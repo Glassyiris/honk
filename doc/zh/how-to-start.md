@@ -287,6 +287,8 @@ sudo journalctl -xefu honk-core
 
 进程启动不等于 datapath 可用。日志应显示 real eBPF backend、接口 hook、listeners 和 control plane 均已 ready。
 
+每个已配置的接口在其 hook 就绪后，会以 info 级别记录一条 `configured interface is bound`。接口尚不存在、没有默认路由的 `auto` 条目，或挂载失败时，记录一条警告（`configured interface is not bound yet` 或 `configured interface attach failed; retrying`），之后仅以 debug 级别记录；不受支持的链路类型记录一条错误（`configured interface is not supported`）。`GET /runtime` 将同一情况报告为 `interface_binding` 降级（见 [API 参考](./reference/api.md#原生-api)）。
+
 ```shell
 ip link show dae0
 sudo bpftool prog show
@@ -312,7 +314,7 @@ sudo systemctl reload honk-core
 sudo /usr/local/bin/honk-core reload
 ```
 
-是否应用成功以运行日志中的 `applied` 或 `rejected` 为准。接口、TPROXY、`data_dir`、NFQUEUE 开关、DNS bind、Clash API listener/secret、cache 等进程级设置发生变化时，需要重启。
+是否应用成功以运行日志中的 `applied` 或 `rejected` 为准。接口、TPROXY、`data_dir`、NFQUEUE 开关、DNS bind、Clash API listener/secret、cache 等进程级设置发生变化时，需要重启。运行期间出现或消失的接口无需重载：watcher 会绑定和释放它们。
 
 正常停止：
 
@@ -367,7 +369,8 @@ cargo run --release -p honk-core -- \
 | pin map 报 `Invalid argument` | `/sys/fs/bpf` 不是 bpffs；按上文重新挂载。 |
 | mock 启动成功但流量不经过 honk | 这是预期行为；使用含 `ebpf` feature 的构建并以 root 启动。 |
 | NFQUEUE disabled 或 queue busy | 检查 nftables/NFQUEUE 内核支持、queue 320 占用者和残留 honk 实例；确实不需要时设置 `nfqueue_enable: false`。 |
-| LAN 流量未被代理 | `lan_interface` 为空或接口名错误；它不会自动使用 `lo`。 |
+| LAN 流量未被代理 | `lan_interface` 为空或接口名错误；它不会自动使用 `lo`。接口名无误时见下一行。 |
+| `GET /runtime` 出现 `interface_binding` 降级 | 某个已配置的接口尚未绑定；日志中有接口名。`pending`：接口不存在，或 `auto` 条目没有 IPv4 默认路由。`unsupported_type`：链路类型被拒绝（例如 `lo`、VRF 设备或 `dae0`）；请改配受支持的接口或其成员。`attach_failed`：TCX link 无法创建、更新或校验；日志中的警告会给出原因。见 [API 参考](./reference/api.md#原生-api)。 |
 | VLESS/VMess 报 `No handler for protocol` | 构建缺少 `rprx`；使用默认 features，或显式加入 `rprx`。 |
 | Geo rule 加载失败 | 将 `geoip.dat`/`geosite.dat` 放入配置的 `data_dir`，或检查文档所列的旧目录/共享目录搜索位置；不需要时删除未使用的 Geo rule。 |
 | GNU binary 在 VyOS/精简系统无法执行 | 改用同架构的 musl release。 |

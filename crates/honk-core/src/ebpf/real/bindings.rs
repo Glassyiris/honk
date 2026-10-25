@@ -314,11 +314,25 @@ fn create_into(
             created.push((binding.clone(), link_id, fd));
             true
         }
+        // The device vanished between the dump and the attach: not a failure
+        // of the attach, the next dump simply no longer has it.
+        Err(error) if device_gone(&error) => {
+            report.topology_changed = true;
+            false
+        }
         Err(error) => {
             report.failed.push((binding.clone(), error));
             false
         }
     }
+}
+
+fn device_gone(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(libc::ENODEV))
+    })
 }
 
 /// The held link is gone from this namespace's chain. Release that owner even
@@ -376,7 +390,7 @@ fn update(
 fn chain_has(binding: &Binding, link_id: u32) -> anyhow::Result<bool> {
     let chain = query_chain(binding.ifindex.get(), binding.direction).with_context(|| {
         format!(
-            "query TCX chain of {} (ifindex {}, {:?})",
+            "verify {} (ifindex {}, {:?}): query TCX chain",
             binding.interface, binding.ifindex, binding.direction
         )
     })?;

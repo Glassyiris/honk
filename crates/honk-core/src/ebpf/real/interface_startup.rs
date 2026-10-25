@@ -1,0 +1,99 @@
+//! Startup of the configured interfaces, shared by `run()` and the VM tests:
+//! subscription, topology, plan, sysctl on sight, `local_ip`, `load`, bind,
+//! degradation. Nothing about a configured interface fails startup except an
+//! unreadable topology; an absent, unsupported or unattachable one is reported
+//! through the `interface_binding` degradation and left to the watcher.
+
+use std::os::fd::OwnedFd;
+use std::path::Path;
+
+use super::RealEbpfBackend;
+use crate::degradations::Degradations;
+use crate::ebpf::interface::status::{self, BindFailure, InterfaceState, Step, StepError};
+use crate::ebpf::interface::{self, InterfacePlan, Topology};
+
+/// What startup hands the watcher: the subscription opened before the first
+/// dump (none when the kernel refused it) and the episode/sysctl bookkeeping
+/// startup already advanced.
+pub(crate) struct InterfaceHandoff {
+    pub(super) subscription: Option<OwnedFd>,
+    pub(super) state: InterfaceState,
+}
+
+/// Fails only when the topology cannot be read (after the bounded dump retry),
+/// the default route cannot be read for an `auto` entry, or `load` fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_interfaces(
+    obj: &[u8],
+    pin_root: &Path,
+    tproxy_port: u16,
+    dae0: &crate::daens::Dae0Setup,
+    lan: &[String],
+    wan: &[String],
+    degradations: &Degradations,
+    read_topology: impl Fn(bool) -> anyhow::Result<Topology>,
+) -> anyhow::Result<(RealEbpfBackend, InterfaceHandoff)> {
+    let subscription = super::iface_watch::subscribe(degradations);
+    let mut state = InterfaceState::default();
+    let mut unplanned = false;
+
+    let (mut topology, mut plan) = match interface::read_and_plan_with(&read_topology, lan, wan) {
+        Ok(planned) => planned,
+        Err(StepError {
+            step: Step::Topology,
+            error,
+        }) => return Err(error.context("read the network topology for the configured interfaces")),
+        Err(StepError { step, error }) => {
+            // Nothing can be planned: start unbound and let the watcher retry.
+            state.step_failed(step, &error);
+            unplanned = true;
+            if !lan.is_empty() || !wan.is_empty() {
+                status::publish(degradations, Some("pending"));
+            }
+            (Topology::default(), InterfacePlan::default())
+        }
+    };
+    write_sysctls(&mut state, &plan, &topology);
+    let mut backend =
+        RealEbpfBackend::load(obj, pin_root, tproxy_port, dae0, interface::local_ip(&plan)).await?;
+
+    let mut report = backend.bind_interfaces(&plan, &topology);
+    if report.topology_changed {
+        match interface::read_and_plan_with(&read_topology, lan, wan) {
+            Ok(planned) => {
+                (topology, plan) = planned;
+                write_sysctls(&mut state, &plan, &topology);
+                report = backend.bind_interfaces(&plan, &topology);
+            }
+            Err(StepError { step, error }) => state.step_failed(step, &error),
+        }
+    }
+    if !unplanned {
+        let owned: Vec<_> = backend
+            .owned_bindings()
+            .map(|binding| (binding.ifindex, binding.direction))
+            .collect();
+        let failures: Vec<_> = report
+            .failed
+            .iter()
+            .map(|(binding, error)| BindFailure::new(binding, error))
+            .collect();
+        state.settle(&plan, &owned, &failures, degradations);
+    }
+    Ok((
+        backend,
+        InterfaceHandoff {
+            subscription,
+            state,
+        },
+    ))
+}
+
+/// Startup writes run on the startup task (the only place besides the watcher's
+/// blocking step where `sysctl -w` may be spawned).
+fn write_sysctls(state: &mut InterfaceState, plan: &InterfacePlan, topology: &Topology) {
+    let owed = state
+        .sysctl
+        .claim(plan, topology, tokio::time::Instant::now());
+    status::perform(&owed, &status::write_sysctl);
+}

@@ -16,8 +16,8 @@
 | `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
 | `lan_interface` | `lan_interface` | `[]` | 拦截转发流量的 LAN 网卡，逗号分隔。空值不安装任何 LAN hook。参见[网卡语义](#网卡语义)。 |
-| `wan_interface` | `wan_interface` | `[]` | 安装 hook 以拦截本机发起 TCP/UDP 的 WAN 网卡，逗号分隔。字面值 `auto`（忽略首尾空白、不区分 ASCII 大小写；空条目同样视为 `auto`）跟随 metric 最低的 IPv4 默认路由。 |
-| `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。该设置会把 `net.ipv6.conf.all.forwarding` 固定为 1，并因此在启动时向每个 WAN 根接口、以及运行期每次新绑定或改挂 WAN egress hook（例如 `auto` WAN 开始解析到已绑定的 LAN 接口）的 WAN 根接口写入 `net.ipv6.conf.<wan>.accept_ra=2`，保证 SLAAC/RA 学来的 IPv6 默认路由不会因 forwarding 被固定而过期消失。启动时还会对第一个已解析的 LAN 接口写入 `net.ipv4.conf.<lan>.rp_filter=0`。使用 systemd-networkd 的主机建议在 WAN 的 `.network` 文件中显式配置 `IPv6AcceptRA=yes`。 |
+| `wan_interface` | `wan_interface` | `[]` | 安装 hook 以拦截本机发起 TCP/UDP 的 WAN 网卡，逗号分隔。字面值 `auto` 跟随 metric 最低的 IPv4 默认路由。参见[网卡语义](#网卡语义)。 |
+| `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。该设置会把 `net.ipv6.conf.all.forwarding` 固定为 1，并因此对每个 WAN 根接口（包括同时也是 LAN 的接口）一出现在网卡拓扑中（启动时，或之后出现时）就写入 `net.ipv6.conf.<wan>.accept_ra=2`，不等待其 hook，也不要求链路 UP，保证 SLAAC/RA 学来的 IPv6 默认路由不会因 forwarding 被固定而过期消失。同样地，对第一个已解析且存在的 LAN 名称写入 `net.ipv4.conf.<lan>.rp_filter=0`，按配置原样、不做规范化（已存在但被拒绝的项仍会占用这一选择）。新加入设备的 udev `systemd-sysctl` 会在首次写入后立即恢复发行版默认值，因此每个值约一秒后会再写一次；此后 honk 不再改动，直到该设备被重建。使用 systemd-networkd 的主机建议在 WAN 的 `.network` 文件中显式配置 `IPv6AcceptRA=yes`。 |
 | `nfqueue_enable` | `nfqueue_enable` | `true` | 将有歧义的 LAN 转发 UDP 原始包保留在 NFQUEUE，直到用户态得到终态决策。需要真实 eBPF 后端；单实例交接后若固定队列不可用，或数据路径准入前的队列/规则/健康检查失败，honk 记录 warning，仅在本进程关闭该功能且不改写配置。持久化 token generation 恢复失败仍为 fatal，因为分配器状态无法确定。安装阶段会回收保留的 nftables table。修改后需重启。新配置应使用此字段；已弃用的 `experimental.udp_nfqueue.enabled` 写法仍接受并给出迁移 warning；两者同时存在时以此 canonical 字段为准。 |
 | `data_dir` | `data_dir` | `"/var/lib/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录。旧根目录 `/var/share/honk`（`LEGACY_DATA_DIR`）中的已有资源按下方各路径规则继续使用；honk 不会自动迁移它们；可写状态仍在原位置更新。修改后需重启。 |
 | `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到状态数据库 `data_dir/state/honk.db`，仅供启动恢复；重载沿用活动节点而不读取已存正文。修改后需重启。 |
@@ -96,9 +96,11 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 
 `lan_interface` 为空时，honk 不安装 LAN TC hook，也绝不会用 `lo` 替代。WAN-only 网关因此只使用 `wan_interface`；经过这些 WAN hook 的本机 TCP/UDP 流量仍会被代理，但不会额外安装 LAN 拦截。
 
-`auto`（在所有使用处均去除首尾空白并不区分 ASCII 大小写，或为空条目）解析为拥有 metric 最低 IPv4 默认路由的网卡。如果不存在该路由，此项会从计划中省略并保持待定，绝不回退到 `lo`。由于没有挂载 hook，未解析网卡上的流量保持 fail-open；同一列表中显式命名的网卡继续工作。仅当某项为 `auto` 时才读取路由表；路由表无法读取会使计划失败，而不是被当作“没有默认路由”。
+`auto`（在所有使用处均去除首尾空白并不区分 ASCII 大小写，因此 `AUTO`、` auto ` 与仅含空白的条目都算；`.dae` 列表解析器会丢弃真正为空的项，所以空列表仍表示没有接口）解析为拥有 metric 最低 IPv4 默认路由的网卡。如果不存在该路由，此项保持待定（绝不回退到 `lo`），直到默认路由出现。同一列表中显式命名的网卡继续工作。仅当某项为 `auto` 时才读取路由表；路由表无法读取是错误，而不是“没有默认路由”：启动时会失败，运行期间的失败则保持现有绑定不变。
 
 网卡存在即绑定，不要求 `IFF_UP`。每个网卡有各自的角色：只在 `lan_interface` 中为 LAN，只在 `wan_interface` 中为 WAN，两者都出现为 LAN/WAN 共用（见[接口挂钩集合](../design/datapath.md#接口挂钩集合)），因此共用网卡不会改变其他 LAN 网卡的 hook。bond、bridge 或其他 master 的成员通过该 master 绑定，但 `vrf` 与 `openvswitch` 的成员保持自身。LAN bridge 同时绑定其端口，bond 绑定其成员。
+
+每个已配置的条目都是惰性绑定，绝不会导致启动失败。网卡尚不存在、没有默认路由的 `auto` 条目或被拒绝的链路类型（见下）不会绑定任何 hook：其流量在绑定之前不被拦截。无法创建、更新或校验的 TCX link 可能让条目只绑定了部分 hook，因此有效的 hook 仍可能拦截流量。两种情况都由 `interface_binding` [降级](./api.md#原生-api)报告；`lifecycle.state` 仍为 `running`，监控必须读取该降级。只有内核的主名称会被匹配，altname 视为不存在。出现的设备会被绑定，消失的设备会释放其 hook，以新网卡 index 重建的设备会重新绑定。属于尚不存在的网卡的 `dns.bind` 地址不是网卡条目：绑定它仍会导致启动失败（`EADDRNOTAVAIL`）。
 
 链路类型决定程序族：
 
@@ -109,9 +111,9 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 | GRE / IP6GRE | 仅当置位 `IFF_POINTOPOINT` 且未置位 `IFF_BROADCAST` 时为 `_l3`；否则拒绝 |
 | `lo`、`vcan`、InfiniBand、802.15.4、nlmon 及其他所有类型 | 拒绝 |
 
-被拒绝的项不绑定任何 hook，在计划中记为 `unbound`，并在启动时记录一条指明网卡与原因的错误日志：链路类型不受支持、`vrf` 设备（请配置成员；VRF 成员绑定自身）或 `dae0`/`dae0peer`。类型不受支持的 bridge 端口或 bond 成员被静默跳过。bond 或 team master 的类型取自其当前第一个端口，因此 InfiniBand bond 会被拒绝。第一个已解析的 LAN 或 WAN 项被拒绝时启动失败。L3S 模式的 ipvlan 与 `reorder_hdr off` 的 VLAN 设备属于不支持的组合。
+被拒绝的项不绑定任何 hook，并按每个 episode 记录一次指明网卡与原因的错误日志：链路类型不受支持、`vrf` 设备（请配置成员；VRF 成员绑定自身）或 `dae0`/`dae0peer`。降级以原因 `unsupported_type` 报告；即使它是第一个已解析的 LAN 或 WAN 项，也不会导致启动失败。类型不受支持的 bridge 端口或 bond 成员被静默跳过。bond 或 team master 的类型取自其当前第一个端口，因此 InfiniBand bond 会被拒绝。L3S 模式的 ipvlan 与 `reorder_hdr off` 的 VLAN 设备属于不支持的组合。
 
-启动时第一个已解析的 LAN 和 WAN 项必须存在并绑定成功，否则启动失败；后续项的失败记录警告并重试，后续不存在的项保持待定。`IfaceWatcher` 订阅 link、address 和 IPv4/IPv6 route 事件，并每 60 秒执行一次 reconciliation。它会随网卡和默认路由变化创建、更新或释放所需的 LAN/WAN hook。拓扑变化仍用于 ECS 刷新，并立即唤醒受健康状态控制的出站探测，但不再生成网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。网卡列表配置本身发生变化仍需重启；网关管理访问应使用[显式用户路由](./routing.md#显式本地路由)。
+`IfaceWatcher` 订阅 link、address 和 IPv4/IPv6 route 事件，并每 60 秒执行一次 reconciliation。若无法订阅或无法注册轮询，它仍每 60 秒协调一次、没有事件通知，并报告 `iface_watch` 降级。它会随网卡和默认路由变化创建、更新或释放所需的 LAN/WAN hook。拓扑变化仍用于 ECS 刷新，并立即唤醒受健康状态控制的出站探测，但不再生成网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。网卡列表配置本身发生变化仍需重启；网关管理访问应使用[显式用户路由](./routing.md#显式本地路由)。启动顺序与导致启动失败的条件见[接口协调](../design/datapath.md#接口协调)。
 
 真实 LAN 绑定还会执行提示性的[自保覆盖检查](./routing.md#显式本地路由)。无法确认时仅告警，不拒绝启动或重载，也不插入路由规则。
 

@@ -79,10 +79,14 @@ pub(crate) fn require_off(key: &str, optional: bool) -> anyhow::Result<()> {
 /// once forwarding is on, and networkd's userspace RA disables itself the
 /// same way — either path lets the SLAAC default route expire (#46).
 #[cfg(feature = "ebpf")]
-pub(crate) fn enable_wan_accept_ra(ifname: &str) {
-    if let Err(e) = set_device_sysctl("ipv6", ifname, "accept_ra", "2") {
-        tracing::warn!("failed to set accept_ra for {ifname}: {e}");
-    }
+pub(crate) fn enable_wan_accept_ra(ifname: &str) -> anyhow::Result<()> {
+    set_device_sysctl("ipv6", ifname, "accept_ra", "2")
+}
+
+/// `rp_filter=0` for the first configured LAN interface.
+#[cfg(feature = "ebpf")]
+pub(crate) fn disable_rp_filter(ifname: &str) -> anyhow::Result<()> {
+    set_device_sysctl("ipv4", ifname, "rp_filter", "0")
 }
 
 #[cfg(all(test, feature = "ebpf"))]

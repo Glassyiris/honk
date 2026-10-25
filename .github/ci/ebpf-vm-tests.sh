@@ -39,6 +39,14 @@ for real_test in \
   ebpf::real::tests::bindings::failure::rejected_update_keeps_old_link_and_commits_the_healthy_direction \
   ebpf::real::tests::bindings::failure::device_deleted_before_verified_apply_reports_failure_without_recreating \
   ebpf::real::tests::bindings::failure::rename_after_planning_is_not_confirmed_and_update_rolls_back \
+  ebpf::real::tests::bindings::failure::device_deleted_before_attach_is_a_topology_change_not_an_attach_failure \
+  ebpf::real::tests::bindings::lazy::absent_interfaces_start_pending_then_bind_release_and_rebind \
+  ebpf::real::tests::bindings::lazy::startup_plan_failure_stays_pending_until_a_successful_plan \
+  ebpf::real::tests::bindings::lazy::only_one_interface_missing_binds_the_down_one_at_startup \
+  ebpf::real::tests::bindings::lazy::startup_attach_failure_degrades_and_recovers_without_stacking \
+  ebpf::real::tests::bindings::lazy::bridge_member_leaving_releases_master_links_and_a_recreated_bridge_rebinds \
+  ebpf::real::tests::bindings::lazy::accept_ra_and_rp_filter_are_written_on_sight_for_dotted_names \
+  ebpf::real::tests::bindings::lazy::watcher_binds_on_an_event_from_the_subscription_startup_opened \
   ebpf::real::tests::bindings::framing::gre_binds_l3_only_when_point_to_point \
   ebpf::real::tests::bindings::framing::collect_md_gre_binds_l3 \
   ebpf::real::tests::mandatory_helpers::mandatory_programs_call_no_probe_read_helper \

@@ -100,6 +100,18 @@ fn set(plan: &InterfacePlan) -> Vec<String> {
         .collect()
 }
 
+/// Every ifindex the entry (as written) derives its bindings from, sorted.
+fn bound(plan: &InterfacePlan, entry: &str) -> Vec<NonZeroU32> {
+    let (_, derived) = plan
+        .bound
+        .iter()
+        .find(|(name, _)| name == entry)
+        .unwrap_or_else(|| panic!("{entry} is not a bound entry in {:?}", plan.bound));
+    let mut derived = derived.clone();
+    derived.sort_unstable();
+    derived
+}
+
 fn ids(values: &[u32]) -> Vec<NonZeroU32> {
     values
         .iter()
@@ -125,8 +137,7 @@ fn single_lan() {
     assert_eq!(plan.lan, ["ens3"]);
     assert!(plan.wan.is_empty() && plan.wan_roots.is_empty() && plan.unbound.is_empty());
     assert_eq!(plan.lan_roots, ["ens3"]);
-    assert_eq!(plan.primary, ids(&[2]));
-    assert!(plan.primary_missing.is_empty());
+    assert_eq!(bound(&plan, "ens3"), ids(&[2]));
     assert_eq!(plan.bindings[0].interface, "ens3");
 }
 
@@ -139,7 +150,7 @@ fn wan_only_synthesizes_no_lan_or_loopback() {
         plan.wan_roots,
         [(NonZeroU32::new(2).unwrap(), "ens3".to_string())]
     );
-    assert_eq!(plan.primary, ids(&[2]));
+    assert_eq!(bound(&plan, "ens3"), ids(&[2]));
 }
 
 #[test]
@@ -151,7 +162,7 @@ fn fully_shared_interface_is_lan_wan() {
         plan.wan_roots,
         [(NonZeroU32::new(2).unwrap(), "ens3".to_string())]
     );
-    assert_eq!(plan.primary, ids(&[2]));
+    assert_eq!(bound(&plan, "ens3"), ids(&[2]));
 }
 
 #[test]
@@ -159,12 +170,7 @@ fn shared_second_lan_is_lan_wan_and_the_first_stays_lan() {
     // A name in both lists is one entry that binds once.
     let plan = run(&["ens3", "eth1"], &["eth1"], &[base()]);
     assert_eq!(plan.lan_roots, ["ens3", "eth1"]);
-    // Single-homed parity: WAN contributes nothing, even though wan[0] is a LAN name.
-    assert_eq!(plan.primary, ids(&[2]));
-
-    // The shared name is eth1, the second LAN: wan[0] still adds nothing.
-    let plan = run(&["ens3", "eth1"], &["eth1"], &[base()]);
-    assert_eq!(plan.primary, ids(&[2]));
+    assert_eq!(bound(&plan, "eth1"), ids(&[3]));
     assert_eq!(
         set(&plan),
         [
@@ -209,16 +215,15 @@ fn bridge_root_and_port_alias_cover_the_same_links() {
         let plan = run(lan, &[], &[base(), bridge()]);
         assert_eq!(set(&plan), expected, "{lan:?}");
         assert_eq!(plan.lan_roots, ["br0"], "{lan:?}");
-        assert_eq!(plan.primary, ids(&[10, 11, 12]), "{lan:?}");
+        assert_eq!(bound(&plan, lan[0]), ids(&[10, 11, 12]), "{lan:?}");
     }
 }
 
 #[test]
-
 fn wan_bridge_root_binds_only_itself() {
     let plan = run(&[], &["br0"], &[bridge()]);
     assert_eq!(set(&plan), ["10 in wan_ingress_l2", "10 eg wan_egress_l2"]);
-    assert_eq!(plan.primary, ids(&[10]));
+    assert_eq!(bound(&plan, "br0"), ids(&[10]));
 }
 
 #[test]
@@ -235,7 +240,7 @@ fn bond_root_and_member_alias_dedup() {
         let plan = run(lan, &[], &[bond()]);
         assert_eq!(set(&plan), lan_expected, "{lan:?}");
         assert_eq!(plan.lan_roots, ["bond0"], "{lan:?}");
-        assert_eq!(plan.primary, ids(&[20, 21, 22]), "{lan:?}");
+        assert_eq!(bound(&plan, lan[0]), ids(&[20, 21, 22]), "{lan:?}");
     }
     let wan_expected = [
         "20 in wan_ingress_l2",
@@ -274,7 +279,8 @@ fn lan_bridge_with_wan_bond_port_upgrades_only_the_bridge() {
         );
     }
     let plan = run(&["br0"], &["bond0"], &[bond_in_bridge()]);
-    assert_eq!(plan.primary, ids(&[10, 11, 20]));
+    assert_eq!(bound(&plan, "br0"), ids(&[10, 11, 20]));
+    assert_eq!(bound(&plan, "bond0"), ids(&[10, 11, 20]));
 }
 
 #[test]
@@ -374,8 +380,7 @@ fn unresolved_auto_is_pending_without_dropping_explicit_entries() {
             "{auto:?}"
         );
         assert_eq!(set(&plan), ["3 in lan_ingress_l2", "3 eg lan_egress_l2"]);
-        assert_eq!(plan.primary, ids(&[3]));
-        assert!(plan.primary_missing.is_empty());
+        assert_eq!(bound(&plan, "eth1"), ids(&[3]));
     }
 }
 
@@ -407,7 +412,6 @@ fn resolved_auto_follows_default_route_and_dedups() {
     let plan = plan_for(&["auto"], &[], &topo);
     assert_eq!(plan.lan, ["gone0"]);
     assert_eq!(plan.unbound, [("auto".to_string(), UnboundReason::Absent)]);
-    assert_eq!(plan.primary_missing, ["gone0"]);
 }
 
 fn plan_for(lan: &[&str], wan: &[&str], topology: &Topology) -> InterfacePlan {
@@ -415,38 +419,29 @@ fn plan_for(lan: &[&str], wan: &[&str], topology: &Topology) -> InterfacePlan {
 }
 
 #[test]
-fn absent_names_are_unbound_and_primary_missing_tracks_first_entries() {
+fn absent_names_are_unbound_and_not_bound_entries() {
     let plan = run(&["nope", "ens3"], &["eth1"], &[base()]);
     assert_eq!(plan.unbound, [("nope".to_string(), UnboundReason::Absent)]);
     assert_eq!(plan.lan, ["nope", "ens3"]);
-    assert_eq!(plan.primary_missing, ["nope"]);
-    // Only the first entries are checked: ens3 is bound but not primary.
-    assert_eq!(plan.primary, ids(&[3]));
+    assert_eq!(plan.bound.len(), 2, "{:?}", plan.bound);
+    assert_eq!(bound(&plan, "ens3"), ids(&[2]));
     assert_eq!(plan.lan_roots, ["ens3"]);
 
-    let plan = run(&["ens3"], &["nope", "eth1"], &[base()]);
-    assert_eq!(plan.primary_missing, ["nope"]);
-    assert_eq!(plan.primary, ids(&[2]));
-
-    // Single-homed: wan[0] is not checked, so an absent shared WAN is not reported twice.
+    // A name in both lists is one absent entry, reported once.
     let plan = run(&["nope"], &["nope"], &[base()]);
-    assert_eq!(plan.primary_missing, ["nope"]);
     assert_eq!(plan.unbound, [("nope".to_string(), UnboundReason::Absent)]);
-    assert!(plan.bindings.is_empty());
-
-    let plan = run(&["ens3", "nope"], &["nope"], &[base()]);
-    assert!(plan.primary_missing.is_empty());
-    assert_eq!(plan.primary, ids(&[2]));
+    assert!(plan.bindings.is_empty() && plan.bound.is_empty());
 }
 
 #[test]
-fn primary_covers_first_lan_and_first_wan_roots_with_ports() {
+fn bound_entries_cover_roots_ports_and_members() {
     let plan = run(&["br0", "ens3"], &["eth1"], &[base(), bridge()]);
-    assert_eq!(plan.primary, ids(&[3, 10, 11, 12]));
+    assert_eq!(bound(&plan, "br0"), ids(&[10, 11, 12]));
+    assert_eq!(bound(&plan, "ens3"), ids(&[2]));
+    assert_eq!(bound(&plan, "eth1"), ids(&[3]));
     let plan = run(&["ens3"], &["bond0", "eth1"], &[base(), bond()]);
-    assert_eq!(plan.primary, ids(&[2, 20, 21, 22]));
+    assert_eq!(bound(&plan, "bond0"), ids(&[20, 21, 22]));
 }
-
 #[test]
 fn unsupported_nesting_is_an_error() {
     // bridge enslaved to a bond, bond enslaved to a bridge: loop.
@@ -457,7 +452,12 @@ fn unsupported_nesting_is_an_error() {
     ];
     for name in ["br0", "bond0", "m1"] {
         assert!(
-            plan(&strings(&[name]), &[], &topology(&[looped.clone()])).is_err(),
+            plan(
+                &strings(&[name]),
+                &[],
+                &topology(std::slice::from_ref(&looped))
+            )
+            .is_err(),
             "{name}"
         );
     }
@@ -485,7 +485,11 @@ fn unsupported_nesting_is_an_error() {
         ],
     ];
     for (index, links) in cases.iter().enumerate() {
-        let result = plan(&strings(&["c"]), &[], &topology(&[links.clone()]));
+        let result = plan(
+            &strings(&["c"]),
+            &[],
+            &topology(std::slice::from_ref(links)),
+        );
         assert!(
             result.is_err(),
             "case {index}: {:?}",
@@ -505,7 +509,7 @@ fn bond_or_bridge_under_other_master_stays_the_root() {
     ];
     let plan = run(&["p1"], &[], &[links]);
     assert_eq!(plan.lan_roots, ["br0"]);
-    assert_eq!(plan.primary, ids(&[10, 11]));
+    assert_eq!(bound(&plan, "p1"), ids(&[10, 11]));
 }
 
 #[test]
@@ -586,45 +590,6 @@ fn dump_retry_stops_after_three_interrupts() {
     assert_eq!((calls, err.kind()), (1, io::ErrorKind::InvalidData));
 }
 
-#[test]
-fn startup_requires_every_primary_direction_and_the_desired_program() {
-    let plan = run(&["br0", "eth1"], &[], &[base(), bridge()]);
-    let owned: Vec<_> = plan
-        .bindings
-        .iter()
-        .map(|b| (b.ifindex, b.direction, b.program))
-        .collect();
-    assert!(check_primary(&plan, &owned, &[]).is_ok());
-    for binding in &plan.bindings {
-        let mut missing = owned.clone();
-        missing.retain(|(index, direction, _)| {
-            (*index, *direction) != (binding.ifindex, binding.direction)
-        });
-        let result = check_primary(&plan, &missing, &[]);
-        assert_eq!(result.is_err(), plan.primary.contains(&binding.ifindex));
-    }
-    let mut wrong_program = owned;
-    let target = wrong_program
-        .iter_mut()
-        .find(|(index, _, _)| plan.primary.contains(index))
-        .unwrap();
-    target.2 = TcProgram::WanIngressL3;
-    assert!(check_primary(&plan, &wrong_program, &[]).is_err());
-}
-
-#[test]
-fn startup_rejects_missing_first_name_but_not_extra_names_or_unresolved_auto() {
-    let absent_primary = run(&["missing", "eth1"], &[], &[base()]);
-    assert!(check_primary(&absent_primary, &[], &[]).is_err());
-    let extra_missing = run(&["ens3", "missing"], &["auto"], &[base()]);
-    let owned = extra_missing
-        .bindings
-        .iter()
-        .map(|b| (b.ifindex, b.direction, b.program))
-        .collect::<Vec<_>>();
-    assert!(check_primary(&extra_missing, &owned, &[]).is_ok());
-}
-
 const LOOPBACK: u16 = 772;
 const IPGRE: u16 = 778;
 const IP6GRE: u16 = 823;
@@ -697,24 +662,16 @@ fn unsupported_roots_are_refused_per_entry_and_bind_nothing() {
             ("gre2".to_string(), refused(IPGRE)),
         ]
     );
-    // Refused roots are not primary; the bindable first entry is.
-    assert_eq!(plan.primary, ids(&[6]));
-    assert_eq!(
-        plan.primary_refused,
-        [(
-            "vcan0".to_string(),
-            RefusedReason::UnsupportedType { arphrd: 280 }
-        )]
-    );
+    // Refused entries derive nothing; the bindable entry does.
+    assert_eq!(bound(&plan, "ens3"), ids(&[6]));
     assert_eq!(plan.lan_roots, ["ens3"]);
     assert!(plan.wan_roots.is_empty());
 }
 
 #[test]
-
 fn vrf_root_is_refused_while_its_member_binds_itself() {
     let links = vec![link(30, "vrf0").kind("vrf"), link(31, "m1").master(30)];
-    let plan = run(&["vrf0"], &["m1"], &[links.clone()]);
+    let plan = run(&["vrf0"], &["m1"], std::slice::from_ref(&links));
     assert_eq!(
         plan.unbound,
         [(
@@ -723,15 +680,13 @@ fn vrf_root_is_refused_while_its_member_binds_itself() {
         )]
     );
     assert_eq!(set(&plan), ["31 in wan_ingress_l2", "31 eg wan_egress_l2"]);
-    assert_eq!(plan.primary_refused.len(), 1);
     assert_eq!(
         plan.wan_roots,
         [(NonZeroU32::new(31).unwrap(), "m1".to_string())]
     );
-    assert!(plan.check_primary_names().is_err());
     // The member alone is fine.
     let plan = run(&["m1"], &[], &[links]);
-    assert!(plan.unbound.is_empty() && plan.check_primary_names().is_ok());
+    assert!(plan.unbound.is_empty());
 }
 
 #[test]
@@ -752,8 +707,6 @@ fn honk_owned_links_are_refused_even_when_absent() {
             ),
         ]
     );
-    assert!(plan.primary_missing.is_empty());
-    assert_eq!(plan.primary_refused.len(), 1);
 }
 
 #[test]
@@ -764,7 +717,7 @@ fn bond_root_takes_its_type_from_the_first_port() {
         link(21, "m1").master(20).arphrd(32),
     ];
     for entry in ["bond0", "m1"] {
-        let plan = run(&[entry], &[], &[links.clone()]);
+        let plan = run(&[entry], &[], std::slice::from_ref(&links));
         assert!(plan.bindings.is_empty(), "{entry}");
         assert_eq!(plan.unbound, [(entry.to_string(), refused(32))], "{entry}");
     }
@@ -785,23 +738,6 @@ fn unsupported_ports_and_members_are_skipped_silently() {
     assert!(plan.unbound.is_empty());
     assert!(set(&plan).iter().all(|b| !b.starts_with("23 ")));
 }
-
-#[test]
-fn startup_rejects_refused_first_name_but_not_refused_extras() {
-    let refused_primary = run(&["lo", "eth1"], &[], &[base()]);
-    let error = check_primary(&refused_primary, &[], &[]).unwrap_err();
-    assert!(format!("{error:#}").contains("lo is refused"), "{error:#}");
-
-    let extra = run(&["ens3", "lo"], &[], &[base()]);
-    let owned = extra
-        .bindings
-        .iter()
-        .map(|b| (b.ifindex, b.direction, b.program))
-        .collect::<Vec<_>>();
-    assert!(check_primary(&extra, &owned, &[]).is_ok());
-    assert_eq!(extra.unbound, [("lo".to_string(), refused(LOOPBACK))]);
-}
-
 #[test]
 fn local_ip_interface_never_names_a_refused_root() {
     let vrf = vec![link(30, "vrf0").kind("vrf"), link(31, "m1").master(30)];

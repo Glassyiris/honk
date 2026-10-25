@@ -225,3 +225,23 @@ fn rename_after_planning_is_not_confirmed_and_update_rolls_back() {
         lab.assert_truthful();
     });
 }
+
+/// The device is deleted between the dump and the attach: `-ENODEV` says the
+/// topology moved, not that the attach failed, so nothing is reported failed
+/// and the owner binds nothing.
+#[test]
+#[ignore = "requires root; run via just test-netns"]
+fn device_deleted_before_attach_is_a_topology_change_not_an_attach_failure() {
+    private_netns(|| {
+        let mut lab = Lab::new();
+        let ifindex = lab.veth("hbt_gone", "hbt_gonep");
+        let (plan, topology) = plan_for(&["hbt_gone"], &[]);
+        assert_eq!(plan.bindings.len(), 2);
+        lab.netlink.del_link(ifindex).unwrap();
+
+        let round = lab.reconcile(&plan, &topology);
+        assert!(round.failed.is_empty(), "{round:?}");
+        assert!(round.topology_changed, "{round:?}");
+        assert!(round.added.is_empty() && lab.owned().is_empty());
+    });
+}

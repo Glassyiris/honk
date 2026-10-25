@@ -172,6 +172,7 @@ mod bindings;
 mod btf;
 mod events;
 mod iface_watch;
+mod interface_startup;
 mod layout;
 mod observation;
 mod process_name;
@@ -186,6 +187,7 @@ mod tests;
 
 pub use events::*;
 pub use iface_watch::IfaceWatcher;
+pub(crate) use interface_startup::start_interfaces;
 use syscall::{
     bpf_lookup_batch_scan_cb, reset_udp_decision_sequence_locked,
     validate_loaded_udp_decision_sequence,

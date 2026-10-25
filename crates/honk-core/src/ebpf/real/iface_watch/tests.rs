@@ -1,6 +1,9 @@
 use super::*;
-use crate::ebpf::interface::{Direction, TcProgram};
+use crate::degradations::{Component, Degradations};
+use crate::ebpf::interface::status::SysctlKey;
+use crate::ebpf::interface::{Binding, Direction, TcProgram};
 use crate::netlink::LinkSnapshot;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 fn link(ifindex: u32, name: &str) -> LinkSnapshot {
@@ -95,8 +98,11 @@ struct Stub {
     applies: Arc<AtomicU64>,
     /// Replaces the fixed topology.
     links: Arc<parking_lot::Mutex<Option<Topology>>>,
-    /// Names the stub `accept_ra` step was asked to write.
-    accept_ra: Arc<parking_lot::Mutex<Vec<String>>>,
+    /// What the stub sysctl step was asked to write, in order.
+    sysctl: Arc<parking_lot::Mutex<Vec<(SysctlKey, String)>>>,
+    /// Sysctl writes that fail (counted as attempted all the same).
+    fail_sysctl: Arc<AtomicBool>,
+    interval: Option<Duration>,
 }
 
 impl Stub {
@@ -107,7 +113,11 @@ impl Stub {
             self.moving.clone(),
         );
         let fail_topology = self.fail_topology.clone();
-        let (links, accept_ra) = (self.links.clone(), self.accept_ra.clone());
+        let (links, sysctl, fail_sysctl) = (
+            self.links.clone(),
+            self.sysctl.clone(),
+            self.fail_sysctl.clone(),
+        );
         Reconciler {
             read_topology: Arc::new(move |_| {
                 anyhow::ensure!(!fail_topology.load(Ordering::SeqCst), "link dump failed");
@@ -122,7 +132,16 @@ impl Stub {
                     moving.load(Ordering::SeqCst),
                 )
             }),
-            accept_ra: Arc::new(move |name| accept_ra.lock().push(name.to_string())),
+            sysctl: Arc::new(move |write| {
+                sysctl.lock().push((write.key, write.name.clone()));
+                anyhow::ensure!(
+                    !fail_sysctl.load(Ordering::SeqCst),
+                    "injected sysctl failure"
+                );
+                Ok(())
+            }),
+            // Never fires inside a test that does not ask for it.
+            interval: self.interval.unwrap_or(Duration::from_secs(3600)),
         }
     }
 }
@@ -132,6 +151,7 @@ struct Fixture {
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     commits: Arc<AtomicU64>,
     detaches: Arc<AtomicU64>,
+    degradations: Arc<Degradations>,
     stub: Stub,
 }
 
@@ -149,6 +169,7 @@ fn fixture(lan: &[&str], wan: &[&str]) -> Fixture {
         config: Arc::new(RwLock::new(Arc::new(config))),
         commits,
         detaches,
+        degradations: Arc::default(),
         stub: Stub::default(),
     }
 }
@@ -161,6 +182,8 @@ impl Fixture {
             self.config.clone(),
             tx,
             self.stub.reconciler(),
+            self.degradations.clone(),
+            InterfaceState::default(),
         );
         (watch, rx)
     }
@@ -247,63 +270,277 @@ fn only_link_events_and_overruns_force_verification() {
     );
 }
 
+/// Without a usable subscription (none at all, or one epoll refuses) the watcher
+/// still reconciles on its ticker, so a device that appears later is bound.
 #[tokio::test]
-async fn a_watcher_that_cannot_poll_is_reported() {
-    let degradations = Arc::new(crate::degradations::Degradations::default());
-    // epoll refuses regular files.
-    let file = tempfile::tempfile().unwrap();
-    let f = fixture(&[], &[]);
-    let (commands, _receiver) = mpsc::channel(1);
-    let (_stop, rx) = watch::channel(false);
-    run(
-        file.into(),
-        f.ebpf,
-        f.config,
-        commands,
-        rx,
-        Arc::clone(&degradations),
-        f.stub.reconciler(),
-    )
-    .await;
+async fn a_watcher_without_a_working_subscription_keeps_reconciling_on_its_ticker() {
+    for epoll_refuses in [false, true] {
+        let mut f = fixture(&["eth1"], &[]);
+        f.stub.interval = Some(Duration::from_millis(20));
+        *f.stub.links.lock() = Some(Topology {
+            links: vec![link(2, "eth0")],
+            default_route: None,
+        });
+        // epoll refuses regular files.
+        let subscription = epoll_refuses.then(|| tempfile::tempfile().unwrap().into());
+        let (commands, _receiver) = mpsc::channel(1);
+        let (stop, rx) = watch::channel(false);
+        let handle = tokio::spawn(run(
+            subscription,
+            f.ebpf.clone(),
+            f.config.clone(),
+            commands,
+            rx,
+            f.degradations.clone(),
+            InterfaceState::default(),
+            f.stub.reconciler(),
+        ));
+        let watcher = IfaceWatcher { handle, stop };
+
+        wait_for(|| {
+            f.degradations
+                .get(Component::InterfaceBinding)
+                .is_some_and(|issue| issue.reason == "pending")
+        })
+        .await;
+        assert!(f.owned().await.is_empty());
+        *f.stub.links.lock() = Some(Topology {
+            links: vec![link(2, "eth0"), link(3, "eth1")],
+            default_route: None,
+        });
+        wait_for(|| f.degradations.get(Component::InterfaceBinding).is_none()).await;
+        assert_eq!(f.owned().await.len(), 2, "bound by the ticker alone");
+        assert_eq!(
+            f.degradations
+                .get(Component::IfaceWatch)
+                .map(|issue| issue.reason),
+            epoll_refuses.then_some("poll_setup_failed")
+        );
+        watcher.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+async fn wait_for(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("condition not reached");
+}
+
+/// A write that fails still counts: an IPv6-disabled host must not respawn
+/// `sysctl -w` every tick. A recreated device (new ifindex) is written again,
+/// and the write does not wait for the device to bind.
+#[tokio::test]
+async fn sysctl_is_written_on_sight_attempted_once_and_again_for_a_recreated_device() {
+    let f = fixture(&["eth0"], &["eth1"]);
+    f.stub.fail_sysctl.store(true, Ordering::SeqCst);
+    f.stub.fail_egress.store(true, Ordering::SeqCst);
+    let (mut watch, _rx) = f.watch();
+    for _ in 0..3 {
+        assert!(watch.reconcile(false).await.is_err(), "egress cannot bind");
+    }
     assert_eq!(
-        degradations
-            .get(crate::degradations::Component::IfaceWatch)
-            .map(|issue| issue.reason),
-        Some("poll_setup_failed")
+        *f.stub.sysctl.lock(),
+        [
+            (SysctlKey::AcceptRa, "eth1".to_string()),
+            (SysctlKey::RpFilter, "eth0".to_string()),
+        ],
+        "attempted once each, although every write failed and no egress bound"
+    );
+
+    // eth1 comes back with another ifindex.
+    *f.stub.links.lock() = Some(Topology {
+        links: vec![link(2, "eth0"), link(9, "eth1")],
+        default_route: None,
+    });
+    let _ = watch.reconcile(false).await;
+    assert_eq!(f.stub.sysctl.lock().len(), 3);
+    assert_eq!(
+        f.stub.sysctl.lock()[2],
+        (SysctlKey::AcceptRa, "eth1".to_string())
     );
 }
 
+/// A device's own udev run puts the distribution sysctl default back right
+/// after our first write: the watcher writes once more about a second later
+/// by itself (the 60 s ticker and no event would leave it lost), then stops.
 #[tokio::test]
-async fn auto_wan_moving_onto_a_bound_lan_root_writes_accept_ra() {
-    let f = fixture(&["eth0"], &["auto"]);
-    let (mut watch, _rx) = f.watch();
-
-    // No default route yet: eth0 is plain LAN, no WAN root to write.
-    watch.reconcile(false).await.unwrap();
-    assert!(f.stub.accept_ra.lock().is_empty());
-
-    // The default route lands on eth0: it becomes LAN+WAN by reprogramming its
-    // egress, not by a new binding.
-    *f.stub.links.lock() = Some(Topology {
-        default_route: Some("eth0".into()),
-        ..topology()
-    });
-    assert!(watch.reconcile(false).await.unwrap());
+async fn sysctl_is_written_again_after_udev_without_waiting_for_the_ticker() {
+    let mut f = fixture(&["eth0"], &["eth1"]);
+    f.stub.interval = Some(Duration::from_secs(60));
+    let (commands, _receiver) = mpsc::channel(1);
+    let (stop, rx) = watch::channel(false);
+    let handle = tokio::spawn(run(
+        None,
+        f.ebpf.clone(),
+        f.config.clone(),
+        commands,
+        rx,
+        f.degradations.clone(),
+        InterfaceState::default(),
+        f.stub.reconciler(),
+    ));
+    let watcher = IfaceWatcher { handle, stop };
+    let writes = |key| {
+        f.stub
+            .sysctl
+            .lock()
+            .iter()
+            .filter(|(k, _)| *k == key)
+            .count()
+    };
+    wait_for(|| writes(SysctlKey::RpFilter) == 2 && writes(SysctlKey::AcceptRa) == 2).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
-        f.owned().await,
-        [
-            (2, Direction::Ingress, TcProgram::LanIngressL2),
-            (2, Direction::Egress, TcProgram::WanEgressL2),
-        ]
+        (writes(SysctlKey::RpFilter), writes(SysctlKey::AcceptRa)),
+        (2, 2),
+        "twice per ifindex, then left alone"
     );
-    assert_eq!(*f.stub.accept_ra.lock(), ["eth0"]);
+    watcher.shutdown(Duration::from_secs(1)).await;
+}
 
-    // Steady state writes nothing more; a newly added WAN root does.
-    assert!(!watch.reconcile(false).await.unwrap());
-    assert_eq!(f.stub.accept_ra.lock().len(), 1);
-    f.set_interfaces(&["eth0"], &["auto", "eth1"]).await;
-    assert!(watch.reconcile(false).await.unwrap());
-    assert_eq!(*f.stub.accept_ra.lock(), ["eth0", "eth1"]);
+#[tokio::test]
+async fn degradation_follows_the_configured_entries() {
+    let f = fixture(&["eth0", "gone"], &["lo"]);
+    let reason = || {
+        f.degradations
+            .get(Component::InterfaceBinding)
+            .map(|i| i.reason)
+    };
+    let (mut watch, _rx) = f.watch();
+    let with = |links: Vec<LinkSnapshot>| {
+        *f.stub.links.lock() = Some(Topology {
+            links,
+            default_route: None,
+        });
+    };
+    let loopback = || {
+        let mut lo = link(1, "lo");
+        lo.arphrd = 772;
+        lo
+    };
+
+    // Absent entries are pending.
+    with(vec![link(2, "eth0")]);
+    watch.reconcile(false).await.unwrap();
+    assert_eq!(reason(), Some("pending"));
+    // A refused entry outranks pending.
+    with(vec![loopback(), link(2, "eth0")]);
+    watch.reconcile(false).await.unwrap();
+    assert_eq!(reason(), Some("unsupported_type"));
+    // An attach failure outranks both.
+    f.stub.fail_egress.store(true, Ordering::SeqCst);
+    with(vec![loopback(), link(2, "eth0"), link(3, "gone")]);
+    assert!(watch.reconcile(false).await.is_err());
+    assert_eq!(reason(), Some("attach_failed"));
+    f.stub.fail_egress.store(false, Ordering::SeqCst);
+    watch.reconcile(false).await.unwrap();
+    assert_eq!(reason(), Some("unsupported_type"));
+    // Dropping the refused entry from the configuration clears the degradation.
+    f.set_interfaces(&["eth0", "gone"], &[]).await;
+    watch.reconcile(false).await.unwrap();
+    assert_eq!(reason(), None);
+    // The device goes away again: pending, and its links are released.
+    with(vec![link(2, "eth0")]);
+    watch.reconcile(true).await.unwrap();
+    assert_eq!(reason(), Some("pending"));
+    assert_eq!(f.owned().await.len(), 2, "only eth0 stays bound");
+    // The issue text names nothing the operator configured.
+    let issue = f.degradations.get(Component::InterfaceBinding).unwrap();
+    assert!(!issue.message.contains("gone") && !issue.message.contains("eth0"));
+}
+
+/// A stage that fails as a whole says nothing about the entries: the bindings
+/// and the degradation stay as they were, and the failure is retried.
+#[tokio::test]
+async fn a_failed_stage_leaves_the_degradation_and_bindings_alone() {
+    let f = fixture(&["eth0", "gone"], &[]);
+    let (mut watch, _rx) = f.watch();
+    watch.reconcile(false).await.unwrap();
+    let held = f.owned().await;
+    let pending = Some("pending");
+    let reason = || {
+        f.degradations
+            .get(Component::InterfaceBinding)
+            .map(|i| i.reason)
+    };
+    assert_eq!(reason(), pending);
+
+    f.stub.fail_topology.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert!(watch.reconcile(true).await.is_err());
+    }
+    assert_eq!((reason(), f.owned().await), (pending, held.clone()));
+    f.stub.fail_topology.store(false, Ordering::SeqCst);
+
+    // Unsupported nesting: the whole plan is rejected, nothing is half bound.
+    let mut a = link(10, "a");
+    a.kind = Some("bond".into());
+    a.master = NonZeroU32::new(11);
+    let mut b = link(11, "b");
+    b.kind = Some("bridge".into());
+    b.master = NonZeroU32::new(10);
+    *f.stub.links.lock() = Some(Topology {
+        links: vec![link(2, "eth0"), a, b],
+        default_route: None,
+    });
+    f.set_interfaces(&["eth0", "a"], &[]).await;
+    let error = watch.reconcile(true).await.unwrap_err();
+    assert!(format!("{error:#}").contains("nesting"), "{error:#}");
+    assert_eq!((reason(), f.owned().await), (pending, held));
+    *f.stub.links.lock() = None;
+    f.set_interfaces(&["eth0", "gone"], &[]).await;
+    watch.reconcile(true).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_retry_keeps_the_committed_rounds_degradation() {
+    for failing_step in [Step::Topology, Step::Plan, Step::Join] {
+        let f = fixture(&["eth0"], &[]);
+        f.stub.fail_egress.store(true, Ordering::SeqCst);
+        f.stub.moving.store(true, Ordering::SeqCst);
+        let (mut watch, _rx) = f.watch();
+        let applies = f.stub.applies.clone();
+        watch.reconciler.read_topology = Arc::new(move |_| {
+            if applies.load(Ordering::SeqCst) == 0 {
+                return Ok(topology());
+            }
+            match failing_step {
+                Step::Topology => anyhow::bail!("retry dump failed"),
+                Step::Plan => {
+                    let mut topology = topology();
+                    topology.links[0].master = Some(topology.links[0].ifindex);
+                    Ok(topology)
+                }
+                Step::Join => panic!("retry task panicked"),
+                Step::Snapshot => unreachable!(),
+            }
+        });
+
+        assert!(watch.reconcile(true).await.is_err());
+        assert_eq!(f.stub.applies.load(Ordering::SeqCst), 1);
+        assert_eq!(f.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.owned().await,
+            [(2, Direction::Ingress, TcProgram::LanIngressL2)]
+        );
+        assert_eq!(
+            f.degradations
+                .get(Component::InterfaceBinding)
+                .map(|i| i.reason),
+            Some("attach_failed"),
+            "{failing_step:?} failed only after the partial bind committed"
+        );
+
+        watch.reconciler.read_topology = f.stub.reconciler().read_topology;
+        f.stub.fail_egress.store(false, Ordering::SeqCst);
+        f.stub.moving.store(false, Ordering::SeqCst);
+        assert!(watch.reconcile(true).await.unwrap());
+        assert!(f.degradations.get(Component::InterfaceBinding).is_none());
+    }
 }
 
 #[tokio::test]
@@ -352,28 +589,7 @@ async fn renamed_port_keeps_its_binding_and_refreshes_the_name() {
 }
 
 #[tokio::test]
-async fn attach_failure_warning_rearms_after_success() {
-    let f = fixture(&["eth0"], &[]);
-    f.stub.fail_egress.store(true, Ordering::SeqCst);
-    let (mut watch, _rx) = f.watch();
-
-    for _ in 0..2 {
-        assert!(watch.reconcile(false).await.is_err());
-        assert!(watch.warned.contains("eth0"));
-    }
-    // The healthy direction was committed, the failed one is retried.
-    assert_eq!(
-        f.owned().await,
-        [(2, Direction::Ingress, TcProgram::LanIngressL2)]
-    );
-    f.stub.fail_egress.store(false, Ordering::SeqCst);
-    assert!(watch.reconcile(false).await.unwrap());
-    assert!(watch.warned.is_empty());
-    assert_eq!(f.owned().await.len(), 2);
-}
-
-#[tokio::test]
-async fn attach_failure_warning_ends_when_interface_is_no_longer_configured() {
+async fn attach_failure_ends_when_interface_is_no_longer_configured() {
     let f = fixture(&["eth0"], &[]);
     f.stub.fail_egress.store(true, Ordering::SeqCst);
     let (mut watch, _rx) = f.watch();
@@ -381,7 +597,7 @@ async fn attach_failure_warning_ends_when_interface_is_no_longer_configured() {
     assert!(watch.reconcile(false).await.is_err());
     f.set_interfaces(&[], &[]).await;
     watch.reconcile(false).await.unwrap();
-    assert!(watch.warned.is_empty());
+    assert!(f.degradations.get(Component::InterfaceBinding).is_none());
     assert!(f.owned().await.is_empty(), "removed from config, released");
 }
 
@@ -451,12 +667,13 @@ fn watcher_fixture(
     events.set_nonblocking(true).unwrap();
     let (stop, rx) = watch::channel(false);
     let handle = tokio::spawn(run(
-        events.into(),
+        Some(events.into()),
         f.ebpf.clone(),
         f.config.clone(),
         commands,
         rx,
         Arc::default(),
+        InterfaceState::default(),
         reconciler,
     ));
     (IfaceWatcher { handle, stop }, writer)
@@ -511,7 +728,8 @@ async fn shutdown_waits_for_an_in_flight_apply() {
                 model_apply(snapshot, plan, false, false)
             })
         },
-        accept_ra: Arc::new(|_| {}),
+        sysctl: Arc::new(|_| Ok(())),
+        interval: Duration::from_secs(3600),
     };
     let (tx, _rx) = mpsc::channel(4);
     let (watcher, _events) = watcher_fixture(&f, tx, reconciler);
@@ -594,8 +812,10 @@ fn route_only_change_wakes_network_subscription() {
     .expect("network namespace thread");
 }
 
+/// A binding that failed its proof is looked at again, but not on every route
+/// event: at most once per ticker interval. Between those it stays failed.
 #[tokio::test]
-async fn failed_retained_verification_is_retried_on_a_route_only_batch() {
+async fn failed_retained_verification_is_rate_limited_on_route_only_batches() {
     let f = fixture(&["eth0"], &[]);
     let (mut watch, _rx) = f.watch();
     watch.reconcile(false).await.unwrap();
@@ -610,7 +830,8 @@ async fn failed_retained_verification_is_retried_on_a_route_only_batch() {
             verifies.lock().push(verify);
             let binding = snapshot.owned[0].0.clone();
             let mut report = model_apply(snapshot, plan, false, false);
-            if failing.load(Ordering::SeqCst) {
+            // Only a verifying pass can find (or clear) a proof failure.
+            if verify && failing.load(Ordering::SeqCst) {
                 report
                     .failed
                     .push((binding, anyhow::anyhow!("query failed")));
@@ -618,14 +839,35 @@ async fn failed_retained_verification_is_retried_on_a_route_only_batch() {
             report
         })
     };
+    let reason = || {
+        f.degradations
+            .get(Component::InterfaceBinding)
+            .map(|i| i.reason)
+    };
+    watch.reconciler.interval = Duration::from_secs(3600);
     assert!(watch.reconcile(true).await.is_err());
+    for _ in 0..3 {
+        assert!(
+            watch.reconcile(false).await.is_err(),
+            "still failed, not re-verified"
+        );
+        assert_eq!(reason(), Some("attach_failed"));
+    }
+    assert_eq!(*verifies.lock(), [true, false, false, false]);
+
+    // Once the interval has passed the next route-only batch proves it again.
+    watch.reconciler.interval = Duration::ZERO;
     assert!(watch.reconcile(false).await.is_err());
-    assert_eq!(f.owned().await, held);
-    assert_eq!(f.commits.load(Ordering::Relaxed), commits);
     failing.store(false, Ordering::SeqCst);
     assert!(!watch.reconcile(false).await.unwrap());
+    assert_eq!(reason(), None);
     assert!(!watch.reconcile(false).await.unwrap());
-    assert_eq!(*verifies.lock(), [true, true, true, false]);
+    assert_eq!(
+        *verifies.lock(),
+        [true, false, false, false, true, true, false]
+    );
+    assert_eq!(f.owned().await, held);
+    assert_eq!(f.commits.load(Ordering::Relaxed), commits);
 }
 
 #[test]

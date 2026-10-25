@@ -323,6 +323,7 @@ async fn kernel_held(
 
 mod failure;
 mod framing;
+mod lazy;
 mod watcher;
 
 #[test]

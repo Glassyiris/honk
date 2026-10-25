@@ -183,3 +183,16 @@ fn target_comparison_rejects_name_framing_master_and_kind_changes_only() {
         assert!(!same_device(&old, &changed));
     }
 }
+
+#[test]
+fn only_a_vanished_device_is_not_an_attach_failure() {
+    let gone = anyhow::Error::from(io::Error::from_raw_os_error(libc::ENODEV))
+        .context("attach lan_ingress_l2 to eth0");
+    assert!(device_gone(&gone));
+    let full = anyhow::Error::from(io::Error::from_raw_os_error(libc::ERANGE))
+        .context("attach lan_ingress_l2 to eth0");
+    assert!(!device_gone(&full));
+    assert!(!device_gone(&anyhow::anyhow!(
+        "TC program is not preloaded"
+    )));
+}

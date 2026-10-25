@@ -1021,21 +1021,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         config.routing.rules.len()
     );
 
-    #[cfg(feature = "ebpf")]
-    if !mock_mode
-        && detect_default_interface().is_none()
-        && config
-            .global
-            .lan_interface
-            .iter()
-            .chain(&config.global.wan_interface)
-            .any(|name| honk_config::config::is_auto_interface(name))
-    {
-        warn!(
-            "default route unavailable; auto interface binding is pending until a network route appears"
-        );
-    }
-
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
     // a healthy restart into a permanently degraded process.
@@ -1078,6 +1063,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         _dae0_link = None;
     }
 
+    #[cfg(feature = "ebpf")]
+    let mut interface_handoff = None;
     let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
@@ -1096,58 +1083,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     DEFAULT_BPF_OBJECT.to_vec()
                 }
             };
-            let (mut topology, mut plan) = ebpf::interface::read_and_plan(
-                &config.global.lan_interface,
-                &config.global.wan_interface,
-            )?;
-            plan.check_primary_names()?;
-            if let Some(lan) = plan.lan.first() {
-                let _ = sysctl::set_device_sysctl("ipv4", lan, "rp_filter", "0");
-            }
-            for (_, name) in &plan.wan_roots {
-                sysctl::enable_wan_accept_ra(name);
-            }
             let (_, dae0_setup) = _dae0_link
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("dae0 link setup missing before eBPF load"))?;
-            let mut backend = ebpf::real::RealEbpfBackend::load(
+            let (backend, handoff) = ebpf::real::start_interfaces(
                 &bpf_object_bytes,
                 &cli.bpf_pin_root,
                 config.global.tproxy_port,
                 dae0_setup,
-                ebpf::interface::local_ip(&plan),
+                &config.global.lan_interface,
+                &config.global.wan_interface,
+                &degradations,
+                ebpf::interface::read_topology,
             )
             .await?;
-            let mut report = backend.bind_interfaces(&plan, &topology);
-            if report.topology_changed {
-                (topology, plan) = ebpf::interface::read_and_plan(
-                    &config.global.lan_interface,
-                    &config.global.wan_interface,
-                )?;
-                report = backend.bind_interfaces(&plan, &topology);
-            }
-            let owned = backend
-                .owned_bindings()
-                .map(|binding| (binding.ifindex, binding.direction, binding.program))
-                .collect::<Vec<_>>();
-            ebpf::interface::check_primary(&plan, &owned, &report.failed)?;
-            for (binding, error) in &report.failed {
-                warn!(interface = %binding.interface, program = binding.program.name(),
-                    "interface attach failed; watcher will retry: {error:#}");
-            }
-            if report.topology_changed {
-                warn!("interface topology changed while binding; watcher will retry");
-            }
-            for (name, reason) in &plan.unbound {
-                match reason {
-                    ebpf::interface::UnboundReason::Refused(refused) => {
-                        error!(interface = %name, "interface is refused: {refused}");
-                    }
-                    _ => {
-                        warn!(interface = %name, ?reason, "interface binding is pending; watcher will retry");
-                    }
-                }
-            }
+            interface_handoff = Some(handoff);
 
             Box::new(backend)
         }
@@ -1319,18 +1269,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .await;
     control_plane.set_log_file_override(cli.log_file.clone(), log_file_path);
     #[cfg(feature = "ebpf")]
-    let iface_watcher = if !cli.mock_ebpf {
+    control_plane.set_iface_watcher(interface_handoff.map(|handoff| {
         ebpf::real::IfaceWatcher::spawn(
             control_plane.ebpf_handle(),
             control_plane.config_handle(),
             control_plane.command_sender(),
             Arc::clone(&degradations),
+            handoff,
         )
-    } else {
-        None
-    };
-    #[cfg(feature = "ebpf")]
-    control_plane.set_iface_watcher(iface_watcher);
+    }));
 
     // Wire GroupManager into DNS outbound selection (Selector/URLTest/…).
     dns_upstream_pool.set_group_manager(Some(control_plane.group_manager()));

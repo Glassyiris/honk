@@ -287,6 +287,8 @@ Do not add strict capability bounding, a read-only `/proc/sys`, or `NoNewPrivile
 
 A running process does not prove that the datapath is usable. The logs should show that the real eBPF backend, interface hooks, listeners, and control plane are all ready.
 
+Each configured interface logs `configured interface is bound` at info level once its hooks are in place. An interface that does not exist yet, an `auto` entry without a default route, or a failed attach logs one warning (`configured interface is not bound yet` or `configured interface attach failed; retrying`) and then only at debug level; an unsupported link type logs one error (`configured interface is not supported`). `GET /runtime` reports the same condition as the `interface_binding` degradation (see the [API reference](./reference/api.md#native-api)).
+
 ```shell
 ip link show dae0
 sudo bpftool prog show
@@ -312,7 +314,7 @@ sudo systemctl reload honk-core
 sudo /usr/local/bin/honk-core reload
 ```
 
-Use the running process logs and their `applied` or `rejected` result to determine whether the reload succeeded. Changes to interfaces, TPROXY settings, `data_dir`, the NFQUEUE switch, DNS bind, the Clash API listener/secret, cache settings, and other process-scoped fields require a restart.
+Use the running process logs and their `applied` or `rejected` result to determine whether the reload succeeded. Changes to interfaces, TPROXY settings, `data_dir`, the NFQUEUE switch, DNS bind, the Clash API listener/secret, cache settings, and other process-scoped fields require a restart. An interface that appears or disappears at runtime needs no reload: the watcher binds and releases it.
 
 Stop normally with:
 
@@ -367,7 +369,8 @@ cargo run --release -p honk-core -- \
 | Pinning a map returns `Invalid argument` | `/sys/fs/bpf` is not bpffs; mount it as shown above. |
 | Mock mode starts but traffic bypasses honk | This is expected. Build with the `ebpf` feature and run as root. |
 | NFQUEUE is disabled or queue 320 is busy | Check nftables/NFQUEUE kernel support, the queue owner, and stale honk instances. Set `nfqueue_enable: false` only when staging is intentionally unnecessary. |
-| LAN traffic is not intercepted | `lan_interface` is empty or names the wrong interface. honk does not substitute `lo`. |
+| LAN traffic is not intercepted | `lan_interface` is empty or names the wrong interface. honk does not substitute `lo`. If the interface is named correctly, see the next row. |
+| `GET /runtime` shows an `interface_binding` degradation | A configured interface is not bound yet; the logs name it. `pending`: it does not exist or an `auto` entry has no IPv4 default route. `unsupported_type`: the link type is refused (for example `lo`, a VRF device or `dae0`); name a supported interface or a member. `attach_failed`: the TCX link could not be created, updated or verified; see the warning in the logs. See the [API reference](./reference/api.md#native-api). |
 | VLESS/VMess reports `No handler for protocol` | The build lacks `rprx`; use the default features or add `rprx` explicitly. |
 | A Geo rule fails to load | Put `geoip.dat`/`geosite.dat` in the configured `data_dir`, or verify the documented legacy/share search locations; remove unused Geo rules if not needed. |
 | A GNU binary does not execute on VyOS or a minimal system | Use the musl release for the same architecture. |

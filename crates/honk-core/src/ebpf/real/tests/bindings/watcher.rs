@@ -4,6 +4,7 @@
 //! kernel (TCX chains, link info, `/proc/sys`), not the owner's records.
 
 use super::*;
+use crate::ebpf::interface::status::InterfaceState;
 use crate::ebpf::real::iface_watch::{Reconciler, Watch};
 use crate::netlink::{FAM_V4, PROTO_STATIC, ROUTE_UNICAST, SCOPE_LINK};
 use std::sync::Arc;
@@ -20,7 +21,7 @@ pub(super) fn accept_ra(device: &str) -> String {
         .to_string()
 }
 
-fn set_accept_ra(device: &str, value: &str) {
+pub(super) fn set_accept_ra(device: &str, value: &str) {
     let path = format!("/proc/sys/net/ipv6/conf/{device}/accept_ra");
     std::fs::write(&path, value).unwrap_or_else(|error| panic!("write {path}: {error}"));
 }
@@ -55,6 +56,8 @@ fn watcher_reconcile_binds_reprograms_writes_accept_ra_and_releases() {
             Arc::new(RwLock::new(Arc::new(config))),
             commands,
             Reconciler::default(),
+            Arc::default(),
+            InterfaceState::default(),
         );
         let baseline = held_bpf_link_count();
 
