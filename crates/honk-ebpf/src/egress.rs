@@ -795,6 +795,11 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     {
         return Err(TC_ACT_SHOT);
     }
+    // A non-zero-VID frame still tagged on the parent belongs to the VLAN
+    // device (see lan ingress); redirecting it into daens would drop it.
+    if link_h_len == ETH_HLEN && unsafe { (*ctx.skb.skb).vlan_tci } & 0x0fff != 0 {
+        return Err(TC_ACT_UNSPEC);
+    }
     if !crate::maps::datapath_ready() {
         return Err(TC_ACT_UNSPEC);
     }

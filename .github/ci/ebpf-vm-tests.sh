@@ -14,7 +14,7 @@ kernel=$(uname -r)
 printf 'Guest uname -r: %s\n' "$kernel" >> "${GITHUB_STEP_SUMMARY:?}"
 test "$kernel" = "${HONK_CI_EXPECTED_KERNEL:?}"
 test -d "/lib/modules/$kernel"
-modprobe -a tun sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue
+modprobe -a tun sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue 8021q macsec
 test -e /sys/fs/cgroup/cgroup.controllers
 test -r "${HONK_ROUTING_TEST_OBJECT:?}"
 if ! mountpoint -q /sys/fs/bpf; then
@@ -49,9 +49,18 @@ done
 for ownership_test in \
   control::tests::tcp_binding::netns_tcp_accepted_fd_proves_original_syn \
   control::tests::tcp_tuple_reuse::netns_tcp_reuses_tuple_during_daens_time_wait \
-  control::tests::udp_fullcone::netns_udp_full_cone_source_contract; do
+  control::tests::udp_fullcone::netns_udp_full_cone_source_contract \
+  control::tests::vlan_frames::netns_vlan_client_on_parent_lan_is_forwarded_natively \
+  control::tests::vlan_frames::netns_vlan_device_lan_is_proxied_beside_its_parent \
+  control::tests::vlan_frames::netns_vlan_priority_tagged_lan_client_is_still_proxied \
+  control::tests::vlan_frames::netns_vlan_host_connection_on_parent_wan_is_native \
+  control::tests::vlan_frames::netns_vlan_device_wan_intercepts_host_connection \
+  control::tests::vlan_frames::netns_macsec_upper_device_lan_flow_is_classified; do
   test "$("$HONK_CORE_TEST_BIN" "$ownership_test" --exact --ignored --list --format terse)" = "$ownership_test: test"
 done
+# Substring-selected by the routing run above; an exact check keeps a rename from emptying it.
+unsupported_test=ebpf::real::routing::tests::dns_ownership::tcx::unsupported_lan_ingress_frames_continue_tcx_without_marking
+test "$("$HONK_CORE_TEST_BIN" "$unsupported_test" --exact --ignored --list --format terse)" = "$unsupported_test: test"
 "$HONK_CORE_TEST_BIN" netns --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-netns.log"
 watcher_test=ebpf::real::iface_watch::tests::route_only_change_wakes_network_subscription

@@ -49,8 +49,8 @@ use crate::{
     route::{OUTBOUND_BLOCK, OUTBOUND_CONTROL_PLANE_ROUTING, OUTBOUND_DIRECT},
     sk,
     transport::{
-        ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, PARSE_FRAGMENT, parse_packet,
-        udp_has_quic_long_header,
+        ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, PARSE_FRAGMENT, PASS_UNSUPPORTED,
+        parse_packet, udp_has_quic_long_header,
     },
 };
 const AF_INET: u8 = 2;
@@ -481,6 +481,13 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if !crate::maps::datapath_ready() {
         return Err(TC_ACT_UNSPEC);
     }
+    // A non-zero-VID frame is still tagged here (hwaccel vlan_tci, cleared by
+    // vlan_do_receive before the VLAN device's own TC). Redirecting it into
+    // daens drops it as OTHERHOST, so leave it to the VLAN device. VID 0
+    // priority tags are cleared and delivered normally: not skipped.
+    if link_h_len == ETH_HLEN && unsafe { (*ctx.skb.skb).vlan_tci } & 0x0fff != 0 {
+        return Err(TC_ACT_UNSPEC);
+    }
     // Bridge master/slave double attachment must not reclassify either an
     // already-final packet or a held packet carrying its unique queue token.
     if unsafe { (*ctx.skb.skb).mark } & (CLASSIFIED_MARK | NFQUEUE_PENDING_MARK) != 0 {
@@ -491,6 +498,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if ret != 0 {
         if ret == PARSE_FRAGMENT as c_long && crate::fragment::condemned(pkt) {
             return Err(TC_ACT_SHOT);
+        }
+        // Non-IP and unsupported-L4 frames carry no classification: leave them
+        // unmarked so an upper device (macsec, vlan) still classifies its own
+        // frame. `pkt.ethh` is not written on failure; do not read it here.
+        if ret == PASS_UNSUPPORTED {
+            return Err(TC_ACT_UNSPEC);
         }
         return pass_through_classified(ctx);
     }

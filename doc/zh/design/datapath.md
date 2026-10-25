@@ -54,6 +54,11 @@ Linux 6.12+ 上，Aya 使用 FD 持有的 TCX BPF link；启动、重绑定和�
 
 不写 mark 且不受所有权 guard 保护的直通退出点返回 `TC_ACT_UNSPEC`（`-1`，TCX `NEXT`），包括反向刷新与跳过 DNS，让后续 TCX 程序继续运行。最低支持内核上的 `TC_ACT_PIPE` 不是继续动作。写入 mark 的路径（包括显式写零的 WAN 路径）、LAN classified/pending 及 WAN 精确 socket-mark/classified 所有权 guard 返回 `TC_ACT_OK`（`0`，TCX `PASS`），终止链。
 
+属于其他设备的帧同样以 `NEXT` 继续，因此同一设备上排在后面的 TCX 程序以及 legacy `clsact`/`cls_bpf` 过滤器都能看到它们：
+
+- **带 VLAN 标签的帧。** 在以太网（`_l2`）父设备上，`lan_ingress` 与 `wan_egress` 对仍带标签且 VID 非零的帧不处理，留给 VLAN 设备，由其自己的挂钩分类去标签后的帧；若把它们重定向进 `daens`，会在那里按 `PACKET_OTHERHOST` 丢弃。只有这两个 hook 会跳过：`wan_egress` 先执行分片、NDP Redirect 与 NFQUEUE 载体的处理（仍可丢弃该帧），反向 hook `lan_egress` 与 `wan_ingress` 仍会刷新连接状态，`lan_ingress` 在 classified/pending 所有权 guard 之前跳过带标签的帧。VID 0 的优先级标签由父设备直接上交，照常分类。`_l3` 程序没有链路层头，不受影响。
+- **不支持的 LAN 入站帧。** 非 IP EtherType（ARP、MACsec）或不支持的 L4（GRE、IPIP、ESP、ICMPv4、除 Redirect 外的 ICMPv6）以 `NEXT` 返回且不写 `CLASSIFIED_MARK`，使 `macsec0` 等上层设备能分类自己解密后的帧。NDP Redirect、非首分片与畸形包保持终结性的 classified `PASS`；不带标签且已带 `CLASSIFIED_MARK` 或 pending 标记的帧同样如此：所有权 guard 先于解析执行。
+
 ### 动态接口协调
 
 `auto` 解析为当前默认路由接口。没有默认路由时，该项保持未挂载，而不会回退到 loopback。`IfaceWatcher` 订阅 rtnetlink 的链路、IPv4/IPv6 地址和 IPv4/IPv6 路由组；每 60 秒一次的协调 tick 作为事件交付的后备。协调过程重新解析 `auto`，通过 ifindex 识别接口重建，重新计算单网卡或双网卡角色，并安装或忘记进程持有的挂钩。

@@ -28,6 +28,8 @@ mod tcp_binding;
 mod tcp_tuple_reuse;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod udp_fullcone;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod vlan_frames;
 
 #[tokio::test]
 async fn health_push_re_resolves_after_reload_writer() {

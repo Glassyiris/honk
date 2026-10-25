@@ -60,7 +60,7 @@ gate (`.github/ci/run-vm-gate.sh floor`); `test-netns` retains `test-routing` as
 its dependency and boots only one guest. The complete routing suite also has
 root-cgroup cases, so neither recipe executes ignored tests on the host.
 The VM gate includes compiled routing, real backend/datapath, NFQUEUE/netns,
-TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership,
+TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership, real VLAN/macsec frame cases,
 native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher and SO_MARK socket checks. Exact nonempty
 selections in the guest gate must remain intact.
 

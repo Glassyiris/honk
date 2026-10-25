@@ -28,7 +28,7 @@ Maintaining this guide: a rule that binds every change goes in this file; a subs
 - `honk-config` provides shared types/parsers for original dae `{ section { ... } }`, the primary and only documented config syntax.
 - Status: **experimental alpha**. Expect breaking changes.
 - License: **GPL-3.0-only**. Repository: <https://github.com/daeuniverse/honk>
-- Docs: `README.md` / `README.zh.md` (bilingual overview, feature checklist, TODO list); matching `doc/en/` / `doc/zh/` trees under `doc/`, indexed by bilingual `doc/README.md`. Each has `configuration.md`, `design/` (overview/datapath/routing/nfqueue/control-plane/dns/outbound/groups), `reference/` (global/nodes/groups/routing/dns/subscription/assets/experimental/api/cli), `migration/` (one `<tag>.md` per release listing configuration changes that affect an existing configuration), and `operations/` runbooks. Lab benchmark tooling, evidence, and bilingual docs live only on `bench`.
+- Docs: `README.md` / `README.zh.md` (bilingual overview, feature checklist, TODO list); matching `doc/en/` / `doc/zh/` trees under `doc/`, indexed by bilingual `doc/README.md`. Each has `configuration.md`, `design/` (overview/datapath/routing/nfqueue/control-plane/dns/outbound/groups), `reference/` (global/nodes/groups/routing/dns/subscription/assets/experimental/api/cli), and `operations/` runbooks; per-release configuration changes that affect an existing configuration live in `doc/migration/{en,zh}/<tag>.md` (one file per release tag). Lab benchmark tooling, evidence, and bilingual docs live only on `bench`.
 
 ## Repository layout
 
@@ -43,7 +43,7 @@ Maintaining this guide: a rule that binds every change goes in this file; a subs
 ├── config.dae                # Full-featured example config (production-leaning)
 ├── config.min.dae            # Minimal example (good for --mock-ebpf dev)
 ├── example.dae               # Annotated example (Chinese comments)
-├── doc/                      # en/ + zh/ doc trees: guide, design/, reference/, migration/, operations/
+├── doc/                      # en/ + zh/ doc trees: guide, design/, reference/, operations/; migration/{en,zh}/<tag>.md
 ├── ci/                       # zigcc/zigcxx: zig cc/c++ wrappers for cross builds (strip CMake's clang-style --target from boring-sys ASM rules + rustc's aarch64 errata linker args; used by build-musl and the release workflow); zig-bindgen-env: derive BINDGEN_EXTRA_CLANG_ARGS from `zig cc -E -v` for cross bindgen
 ├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release
 └── crates/

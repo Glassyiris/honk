@@ -220,6 +220,101 @@ fn pure_passes_continue_tcx_without_changing_marks() {
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+fn unsupported_lan_ingress_frames_continue_tcx_without_marking() {
+    isolated(|| {
+        // The parser scratch is per CPU: pin so each frame follows the TCP
+        // packet on the same CPU, exposing any read of a previous packet's headers.
+        let allowed = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
+        let cpu = (0..nix::sched::CpuSet::count())
+            .find(|cpu| allowed.is_set(*cpu).unwrap())
+            .unwrap();
+        let mut pinned = nix::sched::CpuSet::new();
+        pinned.set(cpu).unwrap();
+        nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &pinned).unwrap();
+        let mut backend =
+            RealEbpfBackend::load_routing_test_fixture(&object(), fixture_param()).unwrap();
+        for name in ["lan_ingress_l2", "lan_ingress_l3"] {
+            load_classifier(&mut backend, name);
+        }
+        set_array(&mut backend, "DATAPATH_STATE_MAP", 0, 1u32);
+        let input = SkbInput {
+            mark: USER_MARK,
+            ..Default::default()
+        };
+        for l3 in [false, true] {
+            let name = if l3 {
+                "lan_ingress_l3"
+            } else {
+                "lan_ingress_l2"
+            };
+            let form = |bytes: Vec<u8>| if l3 { l3_packet(bytes) } else { bytes };
+            // Header offsets within the frame handed to this program.
+            let eth = if l3 { 0 } else { 14 };
+            for (src, dst, _) in PEERS {
+                let v4 = src.is_ipv4();
+                let (proto, l4) = (eth + if v4 { 9 } else { 6 }, eth + if v4 { 20 } else { 40 });
+                let tcp = form(packet(src, dst, IPPROTO_TCP, 46200, 443, 0, 0x02));
+                let udp = form(packet(src, dst, IPPROTO_UDP, 46201, 443, 0, 0));
+                // Test-run derives the EtherType from bytes 12..14 for both framings.
+                let with_ethertype = |ethertype: u16| {
+                    let mut bytes = udp.clone();
+                    bytes[12..14].copy_from_slice(&ethertype.to_be_bytes());
+                    bytes
+                };
+                let with_protocol = |protocol: u8| {
+                    let mut bytes = udp.clone();
+                    bytes[proto] = protocol;
+                    bytes
+                };
+                let mut unsupported =
+                    vec![("ARP", with_ethertype(0x0806)), ("GRE", with_protocol(47))];
+                if v4 {
+                    unsupported.push(("ICMPv4 echo", with_protocol(1)));
+                } else {
+                    let mut ns = with_protocol(58);
+                    ns[l4..l4 + 2].copy_from_slice(&[135, 0]);
+                    unsupported.push(("ICMPv6 NS", ns));
+                }
+                for (what, frame) in &unsupported {
+                    let _ = run(&backend, name, &tcp, input);
+                    let result = run(&backend, name, frame, input);
+                    assert_eq!(
+                        (result.verdict, result.mark),
+                        (TC_ACT_UNSPEC, USER_MARK),
+                        "{name} {what} {src}"
+                    );
+                    assert_eq!(&result.data[..frame.len()], frame, "{name} {what}");
+                }
+                // These keep the terminal, classified pass.
+                let mut classified = Vec::new();
+                if v4 {
+                    let mut fragment = udp.clone();
+                    fragment[eth + 6..eth + 8].copy_from_slice(&[0, 8]);
+                    classified.push(("non-initial fragment", fragment));
+                    let mut malformed = udp.clone();
+                    malformed[eth] = 0x40;
+                    classified.push(("malformed IPv4", malformed));
+                } else {
+                    let mut redirect = with_protocol(58);
+                    redirect[l4..l4 + 2].copy_from_slice(&[137, 0]);
+                    classified.push(("NDP Redirect", redirect));
+                }
+                for (what, frame) in &classified {
+                    let _ = run(&backend, name, &tcp, input);
+                    let result = run(&backend, name, frame, input);
+                    assert_eq!(
+                        (result.verdict, result.mark),
+                        (TC_ACT_OK, USER_MARK | CLASSIFIED_MARK),
+                        "{name} {what} {src}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn conn_capacity_native_passes_continue_tcx_without_clearing_marks() {
     isolated(|| {
         let (mut backend, _, _listeners) = publish(&[]);
