@@ -23,6 +23,7 @@ impl RealEbpfBackend {
         obj: &[u8],
         pin_root: &Path,
         tproxy_port: u16,
+        dae0: &crate::daens::Dae0Setup,
         lan_ifname: Option<&str>,
         wan_ifname: &str,
         single_homed: bool,
@@ -46,18 +47,8 @@ impl RealEbpfBackend {
             u8::from(crate::netlink::ipv6_socket_available().context("probe IPv6 socket family")?);
 
         info!("Loading eBPF programs ({} bytes)", obj.len());
-        let dae0_ifindex = crate::netlink::ifindex_of("dae0").unwrap_or(0);
-        let dae0peer_ifindex = crate::netlink::ifindex_of("dae0peer").unwrap_or(0);
-        let dae0peer_mac = std::fs::read_to_string("/sys/class/net/dae0peer/address")
-            .ok()
-            .map(|s| {
-                let mut mac = [0u8; 6];
-                for (i, b) in s.trim().split(':').enumerate().take(6) {
-                    mac[i] = u8::from_str_radix(b, 16).unwrap_or(0);
-                }
-                mac
-            })
-            .unwrap_or([0u8; 6]);
+        let (dae0_ifindex, dae0peer_ifindex, dae0peer_mac) =
+            (dae0.ifindex(), dae0.peer_ifindex(), dae0.peer_mac());
         let ebpf_lan_ifname = lan_ifname
             .map(|name| Self::bridge_interface(name).unwrap_or_else(|| name.to_string()))
             .unwrap_or_default();

@@ -1098,9 +1098,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // dae0peer stays in the host namespace during the dae0 attach, then moves
     // to the daens netns during namespace setup.
     #[cfg(feature = "ebpf")]
-    let _dae0_guard: Option<daens::Dae0Guard>;
+    let _dae0_link: Option<(daens::Dae0Guard, daens::Dae0Setup)>;
     #[cfg(not(feature = "ebpf"))]
-    let _dae0_guard: Option<()>;
+    let _dae0_link: Option<()>;
     if !mock_mode {
         // QUIC socket headroom: the default 208 KiB rmem/wmem caps a
         // ~1ms-RTT QUIC path at ~2 Gbps (setsockopt is clamped to 2×max).
@@ -1120,21 +1120,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             if let Some(lan_ifname) = configured_ifaces.lan.first() {
                 let _ = sysctl::set_sysctl(&format!("net.ipv4.conf.{}.rp_filter", lan_ifname), "0");
             }
-            _dae0_guard = Some(daens::create_dae0_link()?);
+            _dae0_link = Some(daens::create_dae0_link()?);
             for wan_ifname in &configured_ifaces.wan {
                 sysctl::enable_wan_accept_ra(wan_ifname);
             }
             info!(
                 "dae0 link created before eBPF load (ifindex={})",
-                _dae0_guard.as_ref().unwrap().ifindex
+                _dae0_link.as_ref().unwrap().1.ifindex()
             );
         }
         #[cfg(not(feature = "ebpf"))]
         {
-            _dae0_guard = None;
+            _dae0_link = None;
         }
     } else {
-        _dae0_guard = None;
+        _dae0_link = None;
     }
 
     #[cfg(feature = "ebpf")]
@@ -1162,10 +1162,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let single_homed = configured_ifaces.single_homed;
             let primary_lan = lan_ifnames.first().map(String::as_str);
             let primary_wan = wan_ifnames.first().map(String::as_str).unwrap_or("");
+            let (_, dae0_setup) = _dae0_link
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("dae0 link setup missing before eBPF load"))?;
             let mut backend = ebpf::real::RealEbpfBackend::load(
                 &bpf_object_bytes,
                 &cli.bpf_pin_root,
                 config.global.tproxy_port,
+                dae0_setup,
                 primary_lan,
                 primary_wan,
                 single_homed,

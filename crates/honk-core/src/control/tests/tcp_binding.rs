@@ -348,7 +348,11 @@ struct Lab {
 }
 
 impl Lab {
-    async fn boot(net: Net, kind: Kind) -> anyhow::Result<(Self, Option<TestRetirement>)> {
+    async fn boot(
+        net: Net,
+        kind: Kind,
+        dae0: &daens::Dae0Setup,
+    ) -> anyhow::Result<(Self, Option<TestRetirement>)> {
         let object = std::env::var_os("HONK_TEST_BPF_OBJECT")
             .map(std::fs::read)
             .transpose()?;
@@ -357,6 +361,7 @@ impl Lab {
             object.as_deref().unwrap_or(crate::DEFAULT_BPF_OBJECT),
             Path::new(ROOT),
             config.global.tproxy_port,
+            dae0,
             Some("honk-lan0"),
             "honk-wan0",
             false,
@@ -480,12 +485,12 @@ fn run_child(
     case: impl AsyncFnOnce(&Lab) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let net = Net::build(family, kind)?;
-    let _dae0 = daens::create_dae0_link()?;
+    let (_dae0, dae0_setup) = daens::create_dae0_link()?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async {
-            let (lab, retirement) = Lab::boot(net, kind).await?;
+            let (lab, retirement) = Lab::boot(net, kind, &dae0_setup).await?;
             let result = case(&lab).await;
             lab.finish(retirement, result).await
         })
@@ -494,7 +499,7 @@ fn run_child(
 
 fn namespace(family: &str) -> anyhow::Result<()> {
     let _net = Net::build(family, Kind::Proxy)?;
-    let _dae0 = daens::create_dae0_link()?;
+    let (_dae0, _) = daens::create_dae0_link()?;
     daens::setup_daens_namespace(honk_ebpf_common::TPROXY_MARK, 12345)?;
     daens::with_daens_netns("verify handshake shortcut settings", || {
         for name in ["tcp_syncookies", "tcp_migrate_req", "tcp_fastopen"] {

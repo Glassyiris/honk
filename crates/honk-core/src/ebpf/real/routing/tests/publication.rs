@@ -334,9 +334,11 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
     let mut connection = golden::connection();
     connection.dst_port = 53;
     let input = input(&connection);
-    let mut backend = RealEbpfBackend::load(&object, &pin_root, 12345, None, "lo", false)
-        .await
-        .unwrap();
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().unwrap();
+    let mut backend =
+        RealEbpfBackend::load(&object, &pin_root, 12345, &dae0_setup, None, "lo", false)
+            .await
+            .unwrap();
     backend.publish_routing_plan(&plan, &[]).unwrap();
     backend
         .set_datapath_flags(honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED)
@@ -411,9 +413,10 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
     );
     drop(backend);
 
-    let mut reloaded = RealEbpfBackend::load(&object, &pin_root, 12345, None, "lo", false)
-        .await
-        .unwrap();
+    let mut reloaded =
+        RealEbpfBackend::load(&object, &pin_root, 12345, &dae0_setup, None, "lo", false)
+            .await
+            .unwrap();
     reloaded.publish_routing_plan(&plan, &[]).unwrap();
     assert!(reloaded.routing_policy_generation() > failed_fence);
     assert_eq!(

@@ -14,10 +14,12 @@ use honk_ebpf_common::conn::BpfStatsKey;
 async fn allocation_failure_allows_create_connect_and_send_without_identity() {
     let pin_root =
         Path::new("/sys/fs/bpf").join(format!("honk-identity-failure-{}", std::process::id()));
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
     let mut backend = RealEbpfBackend::load(
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
+        &dae0_setup,
         Some("lo"),
         "lo",
         true,
@@ -178,11 +180,13 @@ fn unavailable_cgroup_capture_refuses_startup() {
             .enable_all()
             .build()
             .unwrap();
+        let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
         let links_before = held_bpf_link_count();
         let result = runtime.block_on(RealEbpfBackend::load(
             crate::DEFAULT_BPF_OBJECT,
             &pin_root,
             12345,
+            &dae0_setup,
             Some("lo"),
             "lo",
             true,
@@ -256,6 +260,7 @@ async fn occupied_sock_ops_slot_refuses_startup_without_leaving_links() {
     let routing_sequence = routing::open_routing_generation_sequence(&routing_pin).unwrap();
     let routing_map_id = routing_sequence.map().info().unwrap().id();
     drop(routing_sequence);
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
     let links_before = held_bpf_link_count();
     let programs_before = cgroup_attached_prog_count(foreign.cgroup.as_raw_fd());
 
@@ -263,6 +268,7 @@ async fn occupied_sock_ops_slot_refuses_startup_without_leaving_links() {
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
+        &dae0_setup,
         Some("lo"),
         "lo",
         true,

@@ -60,11 +60,13 @@ fn kernel_btf_override_controls_startup() {
             let pin_root =
                 Path::new("/sys/fs/bpf").join(format!("honk-kernel-btf-{}", std::process::id()));
             assert!(!pin_root.exists());
+            let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
             let before = held_bpf_link_count();
             let result = RealEbpfBackend::load(
                 crate::DEFAULT_BPF_OBJECT,
                 &pin_root,
                 12345,
+                &dae0_setup,
                 Some("lo"),
                 "lo",
                 true,

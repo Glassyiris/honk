@@ -50,7 +50,7 @@ fn run_child(family: &str) -> anyhow::Result<()> {
         Ok(listener)
     })?;
     let target = listener.local_addr()?;
-    let _dae0 = daens::create_dae0_link()?;
+    let (_dae0, dae0_setup) = daens::create_dae0_link()?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -61,6 +61,7 @@ fn run_child(family: &str) -> anyhow::Result<()> {
                 crate::DEFAULT_BPF_OBJECT,
                 pin_root,
                 config.global.tproxy_port,
+                &dae0_setup,
                 Some("honk-lan0"),
                 "honk-wan0",
                 false,

@@ -4878,6 +4878,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
         }
         netlink.add_veth_pair("honk-lan0", "honk-c0")?;
         netlink.add_veth_pair("honk-wan0", "honk-s0")?;
+        let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair()?;
         let (lan, _) = netlink.get_link("honk-lan0")?;
         let (client_peer, _) = netlink.get_link("honk-c0")?;
         let (wan, _) = netlink.get_link("honk-wan0")?;
@@ -4919,6 +4920,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                 crate::DEFAULT_BPF_OBJECT,
                 &pin_root,
                 12345,
+                &dae0_setup,
                 Some("honk-lan0"),
                 "honk-wan0",
                 false,

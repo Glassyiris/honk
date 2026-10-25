@@ -140,10 +140,12 @@ async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
     // Other agents (systemd, …) may legitimately hold root-cgroup programs;
     // only the delta belongs to this backend.
     let baseline = cgroup_attached_prog_count(cgroup_file.as_raw_fd());
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
     let mut backend = RealEbpfBackend::load(
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
+        &dae0_setup,
         None,
         "lo",
         false,
@@ -302,10 +304,12 @@ async fn bare_load_holds_no_tracing_links() {
         0,
         "tracing links already held before load"
     );
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
     let mut backend = RealEbpfBackend::load(
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
+        &dae0_setup,
         None,
         "lo",
         false,
@@ -378,10 +382,12 @@ async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
             .unwrap();
     }
 
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
     let mut backend = RealEbpfBackend::load(
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
+        &dae0_setup,
         None,
         "lo",
         false,
@@ -454,10 +460,12 @@ async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
 async fn pinned_raw_udp_decision_sequence_survives_reload() {
     let pin_root =
         Path::new("/sys/fs/bpf").join(format!("honk-sequence-reload-test-{}", std::process::id()));
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
     let mut backend = RealEbpfBackend::load(
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
+        &dae0_setup,
         None,
         "lo",
         false,
@@ -483,6 +491,7 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
+        &dae0_setup,
         None,
         "lo",
         false,
@@ -573,6 +582,7 @@ async fn invalid_routing_sequence_pin_is_never_reset() {
         std::process::id()
     ));
     std::fs::create_dir_all(&pin_root).unwrap();
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
     let pin = pin_root.join(routing::ROUTING_GENERATION_SEQUENCE_MAP);
     for (entries, flags, value) in [
         (2, 0, 17),
@@ -588,6 +598,7 @@ async fn invalid_routing_sequence_pin_is_never_reset() {
                 crate::DEFAULT_BPF_OBJECT,
                 &pin_root,
                 12345,
+                &dae0_setup,
                 None,
                 "lo",
                 false
@@ -614,10 +625,12 @@ async fn pname_is_ready_before_first_packet() {
     let pin_root = Path::new("/sys/fs/bpf").join(format!("honk-pname-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&pin_root);
     std::fs::create_dir_all(&pin_root).expect("create test pin root");
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
     let mut backend = RealEbpfBackend::load(
         crate::DEFAULT_BPF_OBJECT,
         &pin_root,
         12345,
+        &dae0_setup,
         Some("lo"),
         "lo",
         true,
