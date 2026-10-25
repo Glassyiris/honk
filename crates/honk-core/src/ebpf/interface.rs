@@ -96,6 +96,77 @@ pub(crate) enum UnboundReason {
     Absent,
     /// `auto` with no IPv4 default route.
     AutoUnresolved,
+    /// Present but never bindable; fixed by changing the configuration.
+    Refused(RefusedReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusedReason {
+    /// The canonical root has no framing the programs can parse.
+    UnsupportedType { arphrd: u16 },
+    /// A `vrf` device: members see the traffic, never the VRF itself.
+    VrfRoot,
+    /// `dae0` / `dae0peer`.
+    OwnedLink,
+}
+
+impl std::fmt::Display for RefusedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedType { arphrd } => write!(f, "unsupported link type {arphrd}"),
+            Self::VrfRoot => f.write_str("a vrf device (configure a member instead)"),
+            Self::OwnedLink => f.write_str("a link honk owns"),
+        }
+    }
+}
+
+/// Which TC program family fits a link; decided from `(ifi_type, ifi_flags)`
+/// alone, so a bond or team master follows its current first port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Framing {
+    /// Ethernet header at the TC hook.
+    L2,
+    /// Bare IP at the TC hook.
+    L3,
+    Unsupported,
+}
+
+const ARPHRD_RAWIP: u16 = 519;
+const ARPHRD_IP6GRE: u16 = 823;
+
+impl Framing {
+    pub(crate) fn of(arphrd: u16, flags: u32) -> Self {
+        match arphrd {
+            libc::ARPHRD_ETHER => Self::L2,
+            libc::ARPHRD_NONE
+            | libc::ARPHRD_PPP
+            | ARPHRD_RAWIP
+            | libc::ARPHRD_TUNNEL
+            | libc::ARPHRD_TUNNEL6
+            | libc::ARPHRD_SIT => Self::L3,
+            // A GRE device with `header_ops` (multicast or no remote) prepends
+            // a tunnel header; only a point-to-point, non-broadcast one is bare IP.
+            libc::ARPHRD_IPGRE | ARPHRD_IP6GRE
+                if flags & libc::IFF_POINTOPOINT as u32 != 0
+                    && flags & libc::IFF_BROADCAST as u32 == 0 =>
+            {
+                Self::L3
+            }
+            _ => Self::Unsupported,
+        }
+    }
+}
+
+fn refusal(root: &LinkSnapshot) -> Option<RefusedReason> {
+    if root.kind.as_deref() == Some("vrf") {
+        Some(RefusedReason::VrfRoot)
+    } else if Framing::of(root.arphrd, root.flags) == Framing::Unsupported {
+        Some(RefusedReason::UnsupportedType {
+            arphrd: root.arphrd,
+        })
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +199,24 @@ pub(crate) struct InterfacePlan {
     /// c3/c4 only (c5 deletes): the checked first names (`lan[0]`, `wan[0]`
     /// under the same single-homed rule) that are absent from the topology.
     pub primary_missing: Vec<String>,
+    /// c3/c4 only (c5 deletes): the checked first names that are refused.
+    pub primary_refused: Vec<(String, RefusedReason)>,
+}
+
+impl InterfacePlan {
+    /// c3/c4 only (c5 deletes): the checked first names must exist and be bindable.
+    pub(crate) fn check_primary_names(&self) -> anyhow::Result<()> {
+        if !self.primary_missing.is_empty() {
+            bail!(
+                "configured interface {} does not exist",
+                self.primary_missing.join(", ")
+            );
+        }
+        if let Some((name, reason)) = self.primary_refused.first() {
+            bail!("configured interface {name} is refused: {reason}");
+        }
+        Ok(())
+    }
 }
 
 /// What the owner holds; moved into the apply step.
@@ -237,19 +326,14 @@ pub(crate) fn read_and_plan(
 }
 
 /// c3/c4 only (c5 deletes): startup stays fatal when a first LAN/WAN entry is
-/// absent or a binding derived from it (its root, ports, members) is not owned
+/// absent, refused, or a binding derived from it (its root, ports, members) is not owned
 /// after the bind. Failures of any other binding are the watcher's to retry.
 pub(crate) fn check_primary(
     plan: &InterfacePlan,
     owned: &[(NonZeroU32, Direction, TcProgram)],
     failed: &[(Binding, anyhow::Error)],
 ) -> anyhow::Result<()> {
-    if !plan.primary_missing.is_empty() {
-        bail!(
-            "configured interface {} does not exist",
-            plan.primary_missing.join(", ")
-        );
-    }
+    plan.check_primary_names()?;
     for binding in &plan.bindings {
         if plan.primary.contains(&binding.ifindex)
             && !owned.contains(&(binding.ifindex, binding.direction, binding.program))
@@ -396,23 +480,45 @@ fn note_unbound(unbound: &mut Vec<(String, UnboundReason)>, entry: &str, reason:
     }
 }
 
-/// Mark the root of every existing name with `lan`/`wan` intent; returns the
-/// root ifindex per name (`None` when the name is absent).
+/// What a configured name came to this round.
+#[derive(Clone, Copy)]
+enum Named {
+    Absent,
+    Refused(RefusedReason),
+    Root(NonZeroU32),
+}
+
+/// Mark the root of every bindable name with `lan`/`wan` intent; refused and
+/// absent names are reported in `unbound` and mark nothing.
 fn mark_roots<'a>(
     index: &Index<'a>,
     names: &[(String, String)],
     lan: bool,
     roots: &mut Vec<Root<'a>>,
     unbound: &mut Vec<(String, UnboundReason)>,
-) -> anyhow::Result<Vec<Option<NonZeroU32>>> {
+) -> anyhow::Result<Vec<Named>> {
     let mut ids = Vec::with_capacity(names.len());
     for (name, entry) in names {
-        let Some(link) = index.by_name.get(name.as_str()) else {
-            note_unbound(unbound, entry, UnboundReason::Absent);
-            ids.push(None);
+        // honk's own links are refused by configured name (`dae0peer` is in daens).
+        let owned = matches!(name.as_str(), "dae0" | "dae0peer");
+        let link = index.by_name.get(name.as_str());
+        let (Some(link), false) = (link, owned) else {
+            let (reason, named) = if owned {
+                let owned = RefusedReason::OwnedLink;
+                (UnboundReason::Refused(owned), Named::Refused(owned))
+            } else {
+                (UnboundReason::Absent, Named::Absent)
+            };
+            note_unbound(unbound, entry, reason);
+            ids.push(named);
             continue;
         };
         let root = canonical_root(index, link)?;
+        if let Some(reason) = refusal(root) {
+            note_unbound(unbound, entry, UnboundReason::Refused(reason));
+            ids.push(Named::Refused(reason));
+            continue;
+        }
         let slot = match roots.iter().position(|r| r.link.ifindex == root.ifindex) {
             Some(slot) => slot,
             None => {
@@ -430,7 +536,7 @@ fn mark_roots<'a>(
         } else {
             roots[slot].wan = true;
         }
-        ids.push(Some(root.ifindex));
+        ids.push(Named::Root(root.ifindex));
     }
     Ok(ids)
 }
@@ -441,7 +547,13 @@ fn bind(
     direction: Direction,
     lan: bool,
 ) {
-    let program = TcProgram::select(lan, direction, link.arphrd == libc::ARPHRD_ETHER);
+    // A bridge port or bond member the programs cannot parse is skipped.
+    let l2 = match Framing::of(link.arphrd, link.flags) {
+        Framing::L2 => true,
+        Framing::L3 => false,
+        Framing::Unsupported => return,
+    };
+    let program = TcProgram::select(lan, direction, l2);
     bindings
         .entry((link.ifindex, direction))
         .or_insert_with(|| Binding {
@@ -452,10 +564,12 @@ fn bind(
         });
 }
 
-fn dedup_roots(ids: &[Option<NonZeroU32>]) -> Vec<NonZeroU32> {
+fn dedup_roots(ids: &[Named]) -> Vec<NonZeroU32> {
     let mut out: Vec<NonZeroU32> = Vec::new();
-    for id in ids.iter().flatten() {
-        if !out.contains(id) {
+    for named in ids {
+        if let Named::Root(id) = named
+            && !out.contains(id)
+        {
             out.push(*id);
         }
     }
@@ -537,14 +651,18 @@ pub(crate) fn plan(
     }
     let mut primary = Vec::new();
     let mut primary_missing = Vec::new();
-    for (name, id) in checked {
-        match (name, id) {
-            (Some(_), Some(Some(id))) => {
+    let mut primary_refused = Vec::new();
+    for (name, named) in checked {
+        match (name, named) {
+            (Some(_), Some(Named::Root(id))) => {
                 if let Some(root) = roots.iter().find(|r| r.link.ifindex == *id) {
                     primary.extend_from_slice(&root.derived);
                 }
             }
-            (Some(name), Some(None)) => primary_missing.push(name.clone()),
+            (Some(name), Some(Named::Absent)) => primary_missing.push(name.clone()),
+            (Some(name), Some(Named::Refused(reason))) => {
+                primary_refused.push((name.clone(), *reason));
+            }
             _ => {}
         }
     }
@@ -560,6 +678,7 @@ pub(crate) fn plan(
         wan_roots,
         primary,
         primary_missing,
+        primary_refused,
     })
 }
 

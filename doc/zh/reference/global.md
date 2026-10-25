@@ -100,6 +100,17 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 
 网卡存在即绑定，不要求 `IFF_UP`。每个网卡有各自的角色：只在 `lan_interface` 中为 LAN，只在 `wan_interface` 中为 WAN，两者都出现为 LAN/WAN 共用（见[接口挂钩集合](../design/datapath.md#接口挂钩集合)），因此共用网卡不会改变其他 LAN 网卡的 hook。bond、bridge 或其他 master 的成员通过该 master 绑定，但 `vrf` 与 `openvswitch` 的成员保持自身。LAN bridge 同时绑定其端口，bond 绑定其成员。
 
+链路类型决定程序族：
+
+| 链路类型（`ifi_type`） | 帧格式 |
+| --- | --- |
+| 以太网：eth、bond/team（其第一个端口为以太网时）、bridge、vlan、macvlan/macvtap、ipvlan、veth、netkit、vxlan、geneve、gretap、tap、dummy、macsec | `_l2` |
+| `ARPHRD_NONE`（wireguard、tun、`collect_md` GRE、无 MAC 模式的 geneve/VXLAN-GPE）、PPP、RAWIP、IPIP、IP6TNL、SIT | `_l3` |
+| GRE / IP6GRE | 仅当置位 `IFF_POINTOPOINT` 且未置位 `IFF_BROADCAST` 时为 `_l3`；否则拒绝 |
+| `lo`、`vcan`、InfiniBand、802.15.4、nlmon 及其他所有类型 | 拒绝 |
+
+被拒绝的项不绑定任何 hook，在计划中记为 `unbound`，并在启动时记录一条指明网卡与原因的错误日志：链路类型不受支持、`vrf` 设备（请配置成员；VRF 成员绑定自身）或 `dae0`/`dae0peer`。类型不受支持的 bridge 端口或 bond 成员被静默跳过。bond 或 team master 的类型取自其当前第一个端口，因此 InfiniBand bond 会被拒绝。第一个已解析的 LAN 或 WAN 项被拒绝时启动失败。L3S 模式的 ipvlan 与 `reorder_hdr off` 的 VLAN 设备属于不支持的组合。
+
 启动时第一个已解析的 LAN 和 WAN 项必须存在并绑定成功，否则启动失败；后续项的失败记录警告并重试，后续不存在的项保持待定。`IfaceWatcher` 订阅 link、address 和 IPv4/IPv6 route 事件，并每 60 秒执行一次 reconciliation。它会随网卡和默认路由变化创建、更新或释放所需的 LAN/WAN hook。拓扑变化仍用于 ECS 刷新，并立即唤醒受健康状态控制的出站探测，但不再生成网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。网卡列表配置本身发生变化仍需重启；网关管理访问应使用[显式用户路由](./routing.md#显式本地路由)。
 
 真实 LAN 绑定还会执行提示性的[自保覆盖检查](./routing.md#显式本地路由)。无法确认时仅告警，不拒绝启动或重载，也不插入路由规则。

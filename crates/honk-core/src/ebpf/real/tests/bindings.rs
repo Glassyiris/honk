@@ -322,6 +322,7 @@ async fn kernel_held(
 }
 
 mod failure;
+mod framing;
 mod watcher;
 
 #[test]

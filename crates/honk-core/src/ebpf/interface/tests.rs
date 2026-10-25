@@ -624,3 +624,196 @@ fn startup_rejects_missing_first_name_but_not_extra_names_or_unresolved_auto() {
         .collect::<Vec<_>>();
     assert!(check_primary(&extra_missing, &owned, &[]).is_ok());
 }
+
+const LOOPBACK: u16 = 772;
+const IPGRE: u16 = 778;
+const IP6GRE: u16 = 823;
+const P2P: u32 = libc::IFF_POINTOPOINT as u32;
+const BROADCAST: u32 = libc::IFF_BROADCAST as u32;
+
+impl LinkSnapshot {
+    fn flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+}
+
+#[test]
+fn framing_table() {
+    use Framing::*;
+    for (arphrd, flags, want) in [
+        (1, 0, L2),
+        (0xfffe, 0, L3),
+        (512, 0, L3),
+        (519, 0, L3),
+        (768, 0, L3),
+        (769, 0, L3),
+        (776, 0, L3),
+        (IPGRE, P2P, L3),
+        (IP6GRE, P2P, L3),
+        (IPGRE, P2P | BROADCAST, Unsupported),
+        (IP6GRE, P2P | BROADCAST, Unsupported),
+        (IPGRE, 0, Unsupported),
+        (IP6GRE, BROADCAST, Unsupported),
+        (LOOPBACK, 0, Unsupported),
+        (32, 0, Unsupported),
+        (280, 0, Unsupported),
+        (803, 0, Unsupported),
+        (804, 0, Unsupported),
+        (824, 0, Unsupported),
+        (825, 0, Unsupported),
+        (0xffff, 0, Unsupported),
+        (778 + 1, 0, Unsupported),
+    ] {
+        assert_eq!(Framing::of(arphrd, flags), want, "{arphrd} {flags:#x}");
+    }
+    // Ethernet framing never depends on flags.
+    assert_eq!(Framing::of(1, P2P | BROADCAST), L2);
+}
+
+fn refused(arphrd: u16) -> UnboundReason {
+    UnboundReason::Refused(RefusedReason::UnsupportedType { arphrd })
+}
+
+#[test]
+fn unsupported_roots_are_refused_per_entry_and_bind_nothing() {
+    let links = vec![
+        link(1, "lo").arphrd(LOOPBACK).flags(P2P),
+        link(2, "ib0").arphrd(32),
+        link(3, "vcan0").arphrd(280),
+        link(4, "gre1").arphrd(IPGRE).flags(P2P | BROADCAST),
+        link(5, "gre2").arphrd(IPGRE),
+        link(6, "ens3"),
+    ];
+    let plan = run(&["ens3", "lo", "ib0", "gre1"], &["vcan0", "gre2"], &[links]);
+    assert_eq!(set(&plan), ["6 in lan_ingress_l2", "6 eg lan_egress_l2"]);
+    assert_eq!(
+        plan.unbound,
+        [
+            ("lo".to_string(), refused(LOOPBACK)),
+            ("ib0".to_string(), refused(32)),
+            ("gre1".to_string(), refused(IPGRE)),
+            ("vcan0".to_string(), refused(280)),
+            ("gre2".to_string(), refused(IPGRE)),
+        ]
+    );
+    // Refused roots are not primary; the bindable first entry is.
+    assert_eq!(plan.primary, ids(&[6]));
+    assert_eq!(
+        plan.primary_refused,
+        [(
+            "vcan0".to_string(),
+            RefusedReason::UnsupportedType { arphrd: 280 }
+        )]
+    );
+    assert_eq!(plan.lan_roots, ["ens3"]);
+    assert!(plan.wan_roots.is_empty());
+}
+
+#[test]
+
+fn vrf_root_is_refused_while_its_member_binds_itself() {
+    let links = vec![link(30, "vrf0").kind("vrf"), link(31, "m1").master(30)];
+    let plan = run(&["vrf0"], &["m1"], &[links.clone()]);
+    assert_eq!(
+        plan.unbound,
+        [(
+            "vrf0".to_string(),
+            UnboundReason::Refused(RefusedReason::VrfRoot)
+        )]
+    );
+    assert_eq!(set(&plan), ["31 in wan_ingress_l2", "31 eg wan_egress_l2"]);
+    assert_eq!(plan.primary_refused.len(), 1);
+    assert_eq!(
+        plan.wan_roots,
+        [(NonZeroU32::new(31).unwrap(), "m1".to_string())]
+    );
+    assert!(plan.check_primary_names().is_err());
+    // The member alone is fine.
+    let plan = run(&["m1"], &[], &[links]);
+    assert!(plan.unbound.is_empty() && plan.check_primary_names().is_ok());
+}
+
+#[test]
+fn honk_owned_links_are_refused_even_when_absent() {
+    let links = vec![link(40, "dae0")];
+    let plan = run(&["dae0", "dae0peer"], &[], &[base(), links]);
+    assert!(plan.bindings.is_empty());
+    assert_eq!(
+        plan.unbound,
+        [
+            (
+                "dae0".to_string(),
+                UnboundReason::Refused(RefusedReason::OwnedLink)
+            ),
+            (
+                "dae0peer".to_string(),
+                UnboundReason::Refused(RefusedReason::OwnedLink)
+            ),
+        ]
+    );
+    assert!(plan.primary_missing.is_empty());
+    assert_eq!(plan.primary_refused.len(), 1);
+}
+
+#[test]
+fn bond_root_takes_its_type_from_the_first_port() {
+    // An INFINIBAND bond is refused as a root; its members are never bound.
+    let links = vec![
+        link(20, "bond0").kind("bond").arphrd(32),
+        link(21, "m1").master(20).arphrd(32),
+    ];
+    for entry in ["bond0", "m1"] {
+        let plan = run(&[entry], &[], &[links.clone()]);
+        assert!(plan.bindings.is_empty(), "{entry}");
+        assert_eq!(plan.unbound, [(entry.to_string(), refused(32))], "{entry}");
+    }
+}
+
+#[test]
+fn unsupported_ports_and_members_are_skipped_silently() {
+    let mut links = bridge();
+    links.push(link(13, "p3").master(10).arphrd(32));
+    let plan = run(&["br0"], &[], &[links]);
+    assert!(plan.unbound.is_empty());
+    assert!(set(&plan).iter().all(|b| !b.starts_with("13 ")));
+    assert!(set(&plan).contains(&"11 in lan_ingress_l2".to_string()));
+
+    let mut links = bond();
+    links.push(link(23, "m3").master(20).arphrd(LOOPBACK));
+    let plan = run(&["bond0"], &[], &[links]);
+    assert!(plan.unbound.is_empty());
+    assert!(set(&plan).iter().all(|b| !b.starts_with("23 ")));
+}
+
+#[test]
+fn startup_rejects_refused_first_name_but_not_refused_extras() {
+    let refused_primary = run(&["lo", "eth1"], &[], &[base()]);
+    let error = check_primary(&refused_primary, &[], &[]).unwrap_err();
+    assert!(format!("{error:#}").contains("lo is refused"), "{error:#}");
+
+    let extra = run(&["ens3", "lo"], &[], &[base()]);
+    let owned = extra
+        .bindings
+        .iter()
+        .map(|b| (b.ifindex, b.direction, b.program))
+        .collect::<Vec<_>>();
+    assert!(check_primary(&extra, &owned, &[]).is_ok());
+    assert_eq!(extra.unbound, [("lo".to_string(), refused(LOOPBACK))]);
+}
+
+#[test]
+fn local_ip_interface_never_names_a_refused_root() {
+    let vrf = vec![link(30, "vrf0").kind("vrf"), link(31, "m1").master(30)];
+    let topo = topology(&[base(), vrf]);
+    // `lo`, a vrf root and `dae0` are refused: the first bindable root wins.
+    let plan = plan_for(&["lo", "vrf0", "dae0", "ens3"], &[], &topo);
+    assert_eq!(local_ip_interface(&plan), Some("ens3"));
+    // Refused LAN entries leave the WAN root as the source address.
+    let plan = plan_for(&["lo"], &["eth1"], &topo);
+    assert_eq!(local_ip_interface(&plan), Some("eth1"));
+    // Nothing bindable: no address, never `lo`'s.
+    let plan = plan_for(&["lo", "vrf0"], &[], &topo);
+    assert_eq!(local_ip_interface(&plan), None);
+    assert_eq!(local_ip(&plan), 0);
+}

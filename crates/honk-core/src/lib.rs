@@ -1100,12 +1100,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 &config.global.lan_interface,
                 &config.global.wan_interface,
             )?;
-            if !plan.primary_missing.is_empty() {
-                anyhow::bail!(
-                    "configured interface {} does not exist",
-                    plan.primary_missing.join(", ")
-                );
-            }
+            plan.check_primary_names()?;
             if let Some(lan) = plan.lan.first() {
                 let _ = sysctl::set_device_sysctl("ipv4", lan, "rp_filter", "0");
             }
@@ -1144,7 +1139,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 warn!("interface topology changed while binding; watcher will retry");
             }
             for (name, reason) in &plan.unbound {
-                warn!(interface = %name, ?reason, "interface binding is pending; watcher will retry");
+                match reason {
+                    ebpf::interface::UnboundReason::Refused(refused) => {
+                        error!(interface = %name, "interface is refused: {refused}");
+                    }
+                    _ => {
+                        warn!(interface = %name, ?reason, "interface binding is pending; watcher will retry");
+                    }
+                }
             }
 
             Box::new(backend)

@@ -39,6 +39,8 @@ for real_test in \
   ebpf::real::tests::bindings::failure::rejected_update_keeps_old_link_and_commits_the_healthy_direction \
   ebpf::real::tests::bindings::failure::device_deleted_before_verified_apply_reports_failure_without_recreating \
   ebpf::real::tests::bindings::failure::rename_after_planning_is_not_confirmed_and_update_rolls_back \
+  ebpf::real::tests::bindings::framing::gre_binds_l3_only_when_point_to_point \
+  ebpf::real::tests::bindings::framing::collect_md_gre_binds_l3 \
   ebpf::real::tests::mandatory_helpers::mandatory_programs_call_no_probe_read_helper \
   ebpf::real::tests::socket_identity::occupied_sock_ops_slot_refuses_startup_without_leaving_links \
   ebpf::real::receive_trace::tests::receive_trace_family_failure_is_isolated \

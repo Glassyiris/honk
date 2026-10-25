@@ -106,6 +106,17 @@ An empty `lan_interface` is literal: honk installs no LAN TC hooks and never sub
 
 An interface is bound as soon as it exists; `IFF_UP` is not required. Each interface has its own role: named only in `lan_interface` it is LAN, only in `wan_interface` WAN, in both shared LAN/WAN (see [Interface hook sets](../design/datapath.md#interface-hook-sets)), so a shared interface does not change the hooks of the other LAN interfaces. A member of a bond, bridge or other master is bound through that master, except `vrf` and `openvswitch` members, which stay themselves. A LAN bridge also binds its ports and a bond binds its members.
 
+The link type chooses the program family:
+
+| Link type (`ifi_type`) | Framing |
+| --- | --- |
+| Ethernet: eth, bond/team (while their first port is Ethernet), bridge, vlan, macvlan/macvtap, ipvlan, veth, netkit, vxlan, geneve, gretap, tap, dummy, macsec | `_l2` |
+| `ARPHRD_NONE` (wireguard, tun, `collect_md` GRE, geneve/VXLAN-GPE in no-MAC mode), PPP, RAWIP, IPIP, IP6TNL, SIT | `_l3` |
+| GRE / IP6GRE | `_l3` only when `IFF_POINTOPOINT` is set and `IFF_BROADCAST` is not; otherwise refused |
+| `lo`, `vcan`, InfiniBand, 802.15.4, nlmon, and every other type | refused |
+
+A refused entry binds nothing, appears as an `unbound` row in the plan and is logged once at startup as an error naming the interface and reason: unsupported link type, `vrf` device (configure a member; members of a VRF bind themselves), or `dae0`/`dae0peer`. A bridge port or bond member of an unsupported type is skipped silently. A bond or team master takes its type from its current first port, so an InfiniBand bond is refused. If the first resolved LAN or WAN entry is refused, startup fails. ipvlan in L3S mode and a VLAN device with `reorder_hdr off` are unsupported combinations.
+
 At startup the first resolved LAN and WAN entries must exist and bind, or startup fails; failures on later entries log a warning and are retried, and absent later entries stay pending. `IfaceWatcher` subscribes to link, address, and IPv4/IPv6 route events and also performs a 60-second reconciliation. It creates, updates, or drops the required LAN/WAN hooks as interfaces and default routes change. A changed topology immediately wakes health-backed outbound probing. Interface addresses remain observed for topology/ECS/health events, but startup, reload, and network events never synthesize gateway-address routing rules. Configure [explicit local rules](./routing.md#explicit-local-rules) when needed. Interface-list configuration changes themselves require restart.
 
 Real LAN bindings also receive an advisory [self-protection coverage check](./routing.md#explicit-local-rules). An unconfirmed result warns without rejecting startup/reload or inserting routing rules.
