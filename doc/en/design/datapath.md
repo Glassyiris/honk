@@ -40,23 +40,33 @@ The process otherwise remains in the host namespace. `with_daens_netns` serializ
 
 ### Interface hook sets
 
-Ethernet interfaces use the `_l2` programs; interfaces without an Ethernet header use `_l3`. Bridge and bond slaves receive equivalent owned hooks because traffic may bypass the master's hooks.
+An interface uses the `_l2` programs when its link type is Ethernet (`ARPHRD_ETHER`) and `_l3` otherwise; each bridge port and bond member applies that rule to itself. Every program variant is preloaded with the BPF object, before the BPF logger starts, so runtime reconciliation creates only TCX links and never loads a program.
 
-| Topology | LAN-side hooks | WAN-side hooks |
-| --- | --- | --- |
-| Dual-homed | `lan_ingress` + `lan_egress` on LAN | `wan_ingress` + `wan_egress` on WAN |
-| Single-homed, shared LAN/WAN interface | `lan_ingress` | `wan_egress`; `lan_egress` and `wan_ingress` are skipped |
-| WAN-only, no configured LAN interface | None | `wan_ingress` + `wan_egress` |
+Each configured name resolves to a canonical root: a member of a bond or bridge resolves to that master, a bond that is a bridge port resolves to the bridge, and a member of any other master resolves to it, except that `vrf` and `openvswitch` members stay themselves. Roots are planned independently. A root named only in `lan_interface` is LAN, only in `wan_interface` is WAN, and in both is shared LAN/WAN:
+
+| Root role | Hooks |
+| --- | --- |
+| LAN | `lan_ingress` + `lan_egress` |
+| WAN | `wan_ingress` + `wan_egress` |
+| Shared LAN/WAN | `lan_ingress` + `wan_egress`; `lan_egress` and `wan_ingress` are skipped |
+
+The role is per interface, so one shared interface in a multi-LAN configuration no longer changes the hooks of the other LAN interfaces. Traffic may bypass a master's hooks, so a LAN bridge root also binds every port (LAN role; a WAN name never upgrades it). A bond root binds every member: `lan_ingress` + `wan_egress` for a LAN bond, `wan_egress` for a WAN bond. A WAN-only deployment (no `lan_interface`) installs no LAN hooks.
 
 `lan_ingress` classifies forwarded client traffic. `wan_egress` independently classifies traffic created by the host. The reverse-direction ingress/egress hooks refresh existing connection state where the topology provides separate directions. Only a forward TCP SYN publishes TCP state: a reverse-direction pure SYN neither creates nor refreshes it.
 
-On Linux 6.12+, Aya uses FD-owned TCX BPF links; startup, rebind and shutdown drop only owned links. honk neither creates nor deletes `clsact` qdiscs or legacy filters on physical interfaces; remove unwanted leftovers manually. Startup recreates the stale `dae0`/`dae0peer` pair. Kernel options are listed in [Getting started](../how-to-start.md#kernel-configuration).
+On Linux 6.12+, honk creates interface hooks as FD-owned TCX BPF links, appended after any other TCX programs; startup, rebind and shutdown drop only owned links. honk neither creates nor deletes `clsact` qdiscs or legacy filters on physical interfaces; remove unwanted leftovers manually. Startup recreates the stale `dae0`/`dae0peer` pair. Kernel options are listed in [Getting started](../how-to-start.md#kernel-configuration).
 
 Mark-preserving, unguarded passes return `TC_ACT_UNSPEC` (`-1`, TCX `NEXT`), including reverse refresh and DNS skip, so subsequent TCX programs can run. `TC_ACT_PIPE` is not continuation on the floor kernel. Mark writers, including explicit WAN zero, and LAN classified/pending or WAN exact socket-mark/classified ownership guards return `TC_ACT_OK` (`0`, TCX `PASS`) and terminate the chain.
 
-### Dynamic interface reconciliation
+### Interface reconciliation
 
-`auto` resolves to the current default-route interface. If no default route exists, the entry stays unattached rather than falling back to loopback. `IfaceWatcher` subscribes to rtnetlink link, IPv4/IPv6 address, and IPv4/IPv6 route groups; a 60-second reconciliation tick backs up event delivery. Reconciliation re-resolves `auto`, detects interface recreation by ifindex, recalculates single- versus dual-homed roles, and attaches or forgets process-owned hooks.
+One `InterfaceBindings` owner holds the preloaded program FDs and one FD-owned TCX link per owned `(ifindex, direction)`. Startup reads one rtnetlink topology snapshot, derives the plan, resolves `local_ip`, loads the BPF object, then binds: it is fatal when the topology cannot be read, when the first resolved LAN or WAN entry is absent, or when any binding derived from that entry (its root, ports, members) is not owned afterwards. Failures on later entries log a warning and the watcher retries; absent later entries stay pending. The watcher starts without seeds and re-reads the topology itself.
+
+An interface that exists is bound; `IFF_UP` is not required. `auto` (trimmed, ASCII case-insensitive, or empty) resolves to the current default-route interface and stays pending, never `lo`, while no IPv4 default route exists; `/proc/net/route` is read only when an entry is `auto`, and a read error fails the plan instead of meaning "no default route".
+
+`IfaceWatcher` subscribes to rtnetlink link, IPv4/IPv6 address, and IPv4/IPv6 route groups, drains at most 64 messages per batch, and a 60-second tick backs up event delivery. Each batch runs outside the backend lock: read the topology and plan; take the backend read lock only to copy a snapshot of owned links; apply the plan (TCX create/update/query, the post-change topology recheck, FD close, sysctl) with no lock; then take the write lock only to transfer the resulting commit, and close replaced FDs after releasing it. A retained link is verified against a namespace-local `BPF_PROG_QUERY` when the batch saw a link message, an overflowed drain, or the tick; pure address/route batches with an unchanged plan skip the query. An unchanged plan with healthy links commits nothing; a role change updates the existing link in place (`BPF_F_REPLACE`) instead of stacking another. If the link changed between the dump and the attach, the new link is dropped and the batch retries once.
+
+Shutdown sends stop and joins the watcher, which awaits any in-flight batch (a warning follows the stage timeout, but the join continues) before the BPF hooks are dropped. Startup writes `accept_ra=2` for every WAN root and `rp_filter=0` for the first LAN name; a WAN root bound later, or moved onto a WAN egress hook, has `accept_ra` enabled when its commit lands.
 
 A changed link/address/route/interface role updates topology observations, clears health-check cooldowns, and triggers fresh probes. Interface addresses also remain available for ECS; no startup, reload, or network event synthesizes `direct(must)` routing rules or a hidden kernel replacement allowlist. Dead UDP and multi-leaf outbounds remain fail-closed until a fresh probe succeeds; a sole TCP leaf with no `final` remains a userspace last resort.
 
@@ -65,9 +75,9 @@ A changed link/address/route/interface role updates topology observations, clear
 | Program | Hook | Kernel responsibility |
 | --- | --- | --- |
 | `lan_ingress_l2`, `lan_ingress_l3` | TC ingress on LAN | Admission check, special/control-plane and non-DNS local bypass, per-source new-flow limit, ordered routing including port-53 ownership, connection state, direct offload, proxy redirect, TX accounting, fragment-verdict recording, and optional ambiguous-UDP staging. |
-| `wan_ingress_l2`, `wan_ingress_l3` | TC ingress on WAN | Refresh reverse-direction connection state; not attached in a single-homed topology. |
-| `lan_egress_l2`, `lan_egress_l3` | TC egress on LAN | Refresh reverse connection state without creating UDP entries from `dae0`; suppress locally generated ICMPv6 Redirects. Skipped on the shared interface in a single-homed topology. |
-| `wan_egress_l2`, `wan_egress_l3` | TC egress on WAN | Route host-originated TCP/UDP, apply process-name and control-plane bypass data, check outbound connectivity, cache decisions, and redirect proxy traffic; suppress locally generated ICMPv6 Redirects (the shared interface's LAN-egress hook is skipped in a single-homed topology). |
+| `wan_ingress_l2`, `wan_ingress_l3` | TC ingress on WAN | Refresh reverse-direction connection state; not attached on a shared LAN/WAN interface. |
+| `lan_egress_l2`, `lan_egress_l3` | TC egress on LAN | Refresh reverse connection state without creating UDP entries from `dae0`; suppress locally generated ICMPv6 Redirects. Skipped on a shared LAN/WAN interface. |
+| `wan_egress_l2`, `wan_egress_l3` | TC egress on WAN | Route host-originated TCP/UDP, apply process-name and control-plane bypass data, check outbound connectivity, cache decisions, and redirect proxy traffic; suppress locally generated ICMPv6 Redirects (a shared LAN/WAN interface's LAN-egress hook is skipped). |
 | `dae0_ingress` | TC ingress on host `dae0` | Restore reply framing and RX attribution from `REDIRECT_TRACK`, or uncounted client-only fallback; [renew eligible UDP owners](#udp-lifetime-renewal). |
 | `dae0peer_ingress` | TC ingress on `daens` `dae0peer` | Restore UDP53 provenance and SYN incarnation after link scrub; assign UDP listeners. TCP retains native established/TIME_WAIT lookup. |
 | `tproxy_sk_lookup` | `sk_lookup` in `daens` | Override ordinary socket lookup with a transparent listener from `LISTEN_SOCKET_MAP`. |
@@ -81,10 +91,10 @@ A changed link/address/route/interface role updates topology observations, clear
 - TC entry points are raw `#[unsafe(no_mangle)] #[unsafe(link_section = "classifier")]` functions taking `*mut __sk_buff`, not Aya's `#[tc]`, whose structured argument shape triggers a verifier rejection on kernels ≥7.0. Bodies return `Verdict = Result<c_long, c_long>` (`action::Verdict`): `Ok` normal, `Err` early exit; both carry real `TC_ACT_*` values, reduced to kernel `i32` by `flatten` (`action::flatten`). `src/action.rs` owns `TC_ACT_*`. Keep parser and helper sentinels (for example `transport::ERR_FALLBACK`, `ERR_FRAGMENT`, and `PASS_UNSUPPORTED`) separate from verdicts; the `bpf_loop` callback's continuation values are separate as well.
   `src/sk.rs`: `sk_assign_by_index` is TC's counterpart to aya `SockMap::redirect_sk_lookup` (which accepts only `SkLookupContext`); `probe_udp_socket` looks up non-DNS local UDP sockets. All helpers release implicit lookup references. Programs:
     - `lan_ingress_l2/l3` — LAN classify/route/redirect, ordered-policy DNS ownership, `CLASSIFIED_MARK` dedup, and unique-token staging of only ambiguous non-DNS UDP decisions into Pending when NFQUEUE is enabled and ready; enabled-but-not-ready staging fails closed (`src/ingress.rs`).
-    - `wan_ingress_l2/l3` — reverse-direction conntrack refresh (skipped single-homed).
+    - `wan_ingress_l2/l3` — reverse-direction conntrack refresh (skipped on a shared LAN/WAN interface).
     - `lan_egress_l2/l3`, `wan_egress_l2/l3` (`src/egress.rs`) — reverse conn state; locally-originated traffic routing (pname via the actual skb socket's `SOCKET_IDENTITY`, control-plane bypass, `OUTBOUND_CONNECTIVITY_MAP` aliveness, redirect to control plane). Live non-DNS WAN UDP entries take a lookup-only cached-route path; misses route once and then publish complete conntrack metadata.
     - `dae0_ingress` — reply MAC rewrite and redirect to the original LAN iface. Unknown-peer UDP replies use client-only framing without outbound attribution; honk's own link sources never use it.
-    - LAN and WAN egress suppress only locally originated ICMPv6 Redirects, using the parser's ICMPv6 header after extension traversal; forwarded Redirects and other ICMPv6 remain pass-through. The WAN hook carries this invariant on a single-homed topology's shared interface, where `lan_egress` is not attached. `honk-core/tests/ebpf_datapath_test.rs` checks L2 through `BPF_PROG_TEST_RUN` and L3 on isolated TUN interfaces, alongside exact-tuple RX accounting and cached-route policy.
+    - LAN and WAN egress suppress only locally originated ICMPv6 Redirects, using the parser's ICMPv6 header after extension traversal; forwarded Redirects and other ICMPv6 remain pass-through. The WAN hook carries this invariant on a shared LAN/WAN interface, where `lan_egress` is not attached. `honk-core/tests/ebpf_datapath_test.rs` checks L2 through `BPF_PROG_TEST_RUN` and L3 on isolated TUN interfaces, alongside exact-tuple RX accounting and cached-route policy.
     - `dae0peer_ingress` — restores UDP53 provenance and TCP SYN incarnation; assigns UDP with `bpf_sk_assign` from the redirect site's `cb[4]` marker `0x100 | index`, without parsing packet bytes. Missing markers leave UDP to `sk_lookup`; TCP SYN retains its `cb[3]`/`cb[4]` incarnation carrier and native established/TIME_WAIT processing.
     - cgroup sock_create/connect4/6/sendmsg4/6 (`src/cgroup.rs`) — first-captured `SocketIdentity{pid, pname}` retained in native socket storage for process-name rules and control-plane bypass. `pname` is the 15-byte `argv[0]` executable basename read through runtime kernel-BTF offsets, with thread `comm` as the unavailable/read-failure fallback. Kernel socket destruction reclaims the storage; there is no release hook or cookie janitor. Missing required cgroup/storage support aborts startup. These hooks sit on the root cgroup, so a capture failure (storage allocation or optmem charge) never denies the host operation: it is counted, and the socket's traffic has no identity, so process-name rules do not match it. Honk's own sockets remain recognized by `dae_socket_mark`.
 

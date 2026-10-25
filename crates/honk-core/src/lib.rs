@@ -117,57 +117,6 @@ fn total_memory_bytes() -> Option<u64> {
     Some(kib.saturating_mul(1024))
 }
 
-#[cfg(feature = "ebpf")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConfiguredInterfaces {
-    pub(crate) lan: Vec<String>,
-    pub(crate) wan: Vec<String>,
-    pub(crate) single_homed: bool,
-}
-
-#[cfg(feature = "ebpf")]
-pub(crate) fn configured_interfaces(config: &honk_config::Config) -> ConfiguredInterfaces {
-    let default_interface = detect_default_interface();
-    let lan = resolve_configured_interface_names(
-        &config.global.lan_interface,
-        default_interface.as_deref(),
-    );
-    let wan = resolve_configured_interface_names(
-        &config.global.wan_interface,
-        default_interface.as_deref(),
-    );
-    let single_homed = !wan.is_empty() && lan.iter().any(|name| wan.contains(name));
-    ConfiguredInterfaces {
-        lan,
-        wan,
-        single_homed,
-    }
-}
-
-/// Resolve an interface list against one default-route snapshot. An unresolved
-/// `auto` entry stays pending instead of binding the datapath to loopback.
-#[cfg(feature = "ebpf")]
-pub(crate) fn resolve_configured_interface_names(
-    configured: &[String],
-    default_interface: Option<&str>,
-) -> Vec<String> {
-    let mut resolved = Vec::with_capacity(configured.len());
-    for name in configured {
-        let name = if name == "auto" || name.is_empty() {
-            let Some(default_interface) = default_interface else {
-                continue;
-            };
-            default_interface
-        } else {
-            name.as_str()
-        };
-        if !resolved.iter().any(|existing| existing == name) {
-            resolved.push(name.to_string());
-        }
-    }
-    resolved
-}
-
 /// Detect the interface used by the IPv4 default route.
 #[cfg(feature = "ebpf")]
 ///
@@ -1073,8 +1022,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
 
     #[cfg(feature = "ebpf")]
-    let configured_ifaces = configured_interfaces(&config);
-    #[cfg(feature = "ebpf")]
     if !mock_mode
         && detect_default_interface().is_none()
         && config
@@ -1082,7 +1029,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             .lan_interface
             .iter()
             .chain(&config.global.wan_interface)
-            .any(|name| name == "auto" || name.is_empty())
+            .any(|name| honk_config::config::is_auto_interface(name))
     {
         warn!(
             "default route unavailable; auto interface binding is pending until a network route appears"
@@ -1117,13 +1064,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         #[cfg(feature = "ebpf")]
         {
-            if let Some(lan_ifname) = configured_ifaces.lan.first() {
-                let _ = sysctl::set_device_sysctl("ipv4", lan_ifname, "rp_filter", "0");
-            }
             _dae0_link = Some(daens::create_dae0_link()?);
-            for wan_ifname in &configured_ifaces.wan {
-                sysctl::enable_wan_accept_ra(wan_ifname);
-            }
             info!(
                 "dae0 link created before eBPF load (ifindex={})",
                 _dae0_link.as_ref().unwrap().1.ifindex()
@@ -1137,8 +1078,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         _dae0_link = None;
     }
 
-    #[cfg(feature = "ebpf")]
-    let mut attached_ifaces: ebpf::real::AttachedMap = Default::default();
     let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
@@ -1157,11 +1096,22 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     DEFAULT_BPF_OBJECT.to_vec()
                 }
             };
-            let lan_ifnames = &configured_ifaces.lan;
-            let wan_ifnames = &configured_ifaces.wan;
-            let single_homed = configured_ifaces.single_homed;
-            let primary_lan = lan_ifnames.first().map(String::as_str);
-            let primary_wan = wan_ifnames.first().map(String::as_str).unwrap_or("");
+            let (mut topology, mut plan) = ebpf::interface::read_and_plan(
+                &config.global.lan_interface,
+                &config.global.wan_interface,
+            )?;
+            if !plan.primary_missing.is_empty() {
+                anyhow::bail!(
+                    "configured interface {} does not exist",
+                    plan.primary_missing.join(", ")
+                );
+            }
+            if let Some(lan) = plan.lan.first() {
+                let _ = sysctl::set_device_sysctl("ipv4", lan, "rp_filter", "0");
+            }
+            for (_, name) in &plan.wan_roots {
+                sysctl::enable_wan_accept_ra(name);
+            }
             let (_, dae0_setup) = _dae0_link
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("dae0 link setup missing before eBPF load"))?;
@@ -1170,93 +1120,31 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 &cli.bpf_pin_root,
                 config.global.tproxy_port,
                 dae0_setup,
-                primary_lan,
-                primary_wan,
-                single_homed,
+                ebpf::interface::local_ip(&plan),
             )
             .await?;
-
-            if let Some(primary_lan) = primary_lan
-                && let Ok(i) = netlink::ifindex_of(primary_lan)
-            {
-                attached_ifaces.insert(
-                    primary_lan.to_string(),
-                    ebpf::real::AttachedInterface {
-                        ifindex: i,
-                        role: if single_homed {
-                            ebpf::IfaceRole::LanWan
-                        } else {
-                            ebpf::IfaceRole::Lan
-                        },
-                        hooks: ebpf::DynamicHooks {
-                            ingress: true,
-                            egress: true,
-                        },
-                    },
-                );
+            let mut report = backend.bind_interfaces(&plan, &topology);
+            if report.topology_changed {
+                (topology, plan) = ebpf::interface::read_and_plan(
+                    &config.global.lan_interface,
+                    &config.global.wan_interface,
+                )?;
+                report = backend.bind_interfaces(&plan, &topology);
             }
-            if !single_homed
-                && !primary_wan.is_empty()
-                && let Ok(i) = netlink::ifindex_of(primary_wan)
-            {
-                attached_ifaces.insert(
-                    primary_wan.to_string(),
-                    ebpf::real::AttachedInterface {
-                        ifindex: i,
-                        role: ebpf::IfaceRole::Wan,
-                        hooks: ebpf::DynamicHooks {
-                            ingress: true,
-                            egress: true,
-                        },
-                    },
-                );
+            let owned = backend
+                .owned_bindings()
+                .map(|binding| (binding.ifindex, binding.direction, binding.program))
+                .collect::<Vec<_>>();
+            ebpf::interface::check_primary(&plan, &owned, &report.failed)?;
+            for (binding, error) in &report.failed {
+                warn!(interface = %binding.interface, program = binding.program.name(),
+                    "interface attach failed; watcher will retry: {error:#}");
             }
-            for extra_lan in lan_ifnames.iter().skip(1) {
-                match backend.attach_lan(extra_lan, single_homed) {
-                    Ok(hooks) => {
-                        if let Ok(i) = netlink::ifindex_of(extra_lan) {
-                            attached_ifaces.insert(
-                                extra_lan.clone(),
-                                ebpf::real::AttachedInterface {
-                                    ifindex: i,
-                                    role: if single_homed && wan_ifnames.contains(extra_lan) {
-                                        ebpf::IfaceRole::LanWan
-                                    } else {
-                                        ebpf::IfaceRole::Lan
-                                    },
-                                    hooks,
-                                },
-                            );
-                        }
-                    }
-                    Err(e) => warn!("Failed to attach LAN programs to {}: {}", extra_lan, e),
-                }
+            if report.topology_changed {
+                warn!("interface topology changed while binding; watcher will retry");
             }
-            for extra_wan in wan_ifnames.iter().skip(1) {
-                let egress = backend.attach_wan_egress(extra_wan);
-                if let Err(e) = &egress {
-                    warn!("Failed to attach WAN egress to {}: {}", extra_wan, e);
-                }
-                let ingress = backend.attach_wan_ingress(extra_wan);
-                if let Err(e) = &ingress {
-                    warn!("Failed to attach WAN ingress to {}: {}", extra_wan, e);
-                }
-                let hooks = ebpf::DynamicHooks {
-                    ingress: ingress.is_ok(),
-                    egress: egress.is_ok(),
-                };
-                if (hooks.ingress || hooks.egress)
-                    && let Ok(i) = netlink::ifindex_of(extra_wan)
-                {
-                    attached_ifaces.insert(
-                        extra_wan.clone(),
-                        ebpf::real::AttachedInterface {
-                            ifindex: i,
-                            role: ebpf::IfaceRole::Wan,
-                            hooks,
-                        },
-                    );
-                }
+            for (name, reason) in &plan.unbound {
+                warn!(interface = %name, ?reason, "interface binding is pending; watcher will retry");
             }
 
             Box::new(backend)
@@ -1434,7 +1322,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             control_plane.ebpf_handle(),
             control_plane.config_handle(),
             control_plane.command_sender(),
-            attached_ifaces,
             Arc::clone(&degradations),
         )
     } else {

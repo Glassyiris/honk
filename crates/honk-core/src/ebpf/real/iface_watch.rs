@@ -1,19 +1,30 @@
 //! Rtnetlink watcher for configured interfaces and `auto` default routes.
-//! Link, address, and route events reconcile late/recreated interfaces plus
-//! LAN bridge/bond and WAN bond slaves against the process-owned TC links.
+//!
+//! Link, address, route events and a slow ticker re-read the topology, plan
+//! the TCX bindings once and reconcile them against the backend's single
+//! owner (`bindings`). Every step that can wait on rtnl (link dump, TCX
+//! create/update/query, closing a link FD, sysctl) runs on a blocking thread
+//! with no backend lock held; the backend lock is taken only to snapshot
+//! (read) and to commit (write, O(1) transfers).
 
+use nix::errno::Errno;
 use nix::sys::socket::{
     AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, socket,
 };
-use std::collections::{HashMap, HashSet};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::collections::HashSet;
+use std::num::NonZeroU32;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use tokio::sync::{RwLock, mpsc, watch};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use crate::ebpf::{DynamicHooks, EbpfBackend, IfaceRole};
+use crate::ebpf::EbpfBackend;
+use crate::ebpf::interface::{
+    self, ApplyReport, Binding, BindingSnapshot, Direction, InterfacePlan, TcProgram, Topology,
+};
 
 // A captive-portal login may add only a default route to an already-up link.
 const RTMGRP_LINK_MASK: u32 = 1;
@@ -26,22 +37,36 @@ const RTMGRP_NETWORK_MASK: u32 = RTMGRP_LINK_MASK
     | RTMGRP_IPV4_ROUTE
     | RTMGRP_IPV6_IFADDR
     | RTMGRP_IPV6_ROUTE;
-const IFF_UP: u32 = 0x1;
-// Events are a wakeup hint only — reconcile re-reads ground truth from
-// /sys — but a dropped datagram would stall a pending interface forever,
-// so a slow ticker backstops the subscription.
+const RTM_NEWLINK: u16 = 16;
+const RTM_DELLINK: u16 = 17;
+// Events are a wakeup hint only — reconcile re-reads ground truth — but a
+// dropped datagram would stall a pending interface forever, so a slow ticker
+// backstops the subscription.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
-/// Attach state per interface name. Program role is part of the identity:
-/// LAN ingress and WAN ingress occupy the same direction but are not
-/// interchangeable when an `auto` route changes topology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AttachedInterface {
-    pub ifindex: u32,
-    pub role: IfaceRole,
-    pub hooks: DynamicHooks,
+
+type ReadTopology = dyn Fn(bool) -> anyhow::Result<Topology> + Send + Sync;
+type ApplyBindings =
+    dyn Fn(BindingSnapshot, &InterfacePlan, &Topology, bool) -> ApplyReport + Send + Sync;
+type AcceptRa = dyn Fn(&str) + Send + Sync;
+
+/// The blocking steps of a batch, injectable so watcher logic is tested
+/// without a kernel.
+#[derive(Clone)]
+pub(super) struct Reconciler {
+    read_topology: Arc<ReadTopology>,
+    apply: Arc<ApplyBindings>,
+    accept_ra: Arc<AcceptRa>,
 }
 
-pub type AttachedMap = HashMap<String, AttachedInterface>;
+impl Default for Reconciler {
+    fn default() -> Self {
+        Self {
+            read_topology: Arc::new(interface::read_topology),
+            apply: Arc::new(super::bindings::apply),
+            accept_ra: Arc::new(crate::sysctl::enable_wan_accept_ra),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NetworkState {
@@ -55,13 +80,10 @@ pub struct IfaceWatcher {
 }
 
 impl IfaceWatcher {
-    /// `attached` seeds the names (with ifindex and directions) already
-    /// hooked during startup so the first reconcile does not attach twice.
     pub(crate) fn spawn(
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
-        attached: AttachedMap,
         degradations: Arc<crate::degradations::Degradations>,
     ) -> Option<Self> {
         let fd = match subscribe_network_events() {
@@ -79,19 +101,29 @@ impl IfaceWatcher {
             }
         };
         let (stop, rx) = watch::channel(false);
-        let handle = tokio::spawn(run(fd, ebpf, config, commands, attached, rx, degradations));
+        let handle = tokio::spawn(run(
+            fd,
+            ebpf,
+            config,
+            commands,
+            rx,
+            degradations,
+            Reconciler::default(),
+        ));
         Some(Self { handle, stop })
     }
 
+    /// Stop between batches and wait for the task. A batch in flight always
+    /// finishes: aborting would not stop its blocking thread, which holds dup'd
+    /// link FDs that must be closed before `detach_hooks` can detach anything.
     pub async fn shutdown(self, timeout: Duration) {
         let _ = self.stop.send(true);
         let mut handle = self.handle;
-        // A watcher wedged mid-reconcile holds the backend write lock and
-        // could re-attach hooks after detach_hooks — abort it rather than
-        // drop the handle and leave the task running into teardown.
-        if tokio::time::timeout(timeout, &mut handle).await.is_err() {
-            handle.abort();
-            let _ = (&mut handle).await;
+        while tokio::time::timeout(timeout, &mut handle).await.is_err() {
+            warn!(
+                ?timeout,
+                "interface watcher is still finishing a blocking step; waiting for it"
+            );
         }
     }
 }
@@ -117,14 +149,74 @@ fn subscribe_network_events() -> std::io::Result<OwnedFd> {
     Ok(fd)
 }
 
+/// What one bounded drain of the subscription saw.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Drained {
+    /// The socket ran dry (as opposed to hitting the 64-message bound).
+    empty: bool,
+    /// A link was added, changed or removed: retained links need re-proving.
+    link_event: bool,
+    /// The kernel dropped events: anything may have changed.
+    overrun: bool,
+}
+
+impl Drained {
+    fn verify(&self) -> bool {
+        self.link_event || self.overrun
+    }
+}
+
+/// True when the datagram carries an `RTM_NEWLINK` or `RTM_DELLINK` message.
+fn has_link_message(datagram: &[u8]) -> bool {
+    let mut offset = 0;
+    while let Some(header) = datagram.get(offset..offset + 16) {
+        let length = u32::from_ne_bytes(header[0..4].try_into().unwrap()) as usize;
+        let kind = u16::from_ne_bytes(header[4..6].try_into().unwrap());
+        if matches!(kind, RTM_NEWLINK | RTM_DELLINK) {
+            return true;
+        }
+        if length < 16 {
+            return false;
+        }
+        offset += (length + 3) & !3;
+    }
+    false
+}
+
+fn drain(fd: RawFd, buf: &mut [u8]) -> std::io::Result<Drained> {
+    drain_with(buf, |buffer| recv(fd, buffer, MsgFlags::empty()))
+}
+
+fn drain_with(
+    buf: &mut [u8],
+    mut receive: impl FnMut(&mut [u8]) -> nix::Result<usize>,
+) -> std::io::Result<Drained> {
+    let mut drained = Drained::default();
+    // Bound a burst so stop and the ticker cannot starve behind netlink traffic.
+    for _ in 0..64 {
+        match receive(buf) {
+            Ok(len) => drained.link_event |= has_link_message(&buf[..len.min(buf.len())]),
+            Err(Errno::ENOBUFS) => drained.overrun = true,
+            Err(Errno::EINTR) => {}
+            Err(Errno::EAGAIN) => {
+                drained.empty = true;
+                return Ok(drained);
+            }
+            Err(_) if drained.overrun => return Ok(drained),
+            Err(errno) => return Err(errno.into()),
+        }
+    }
+    Ok(drained)
+}
+
 async fn run(
     fd: OwnedFd,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
-    mut attached: AttachedMap,
     mut stop: watch::Receiver<bool>,
     degradations: Arc<crate::degradations::Degradations>,
+    reconciler: Reconciler,
 ) {
     let async_fd = match unsafe {
         tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE)
@@ -143,43 +235,34 @@ async fn run(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buf = [0u8; 8192];
     let mut network_state = read_network_state(&config).await;
-    let mut pending_notification = true;
     let mut netlink_retry_at = tokio::time::Instant::now();
-    let mut attach_warned = HashSet::new();
+    let notification_queue = commands.clone();
+    let mut watch = Watch::new(ebpf, config, commands, reconciler);
 
     // Interface-dependent state may have changed before the watcher was ready;
     // the control-plane refresh is content-deduplicated.
-    reconcile_and_notify(
-        &ebpf,
-        &config,
-        &commands,
-        &mut attached,
-        &mut attach_warned,
-        true,
-        &mut pending_notification,
-    )
-    .await;
+    watch.reconcile_and_notify(true, true).await;
     loop {
         tokio::select! {
             biased;
             _ = stop.changed() => break,
-            permit = commands.reserve(), if pending_notification => {
+            permit = notification_queue.reserve(), if watch.pending_notification => {
                 match permit {
                     Ok(permit) => { permit.send(crate::control::ControlCommand::NetworkChanged); }
                     Err(_) => debug!("control plane stopped before network-change refresh"),
                 }
-                pending_notification = false;
+                watch.pending_notification = false;
             }
             _ = ticker.tick() => {
-                let changed = update_network_state(&config, &mut network_state).await;
-                reconcile_and_notify(&ebpf, &config, &commands, &mut attached, &mut attach_warned, changed, &mut pending_notification).await;
+                let changed = update_network_state(&watch.config, &mut network_state).await;
+                watch.reconcile_and_notify(changed, true).await;
             }
             guard = async {
                 tokio::time::sleep_until(netlink_retry_at).await;
                 async_fd.readable().await
             } => {
-                // A transient read failure (ENOBUFS after a burst) must not
-                // kill the watcher: the ticker keeps reconciling regardless.
+                // A transient read failure must not kill the watcher: the
+                // ticker keeps reconciling regardless.
                 let mut guard = match guard {
                     Ok(g) => g,
                     Err(e) => {
@@ -188,34 +271,13 @@ async fn run(
                         continue;
                     }
                 };
-                // Drain pending network events; their contents are irrelevant
-                // because reconcile re-derives state from /sys and /proc.
-                let drained = guard.try_io(|inner| {
-                    // Bound a burst so stop and the ticker cannot starve behind netlink traffic.
-                    for _ in 0..64 {
-                        match recv(inner.as_raw_fd(), &mut buf, MsgFlags::empty()) {
-                            Ok(_) => {}
-                            Err(errno) => {
-                                let e = std::io::Error::from(errno);
-                                if e.kind() == std::io::ErrorKind::WouldBlock {
-                                    return Ok(true);
-                                }
-                                if e.kind() == std::io::ErrorKind::Interrupted {
-                                    continue;
-                                }
-                                return Err(e);
-                            }
-                        }
-                    }
-                    Ok(false)
-                });
-                match drained {
+                match guard.try_io(|inner| drain(inner.as_raw_fd(), &mut buf)) {
                     Ok(Ok(drained)) => {
-                        if drained {
+                        if drained.empty {
                             guard.clear_ready();
                         }
-                        let changed = update_network_state(&config, &mut network_state).await;
-                        reconcile_and_notify(&ebpf, &config, &commands, &mut attached, &mut attach_warned, changed, &mut pending_notification).await;
+                        let changed = update_network_state(&watch.config, &mut network_state).await;
+                        watch.reconcile_and_notify(changed, drained.verify()).await;
                     }
                     Ok(Err(e)) => {
                         debug!("interface watcher: netlink recv failed: {}", e);
@@ -231,11 +293,13 @@ async fn run(
 }
 
 async fn read_network_state(config: &Arc<RwLock<Arc<honk_config::Config>>>) -> NetworkState {
-    let config = config.read().await;
-    NetworkState {
+    let config = config.read().await.clone();
+    tokio::task::spawn_blocking(move || NetworkState {
         default_interface: crate::detect_default_interface(),
         local_cidrs: config.local_direct_cidrs(),
-    }
+    })
+    .await
+    .expect("network-state task")
 }
 
 async fn update_network_state(
@@ -250,568 +314,211 @@ async fn update_network_state(
     true
 }
 
-async fn reconcile_and_notify(
-    ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
-    config: &Arc<RwLock<Arc<honk_config::Config>>>,
-    commands: &mpsc::Sender<crate::control::ControlCommand>,
-    attached: &mut AttachedMap,
-    attach_warned: &mut HashSet<String>,
-    network_state_changed: bool,
-    pending_notification: &mut bool,
-) {
-    *pending_notification |= network_state_changed;
-    match reconcile(ebpf, config, attached, attach_warned).await {
-        Ok(changed) => *pending_notification |= changed,
-        Err(_) => *pending_notification = true,
-    }
-    if *pending_notification {
-        match commands.try_send(crate::control::ControlCommand::NetworkChanged) {
-            Ok(()) => *pending_notification = false,
-            Err(mpsc::error::TrySendError::Full(_)) => {}
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                *pending_notification = false;
-                debug!("control plane stopped before network-change refresh");
-            }
-        }
-    }
+pub(super) struct Watch {
+    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    config: Arc<RwLock<Arc<honk_config::Config>>>,
+    commands: mpsc::Sender<crate::control::ControlCommand>,
+    reconciler: Reconciler,
+    /// Interfaces whose attach failure was already warned; reconcile retries
+    /// on every event and tick.
+    warned: HashSet<String>,
+    pending_notification: bool,
 }
 
-async fn reconcile(
-    ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
-    config: &Arc<RwLock<Arc<honk_config::Config>>>,
-    attached: &mut AttachedMap,
-    // Interfaces whose attach failure was already warned; reconcile retries
-    // on every event and tick.
-    attach_warned: &mut HashSet<String>,
-) -> anyhow::Result<bool> {
-    let (desired, single_homed) = {
-        let cfg = config.read().await;
-        desired_interfaces(&cfg)
-    };
-    // An interface that leaves the desired set ends its failure episode.
-    attach_warned.retain(|name| desired.contains_key(name));
-    let wanted = |role: IfaceRole| match role {
-        IfaceRole::Lan => DynamicHooks {
-            ingress: true,
-            egress: !single_homed,
-        },
-        IfaceRole::LanWan => DynamicHooks {
-            ingress: true,
-            egress: true,
-        },
-        IfaceRole::WanBondSlave => DynamicHooks {
-            ingress: false,
-            egress: true,
-        },
-        _ => DynamicHooks {
-            ingress: true,
-            egress: true,
-        },
-    };
-    let mut changed = false;
-    let mut attach_error = None;
-    let mut backend = ebpf.write().await;
-    // Forget tracked entries that vanished, were recreated (their hooks
-    // died with the old ifindex), or are no longer wanted (un-enslaved,
-    // removed from config).
-    let tracked: Vec<(String, u32, IfaceRole)> = attached
-        .iter()
-        .map(|(name, state)| (name.clone(), state.ifindex, state.role))
-        .collect();
-    for (name, ifindex, role) in tracked {
-        if desired.get(&name) != Some(&role)
-            || crate::netlink::ifindex_of(&name).ok() != Some(ifindex)
-        {
-            backend.forget_dynamic_interface(ifindex);
-            attached.remove(&name);
-            changed = true;
-        }
-    }
-    for (name, role) in desired {
-        let want = wanted(role);
-        let have = attached
-            .get(&name)
-            .map(|state| state.hooks)
-            .unwrap_or_default();
-        if have == want {
-            continue;
-        }
-        let Ok(ifindex) = crate::netlink::ifindex_of(&name) else {
-            continue;
-        };
-        if !iface_is_up(&name) {
-            continue;
-        }
-        match backend.attach_dynamic_interface(&name, role, single_homed) {
-            Ok(hooks) => {
-                attached.insert(
-                    name.clone(),
-                    AttachedInterface {
-                        ifindex,
-                        role,
-                        hooks,
-                    },
-                );
-                if matches!(role, IfaceRole::Wan | IfaceRole::LanWan) {
-                    crate::sysctl::enable_wan_accept_ra(&name);
-                }
-                attach_warned.remove(&name);
-                info!(interface = %name, role = ?role, "attached eBPF programs to new interface");
-                changed = true;
-            }
-            Err(e) => {
-                crate::logging::warn_on_entry!(
-                    attach_warned.insert(name.clone()),
-                    interface = %name,
-                    role = ?role,
-                    "dynamic attach failed: {}",
-                    e
-                );
-                attach_error
-                    .get_or_insert_with(|| e.context(format!("attach {role:?} interface {name}")));
-            }
-        }
-    }
-    attach_error.map_or(Ok(changed), Err)
-}
-
-/// The configured interface set with roles, mirroring the startup logic in
-/// `run()`: a shared LAN/WAN interface receives the single-homed program
-/// pair, while an empty LAN list installs no LAN hooks.
-fn desired_interfaces(config: &honk_config::Config) -> (HashMap<String, IfaceRole>, bool) {
-    let crate::ConfiguredInterfaces {
-        lan,
-        wan,
-        single_homed,
-    } = crate::configured_interfaces(config);
-    let mut desired = HashMap::new();
-    for w in &wan {
-        if !lan.contains(w) {
-            desired.insert(w.clone(), IfaceRole::Wan);
-        }
-    }
-    for l in &lan {
-        let role = if single_homed && wan.contains(l) {
-            IfaceRole::LanWan
-        } else {
-            IfaceRole::Lan
-        };
-        desired.insert(l.clone(), role);
-    }
-    // Bridge/bond slaves of configured LAN masters need their own hooks
-    // (forwarded traffic bypasses the master's TC hooks); membership is
-    // re-read on every reconcile so late-added containers are covered.
-    for master in &lan {
-        for slave in super::RealEbpfBackend::bridge_slaves(master) {
-            desired.entry(slave).or_insert(IfaceRole::LanBridgeSlave);
-        }
-        for slave in super::RealEbpfBackend::bond_slaves(master) {
-            desired.entry(slave).or_insert(IfaceRole::LanBondSlave);
-        }
-    }
-    // A bond may emit host traffic directly on a slave. Re-expand membership
-    // so WAN-only mode keeps intercepting slaves added after startup.
-    for master in &wan {
-        for slave in super::RealEbpfBackend::bond_slaves(master) {
-            desired.entry(slave).or_insert(IfaceRole::WanBondSlave);
-        }
-    }
-    (desired, single_homed)
-}
-
-fn iface_is_up(name: &str) -> bool {
-    std::fs::read_to_string(format!("/sys/class/net/{name}/flags"))
-        .ok()
-        .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
-        .is_some_and(|flags| flags & IFF_UP != 0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::Ordering;
-
-    fn watcher_fixture(
+impl Watch {
+    pub(super) fn new(
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: mpsc::Sender<crate::control::ControlCommand>,
-        attached: AttachedMap,
-    ) -> (IfaceWatcher, std::os::unix::net::UnixDatagram) {
-        let (events, writer) = std::os::unix::net::UnixDatagram::pair().unwrap();
-        events.set_nonblocking(true).unwrap();
-        let (stop, rx) = watch::channel(false);
-        let handle = tokio::spawn(run(
-            events.into(),
+        reconciler: Reconciler,
+    ) -> Self {
+        Self {
             ebpf,
             config,
             commands,
-            attached,
-            rx,
-            Arc::default(),
-        ));
-        (IfaceWatcher { handle, stop }, writer)
-    }
-
-    #[tokio::test]
-    async fn a_watcher_that_cannot_poll_is_reported() {
-        let degradations = Arc::new(crate::degradations::Degradations::default());
-        // epoll refuses regular files.
-        let file = tempfile::tempfile().unwrap();
-        let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
-            crate::ebpf::mock::MockEbpfBackend::new(),
-        )));
-        let config = Arc::new(RwLock::new(Arc::new(honk_config::Config::default())));
-        let (commands, _receiver) = mpsc::channel(1);
-        let (_stop, rx) = watch::channel(false);
-        run(
-            file.into(),
-            ebpf,
-            config,
-            commands,
-            AttachedMap::default(),
-            rx,
-            Arc::clone(&degradations),
-        )
-        .await;
-        assert_eq!(
-            degradations
-                .get(crate::degradations::Component::IfaceWatch)
-                .map(|issue| issue.reason),
-            Some("poll_setup_failed")
-        );
-    }
-
-    #[test]
-    fn wan_only_configuration_does_not_synthesize_loopback_lan() {
-        let mut config = honk_config::Config::default();
-        config.global.wan_interface = vec!["wan0".to_string()];
-
-        let (desired, single_homed) = desired_interfaces(&config);
-
-        assert!(!single_homed);
-        assert_eq!(desired.len(), 1);
-        assert_eq!(desired.get("wan0"), Some(&IfaceRole::Wan));
-        assert!(!desired.contains_key("lo"));
-    }
-
-    #[test]
-    fn unresolved_auto_is_omitted_without_losing_explicit_interfaces() {
-        let configured = vec![
-            "auto".to_string(),
-            "campus0".to_string(),
-            "campus0".to_string(),
-        ];
-
-        assert_eq!(
-            crate::resolve_configured_interface_names(&configured, None),
-            vec!["campus0"]
-        );
-        assert_eq!(
-            crate::resolve_configured_interface_names(&configured, Some("eth0")),
-            vec!["eth0", "campus0"]
-        );
-    }
-
-    #[test]
-    fn default_route_parser_waits_for_a_real_default_and_uses_lowest_metric() {
-        let header = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n";
-        let no_default = format!("{header}campus0 0000A8C0 00000000 0001 0 0 10 00FFFFFF 0 0 0\n");
-        assert_eq!(
-            honk_config::config::default_route_interface_from(&no_default),
-            None
-        );
-
-        let routes = format!(
-            "{header}ethernet0 00000000 00000000 0003 0 0 600 00000000 0 0 0\n\
-             wifi0 00000000 00000000 0003 0 0 100 00000000 0 0 0\n"
-        );
-        assert_eq!(
-            honk_config::config::default_route_interface_from(&routes).as_deref(),
-            Some("wifi0")
-        );
-    }
-
-    #[test]
-    fn same_interface_uses_single_homed_role() {
-        let mut config = honk_config::Config::default();
-        config.global.lan_interface = vec!["campus0".to_string()];
-        config.global.wan_interface = vec!["campus0".to_string()];
-
-        let (desired, single_homed) = desired_interfaces(&config);
-
-        assert!(single_homed);
-        assert_eq!(desired.get("campus0"), Some(&IfaceRole::LanWan));
-    }
-
-    #[tokio::test]
-    async fn role_change_forgets_incompatible_hooks_before_rebind() {
-        let backend = crate::ebpf::mock::MockEbpfBackend::new();
-        let attach = backend.dynamic_attach_calls.clone();
-        let forget = backend.dynamic_forget_calls.clone();
-        let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
-        let mut config = honk_config::Config::default();
-        config.global.lan_interface = vec!["lo".to_string()];
-        let config = Arc::new(RwLock::new(Arc::new(config)));
-        let mut attached = AttachedMap::new();
-        let mut warned = HashSet::new();
-
-        assert!(
-            reconcile(&ebpf, &config, &mut attached, &mut warned)
-                .await
-                .unwrap()
-        );
-        let first = attach.load(Ordering::Relaxed);
-        {
-            let mut config = config.write().await;
-            Arc::make_mut(&mut config).global.wan_interface = vec!["lo".to_string()];
+            reconciler,
+            warned: HashSet::new(),
+            pending_notification: true,
         }
-        assert!(
-            reconcile(&ebpf, &config, &mut attached, &mut warned)
-                .await
-                .unwrap()
-        );
-
-        assert_eq!(forget.load(Ordering::Relaxed), 1);
-        assert_eq!(attach.load(Ordering::Relaxed), first + 1);
-        assert_eq!(
-            attached.get("lo").map(|state| state.role),
-            Some(IfaceRole::LanWan)
-        );
-        assert!(
-            !reconcile(&ebpf, &config, &mut attached, &mut warned)
-                .await
-                .unwrap()
-        );
     }
 
-    #[tokio::test]
-    async fn attach_failure_warning_rearms_after_success() {
-        let mut config = honk_config::Config::default();
-        config.global.lan_interface = vec!["lo".to_string()];
-        let config = Arc::new(RwLock::new(Arc::new(config)));
-        let mut faulty = crate::ebpf::mock::MockEbpfBackend::new();
-        faulty.dynamic_attach_fault = true;
-        let faulty: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(faulty)));
-        let healthy: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
-            crate::ebpf::mock::MockEbpfBackend::new(),
-        )));
-        let mut attached = AttachedMap::new();
-        let mut warned = HashSet::new();
+    async fn reconcile_and_notify(&mut self, network_state_changed: bool, verify: bool) {
+        self.pending_notification |= network_state_changed;
+        match self.reconcile(verify).await {
+            Ok(changed) => self.pending_notification |= changed,
+            Err(error) => {
+                debug!("interface reconcile: {error:#}");
+                self.pending_notification = true;
+            }
+        }
+        if self.pending_notification {
+            match self
+                .commands
+                .try_send(crate::control::ControlCommand::NetworkChanged)
+            {
+                Ok(()) => self.pending_notification = false,
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending_notification = false;
+                    debug!("control plane stopped before network-change refresh");
+                }
+            }
+        }
+    }
 
-        for _ in 0..2 {
-            assert!(
-                reconcile(&faulty, &config, &mut attached, &mut warned)
-                    .await
-                    .is_err()
+    /// One batch: read and plan, snapshot (read lock), apply (no lock), commit
+    /// (write lock). Once started it always finishes its commit. `verify`
+    /// re-proves retained links against the kernel chain.
+    pub(super) async fn reconcile(&mut self, verify: bool) -> anyhow::Result<bool> {
+        let (lan, wan) = {
+            let config = self.config.read().await;
+            (
+                config.global.lan_interface.clone(),
+                config.global.wan_interface.clone(),
+            )
+        };
+        let any_auto = lan
+            .iter()
+            .chain(&wan)
+            .any(|name| honk_config::config::is_auto_interface(name));
+        let mut changed = false;
+        let mut failed = Vec::new();
+        // A device that changed under the apply is retried once; the ticker
+        // handles anything that keeps moving.
+        for round in 0..2 {
+            let read = Arc::clone(&self.reconciler.read_topology);
+            let (lan, wan) = (lan.clone(), wan.clone());
+            let (topology, plan) = tokio::task::spawn_blocking(move || {
+                let topology = read(any_auto)?;
+                let plan = interface::plan(&lan, &wan, &topology)?;
+                anyhow::Ok((topology, plan))
+            })
+            .await
+            .context("topology task")??;
+
+            let snapshot = {
+                let backend = self.ebpf.read().await;
+                backend.interface_binding_snapshot()?
+            };
+            let Some(snapshot) = snapshot else {
+                return Ok(false);
+            };
+
+            let apply = Arc::clone(&self.reconciler.apply);
+            let verify = verify || !self.warned.is_empty() || round != 0;
+            let (report, plan) = tokio::task::spawn_blocking(move || {
+                let report = apply(snapshot, &plan, &topology, verify);
+                (report, plan)
+            })
+            .await
+            .context("apply task")?;
+            let ApplyReport {
+                commit,
+                failed: round_failed,
+                topology_changed,
+            } = report;
+            if !commit.is_empty() {
+                changed = true;
+                log_commit(&commit);
+                // accept_ra follows WAN-role roots that gained a binding or moved
+                // onto a WAN egress program (c5 moves this to on-sight
+                // per-ifindex writes).
+                let accept_ra: Vec<String> = plan
+                    .wan_roots
+                    .iter()
+                    .filter(|(ifindex, _)| gains_wan_egress(&commit, *ifindex))
+                    .map(|(_, name)| name.clone())
+                    .collect();
+                let closed = self.ebpf.write().await.commit_interface_bindings(commit);
+                // The last close of a link takes the rtnl lock.
+                let write_accept_ra = Arc::clone(&self.reconciler.accept_ra);
+                tokio::task::spawn_blocking(move || {
+                    drop(closed);
+                    for name in &accept_ra {
+                        write_accept_ra(name);
+                    }
+                })
+                .await
+                .context("close task")?;
+            }
+            failed = round_failed;
+            if !topology_changed || round == 1 {
+                break;
+            }
+        }
+        self.note_failures(&failed);
+        match failed.into_iter().next() {
+            Some((binding, error)) => Err(error.context(format!(
+                "attach {} to interface {}",
+                binding.program.name(),
+                binding.interface
+            ))),
+            None => Ok(changed),
+        }
+    }
+
+    /// WARN once per interface and failure episode; an interface that binds (or
+    /// leaves the plan) ends its episode.
+    fn note_failures(&mut self, failed: &[(Binding, anyhow::Error)]) {
+        self.warned
+            .retain(|name| failed.iter().any(|(binding, _)| &binding.interface == name));
+        for (binding, error) in failed {
+            crate::logging::warn_on_entry!(
+                self.warned.insert(binding.interface.clone()),
+                interface = %binding.interface,
+                program = binding.program.name(),
+                "interface attach failed: {:#}",
+                error
             );
-            assert!(warned.contains("lo"));
         }
-        assert!(
-            reconcile(&healthy, &config, &mut attached, &mut warned)
-                .await
-                .unwrap()
-        );
-        assert!(warned.is_empty());
     }
+}
 
-    #[tokio::test]
-    async fn attach_failure_warning_ends_when_interface_is_no_longer_desired() {
-        let mut config = honk_config::Config::default();
-        config.global.lan_interface = vec!["lo".to_string()];
-        let config = Arc::new(RwLock::new(Arc::new(config)));
-        let mut faulty = crate::ebpf::mock::MockEbpfBackend::new();
-        faulty.dynamic_attach_fault = true;
-        let faulty: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(faulty)));
-        let mut attached = AttachedMap::new();
-        let mut warned = HashSet::new();
-
-        assert!(
-            reconcile(&faulty, &config, &mut attached, &mut warned)
-                .await
-                .is_err()
-        );
-        Arc::make_mut(&mut *config.write().await)
-            .global
-            .lan_interface
-            .clear();
-        reconcile(&faulty, &config, &mut attached, &mut warned)
-            .await
-            .unwrap();
-        assert!(warned.is_empty());
-    }
-
-    #[tokio::test]
-    async fn topology_or_network_event_requests_refresh() {
-        let backend = crate::ebpf::mock::MockEbpfBackend::new();
-        let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
-        let mut config = honk_config::Config::default();
-        config.global.lan_interface = vec!["lo".to_string()];
-        let config = Arc::new(RwLock::new(Arc::new(config)));
-        let mut attached = AttachedMap::new();
-        let mut warned = HashSet::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        let mut pending_notification = false;
-        reconcile_and_notify(
-            &ebpf,
-            &config,
-            &tx,
-            &mut attached,
-            &mut warned,
-            false,
-            &mut pending_notification,
-        )
-        .await;
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(crate::control::ControlCommand::NetworkChanged)
-        ));
-
-        reconcile_and_notify(
-            &ebpf,
-            &config,
-            &tx,
-            &mut attached,
-            &mut warned,
-            false,
-            &mut pending_notification,
-        )
-        .await;
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
-
-        reconcile_and_notify(
-            &ebpf,
-            &config,
-            &tx,
-            &mut attached,
-            &mut warned,
-            true,
-            &mut pending_notification,
-        )
-        .await;
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(crate::control::ControlCommand::NetworkChanged)
-        ));
-    }
-
-    #[tokio::test]
-    async fn full_control_queue_retains_hint_and_shutdown_joins_the_worker() {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            let backend = crate::ebpf::mock::MockEbpfBackend::new();
-            let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
-            let retained_backend = Arc::downgrade(&ebpf);
-            let mut config = honk_config::Config::default();
-            config.global.lan_interface = vec!["lo".to_string()];
-            let config = Arc::new(RwLock::new(Arc::new(config)));
-            let (tx, mut rx) = mpsc::channel(1);
-            tx.try_send(crate::control::ControlCommand::NetworkChanged)
-                .unwrap();
-            let (watcher, _events) = watcher_fixture(ebpf, config, tx, AttachedMap::new());
-
-            // Freeing capacity must deliver the startup hint the full queue held back.
-            assert!(matches!(
-                rx.recv().await,
-                Some(crate::control::ControlCommand::NetworkChanged)
-            ));
-            assert!(matches!(
-                rx.recv().await,
-                Some(crate::control::ControlCommand::NetworkChanged)
-            ));
-            watcher.shutdown(Duration::from_secs(1)).await;
-            assert!(
-                retained_backend.upgrade().is_none(),
-                "shutdown must join the retained worker"
-            );
+/// True when the commit added a binding on `ifindex` or moved it onto a WAN
+/// egress program (an `auto` WAN landing on an already-bound LAN root).
+fn gains_wan_egress(commit: &interface::BindingCommit, ifindex: NonZeroU32) -> bool {
+    commit.add.iter().any(|(b, ..)| b.ifindex == ifindex)
+        || commit.reprogram.iter().any(|(i, direction, program)| {
+            *i == ifindex
+                && *direction == Direction::Egress
+                && matches!(program, TcProgram::WanEgressL2 | TcProgram::WanEgressL3)
         })
-        .await
-        .expect("watcher did not deliver the retained hint or join on shutdown");
-    }
+}
 
-    #[test]
-    #[ignore = "requires root; run via just test-netns"]
-    fn route_only_change_wakes_network_subscription() {
-        if unsafe { libc::geteuid() } != 0 {
-            return;
-        }
-
-        std::thread::spawn(|| {
-            let rc = unsafe { libc::unshare(libc::CLONE_NEWNET) };
-            assert_eq!(rc, 0, "unshare: {}", std::io::Error::last_os_error());
-
-            let mut netlink = crate::netlink::NlSock::new().expect("netlink socket");
-            let loopback = crate::netlink::ifindex_of("lo").expect("loopback ifindex");
-            netlink
-                .set_link_up(loopback, true)
-                .expect("bring loopback up");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_io()
-                .enable_time()
-                .build()
-                .expect("tokio runtime");
-
-            runtime.block_on(async move {
-                let events = subscribe_network_events().expect("network event subscription");
-                let events = unsafe { tokio::io::unix::AsyncFd::register(events) }
-                    .expect("async netlink socket");
-                netlink
-                    .add_route(
-                        crate::netlink::FAM_V4,
-                        254,
-                        crate::netlink::ROUTE_UNICAST,
-                        crate::netlink::SCOPE_LINK,
-                        crate::netlink::PROTO_STATIC,
-                        None,
-                        None,
-                        Some(loopback),
-                    )
-                    .expect("add default route");
-
-                let _ready = tokio::time::timeout(Duration::from_secs(1), events.readable())
-                    .await
-                    .expect("route event timeout")
-                    .expect("route event readiness");
-            });
-        })
-        .join()
-        .expect("network namespace thread");
-    }
-
-    /// An unchanged topology keeps the original hooks: the ticker must not
-    /// churn working TC links merely because it reconciles periodically.
-    #[tokio::test]
-    async fn reconcile_reuses_unchanged_hooks() {
-        let backend = crate::ebpf::mock::MockEbpfBackend::new();
-        let attach = backend.dynamic_attach_calls.clone();
-        let detach = backend.detach_calls.clone();
-        let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
-        let mut config = honk_config::Config::default();
-        config.global.lan_interface = vec!["lo".to_string()];
-        let config = Arc::new(RwLock::new(Arc::new(config)));
-        let mut attached = AttachedMap::new();
-        let mut warned = HashSet::new();
-
-        reconcile(&ebpf, &config, &mut attached, &mut warned)
-            .await
-            .unwrap();
-        let first = attach.load(Ordering::Relaxed);
-        assert!(first >= 1, "first reconcile attaches the configured LAN");
-        assert_eq!(detach.load(Ordering::Relaxed), 0);
-
-        reconcile(&ebpf, &config, &mut attached, &mut warned)
-            .await
-            .unwrap();
-        assert_eq!(
-            attach.load(Ordering::Relaxed),
-            first,
-            "second reconcile must not re-attach"
+fn log_commit(commit: &interface::BindingCommit) {
+    for (binding, ..) in &commit.add {
+        info!(
+            interface = %binding.interface,
+            ifindex = binding.ifindex.get(),
+            direction = ?binding.direction,
+            program = binding.program.name(),
+            "attached eBPF program to interface"
         );
-        assert_eq!(
-            detach.load(Ordering::Relaxed),
-            0,
-            "unchanged reconcile must not detach"
+    }
+    for (ifindex, direction, interface) in &commit.rename {
+        info!(
+            interface = %interface,
+            ifindex = ifindex.get(),
+            direction = ?direction,
+            "interface renamed; binding follows its ifindex"
+        );
+    }
+    for (ifindex, direction, program) in &commit.reprogram {
+        info!(
+            ifindex = ifindex.get(),
+            direction = ?direction,
+            program = program.name(),
+            "replaced eBPF program on interface"
+        );
+    }
+    for (ifindex, direction) in &commit.remove {
+        info!(
+            ifindex = ifindex.get(),
+            direction = ?direction,
+            "released eBPF program from interface"
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

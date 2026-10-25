@@ -306,7 +306,6 @@ async fn c14_sighup_retains_rebased_provider_provenance() {
 #[tokio::test]
 async fn c14_network_refresh_preserves_active_provenance() {
     let mut config = changed_routing_config();
-    config.global.lan_interface = vec!["lo".into()];
     let expected_routing = config.routing.clone();
     config.dns.client_subnet = "auto(127.0.0.1)".into();
     config.dns.resolved_client_subnet = Some("198.51.100.0/24".parse().unwrap());

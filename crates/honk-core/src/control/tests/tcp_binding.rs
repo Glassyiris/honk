@@ -357,16 +357,16 @@ impl Lab {
             .map(std::fs::read)
             .transpose()?;
         let config = lab_config(&udp_test_node());
+        let local_ip = RealEbpfBackend::test_local_ip(&["honk-lan0"], &["honk-wan0"]);
         let mut backend = RealEbpfBackend::load(
             object.as_deref().unwrap_or(crate::DEFAULT_BPF_OBJECT),
             Path::new(ROOT),
             config.global.tproxy_port,
             dae0,
-            Some("honk-lan0"),
-            "honk-wan0",
-            false,
+            local_ip,
         )
         .await?;
+        backend.bind_test_interfaces(&["honk-lan0"], &["honk-wan0"]);
         backend.attach_dae0_programs()?;
         daens::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
         backend.attach_sk_lookup()?;

@@ -14,7 +14,7 @@ kernel=$(uname -r)
 printf 'Guest uname -r: %s\n' "$kernel" >> "${GITHUB_STEP_SUMMARY:?}"
 test "$kernel" = "${HONK_CI_EXPECTED_KERNEL:?}"
 test -d "/lib/modules/$kernel"
-modprobe -a tun sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue
+modprobe -a tun veth sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue
 test -e /sys/fs/cgroup/cgroup.controllers
 test -r "${HONK_ROUTING_TEST_OBJECT:?}"
 if ! mountpoint -q /sys/fs/bpf; then
@@ -29,6 +29,16 @@ mkdir -p "$log_dir"
   2>&1 | tee "$log_dir/honk-core-real.log"
 for real_test in \
   ebpf::real::tests::bare_load_holds_no_tracing_links \
+  ebpf::real::tests::bindings::private_netns_binding_is_owned_and_detached_by_true_ifindex \
+  ebpf::real::tests::bindings::unchanged_plan_keeps_link_ids_and_leaves_foreign_hooks \
+  ebpf::real::tests::bindings::role_and_framing_change_updates_links_in_place \
+  ebpf::real::tests::bindings::watcher::watcher_reconcile_binds_reprograms_writes_accept_ra_and_releases \
+  ebpf::real::tests::bindings::moved_device_recreated_with_same_name_and_index_is_rebound \
+  ebpf::real::tests::bindings::full_chain_fails_one_direction_and_retry_does_not_stack \
+  ebpf::real::tests::bindings::observation_follows_add_replace_remove \
+  ebpf::real::tests::bindings::failure::rejected_update_keeps_old_link_and_commits_the_healthy_direction \
+  ebpf::real::tests::bindings::failure::device_deleted_before_verified_apply_reports_failure_without_recreating \
+  ebpf::real::tests::bindings::failure::rename_after_planning_is_not_confirmed_and_update_rolls_back \
   ebpf::real::tests::mandatory_helpers::mandatory_programs_call_no_probe_read_helper \
   ebpf::real::tests::socket_identity::occupied_sock_ops_slot_refuses_startup_without_leaving_links \
   ebpf::real::receive_trace::tests::receive_trace_family_failure_is_isolated \

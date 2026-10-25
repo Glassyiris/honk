@@ -40,23 +40,33 @@ flowchart LR
 
 ### 接口挂钩集合
 
-以太网接口使用 `_l2` 程序；没有以太网头的接口使用 `_l3`。流量可能绕过 master 的挂钩，因此 bridge 和 bond slave 也安装等价且由进程持有的挂钩。
+接口的链路类型为以太网（`ARPHRD_ETHER`）时使用 `_l2` 程序，否则使用 `_l3`；每个 bridge 端口和 bond 成员各自套用该规则。所有程序变体随 BPF 对象一并预加载，且早于 BPF logger 启动，因此运行期协调只创建 TCX link，从不加载程序。
 
-| 拓扑 | LAN 侧挂钩 | WAN 侧挂钩 |
-| --- | --- | --- |
-| 双网卡 | LAN 上的 `lan_ingress` + `lan_egress` | WAN 上的 `wan_ingress` + `wan_egress` |
-| LAN/WAN 共用接口的单网卡 | `lan_ingress` | `wan_egress`；跳过 `lan_egress` 和 `wan_ingress` |
-| 未配置 LAN 接口的纯 WAN | 无 | `wan_ingress` + `wan_egress` |
+每个配置的名称先解析为规范根接口：bond 或 bridge 的成员解析为其 master；本身是 bridge 端口的 bond 解析为该 bridge；其他 master 的成员也解析为该 master，但 `vrf` 与 `openvswitch` 的成员保持自身。各根接口独立规划。只出现在 `lan_interface` 的根为 LAN，只出现在 `wan_interface` 的为 WAN，两者都出现的为 LAN/WAN 共用：
+
+| 根接口角色 | 挂钩 |
+| --- | --- |
+| LAN | `lan_ingress` + `lan_egress` |
+| WAN | `wan_ingress` + `wan_egress` |
+| LAN/WAN 共用 | `lan_ingress` + `wan_egress`；跳过 `lan_egress` 和 `wan_ingress` |
+
+角色按接口各自确定，因此多 LAN 配置中的一个共用接口不再改变其他 LAN 接口的挂钩。流量可能绕过 master 的挂钩，所以 LAN bridge 根接口还会绑定每个端口（LAN 角色；WAN 名称不会将其升级）。bond 根接口绑定每个成员：LAN bond 为 `lan_ingress` + `wan_egress`，WAN bond 为 `wan_egress`。纯 WAN 部署（未配置 `lan_interface`）不安装任何 LAN 挂钩。
 
 `lan_ingress` 对转发的客户端流量分类。`wan_egress` 独立地对主机创建的流量分类。拓扑提供独立方向时，反向 ingress/egress 挂钩刷新已有连接状态。只有正向 TCP SYN 发布 TCP 状态：反向的纯 SYN 既不创建也不刷新它。
 
-Linux 6.12+ 上，Aya 使用 FD 持有的 TCX BPF link；启动、重绑定和关闭只释放自有 link。honk 既不创建也不删除物理接口上的 `clsact` qdisc 或旧式 filter；不需要的遗留项请手动移除。启动时会重建遗留的 `dae0`/`dae0peer` 对。内核选项见[开始使用](../how-to-start.md#内核配置)。
+Linux 6.12+ 上，honk 把接口挂钩创建为 FD 持有的 TCX BPF link，追加在其他 TCX 程序之后；启动、重绑定和关闭只释放自有 link。honk 既不创建也不删除物理接口上的 `clsact` qdisc 或旧式 filter；不需要的遗留项请手动移除。启动时会重建遗留的 `dae0`/`dae0peer` 对。内核选项见[开始使用](../how-to-start.md#内核配置)。
 
 不写 mark 且不受所有权 guard 保护的直通退出点返回 `TC_ACT_UNSPEC`（`-1`，TCX `NEXT`），包括反向刷新与跳过 DNS，让后续 TCX 程序继续运行。最低支持内核上的 `TC_ACT_PIPE` 不是继续动作。写入 mark 的路径（包括显式写零的 WAN 路径）、LAN classified/pending 及 WAN 精确 socket-mark/classified 所有权 guard 返回 `TC_ACT_OK`（`0`，TCX `PASS`），终止链。
 
-### 动态接口协调
+### 接口协调
 
-`auto` 解析为当前默认路由接口。没有默认路由时，该项保持未挂载，而不会回退到 loopback。`IfaceWatcher` 订阅 rtnetlink 的链路、IPv4/IPv6 地址和 IPv4/IPv6 路由组；每 60 秒一次的协调 tick 作为事件交付的后备。协调过程重新解析 `auto`，通过 ifindex 识别接口重建，重新计算单网卡或双网卡角色，并安装或忘记进程持有的挂钩。
+唯一的 `InterfaceBindings` 持有者保存预加载的程序 FD，并为每个自有 `(ifindex, direction)` 保存一个由 FD 持有的 TCX link。启动时读取一次 rtnetlink 拓扑快照，推导计划，解析 `local_ip`，加载 BPF 对象，然后绑定：拓扑无法读取、第一个已解析的 LAN 或 WAN 项不存在、或由该项派生的任何绑定（根接口、端口、成员）绑定后仍未持有，均为致命错误。后续项的失败记录警告并由 watcher 重试；后续不存在的项保持待定。watcher 不带种子启动，自行重新读取拓扑。
+
+接口存在即绑定，不要求 `IFF_UP`。`auto`（去除首尾空白后不区分 ASCII 大小写，或为空）解析为当前默认路由接口，在没有 IPv4 默认路由时保持待定，绝不回退到 `lo`；仅当某项为 `auto` 时才读取 `/proc/net/route`，读取错误会使计划失败，而不是被当作“没有默认路由”。
+
+`IfaceWatcher` 订阅 rtnetlink 的链路、IPv4/IPv6 地址和 IPv4/IPv6 路由组，每批最多排空 64 条消息，每 60 秒一次的 tick 作为事件交付的后备。每一批都在 backend 锁之外运行：读取拓扑并规划；仅在 backend 读锁下复制自有 link 的快照；无锁应用计划（TCX 创建/更新/查询、变更后的拓扑复核、FD 关闭、sysctl）；再仅在写锁下转移结果 commit，并在释放锁后关闭被替换的 FD。当该批包含 link 消息、排空溢出或为 tick 时，保留的 link 会对照命名空间本地的 `BPF_PROG_QUERY` 校验；计划不变的纯地址/路由批次跳过该查询。计划不变且 link 健康时不提交任何内容；角色变化就地更新已有 link（`BPF_F_REPLACE`），而不是再叠加一个。若 link 在 dump 与 attach 之间发生变化，新 link 会被丢弃，该批最多重试一次。
+
+关闭时先发送 stop，再 join watcher，它会等待进行中的批次完成（超过阶段超时后记录警告，但继续等待），然后才释放 BPF 挂钩。启动时对每个 WAN 根接口写入 `accept_ra=2`，对第一个 LAN 名称写入 `rp_filter=0`；之后新绑定或改挂 WAN egress 挂钩的 WAN 根接口在其 commit 落地时启用 `accept_ra`。
 
 链路、地址、路由或接口角色变化时，接口地址仍用于拓扑检测与 ECS 刷新，不再发布生成的 `direct(must)` 规则，也没有隐藏的内核地址白名单。系统仍清除健康检查 cooldown 并触发新探测。在新探测成功前，失效 UDP 和多叶节点出站仍保持 fail-closed；未配置 `final` 的单叶节点 TCP 组仍可作为用户态最后尝试。
 
@@ -65,9 +75,9 @@ Linux 6.12+ 上，Aya 使用 FD 持有的 TCX BPF link；启动、重绑定和�
 | 程序 | 挂钩 | 内核职责 |
 | --- | --- | --- |
 | `lan_ingress_l2`, `lan_ingress_l3` | LAN TC ingress | 检查准入，绕过特殊/控制平面及非 DNS 本地流量，执行单源新流限制，执行包含端口 53 的有序路由策略、DNS 接管判断、连接状态、direct 卸载、代理重定向、TX 计数、分片 verdict 记录，以及可选的歧义 UDP 暂存。 |
-| `wan_ingress_l2`, `wan_ingress_l3` | WAN TC ingress | 刷新反向连接状态；单网卡拓扑不挂载。 |
-| `lan_egress_l2`, `lan_egress_l3` | LAN TC egress | 刷新反向连接状态，不从 `dae0` 的 UDP 包创建新条目；抑制本机生成的 ICMPv6 Redirect。单网卡拓扑在共用接口上跳过。 |
-| `wan_egress_l2`, `wan_egress_l3` | WAN TC egress | 路由主机发起的 TCP/UDP，使用进程名与控制平面 bypass 数据，检查出站连通性，缓存决策并重定向代理流量；抑制本机生成的 ICMPv6 Redirect（单网卡拓扑下共用接口的 LAN-egress hook 被跳过）。 |
+| `wan_ingress_l2`, `wan_ingress_l3` | WAN TC ingress | 刷新反向连接状态；LAN/WAN 共用接口上不挂载。 |
+| `lan_egress_l2`, `lan_egress_l3` | LAN TC egress | 刷新反向连接状态，不从 `dae0` 的 UDP 包创建新条目；抑制本机生成的 ICMPv6 Redirect。LAN/WAN 共用接口上跳过。 |
+| `wan_egress_l2`, `wan_egress_l3` | WAN TC egress | 路由主机发起的 TCP/UDP，使用进程名与控制平面 bypass 数据，检查出站连通性，缓存决策并重定向代理流量；抑制本机生成的 ICMPv6 Redirect（LAN/WAN 共用接口的 LAN-egress hook 被跳过）。 |
 | `dae0_ingress` | 主机 `dae0` 的 TC ingress | 从 `REDIRECT_TRACK` 恢复回复帧信息与 RX 归属，或使用不计数的客户端回退；[续期符合条件的 UDP owner](#udp-生存期续期)。 |
 | `dae0peer_ingress` | `daens` `dae0peer` 的 TC ingress | 在链路 scrub 后恢复 UDP53 provenance 与 SYN incarnation；分配 UDP listener。TCP 保留原生 established/TIME_WAIT 查找。 |
 | `tproxy_sk_lookup` | `daens` 中的 `sk_lookup` | 用 `LISTEN_SOCKET_MAP` 中的透明监听器覆盖普通套接字查找。 |
@@ -83,10 +93,10 @@ TC 入口点是接受 `*mut __sk_buff` 的原始 `#[unsafe(no_mangle)] #[unsafe(
 `src/sk.rs` 中，`sk_assign_by_index` 是 TC 侧对应 aya `SockMap::redirect_sk_lookup` 的 helper，后者只接受 `SkLookupContext`；`probe_udp_socket` 查询非 DNS 本地 UDP socket。全部辅助函数都会释放隐式查找引用。程序分工：
 
 - `lan_ingress_l2/l3` — LAN 分类、路由和重定向，以及有序策略下的 DNS 所有权、`CLASSIFIED_MARK` 去重；NFQUEUE 已启用且 ready 时，仅将有歧义的非 DNS UDP 决策以唯一 token 暂存为 Pending；已启用但未 ready 时 fail-closed（`src/ingress.rs`）。
-- `wan_ingress_l2/l3` — 反向 conntrack 刷新，单网卡时跳过。
+- `wan_ingress_l2/l3` — 反向 conntrack 刷新，LAN/WAN 共用接口上跳过。
 - `lan_egress_l2/l3`、`wan_egress_l2/l3`（`src/egress.rs`）— 反向 conn state；本机流量路由（经实际 skb socket 的 `SOCKET_IDENTITY` 匹配 pname、控制面旁路、`OUTBOUND_CONNECTIVITY_MAP` 活性及重定向控制面）。存活的非 DNS WAN UDP 条目只查询缓存路由；未命中时求值一次路由，再发布完整 conntrack 元数据。
 - `dae0_ingress` — 重写回复 MAC，并重定向到原 LAN 接口。未知对端的 UDP 回复使用客户端帧信息，不归属任何出站；honk 自身链路源地址从不使用该回退。
-- LAN 与 WAN egress 仅抑制本机发起的 ICMPv6 Redirect，使用扩展头遍历后的 ICMPv6 header；转发的 Redirect 与其他 ICMPv6 仍放行。单网卡拓扑的共用接口不挂载 `lan_egress`，该不变式在该接口上由 WAN hook 承担。`honk-core/tests/ebpf_datapath_test.rs` 通过 `BPF_PROG_TEST_RUN` 检查 L2、通过隔离 TUN 接口检查 L3，并覆盖精确 tuple RX 计数与 cached-route 策略。
+- LAN 与 WAN egress 仅抑制本机发起的 ICMPv6 Redirect，使用扩展头遍历后的 ICMPv6 header；转发的 Redirect 与其他 ICMPv6 仍放行。LAN/WAN 共用接口不挂载 `lan_egress`，该不变式在该接口上由 WAN hook 承担。`honk-core/tests/ebpf_datapath_test.rs` 通过 `BPF_PROG_TEST_RUN` 检查 L2、通过隔离 TUN 接口检查 L3，并覆盖精确 tuple RX 计数与 cached-route 策略。
 - `dae0peer_ingress` — 恢复 UDP53 provenance 与 TCP SYN incarnation；按重定向点的 `cb[4]` 标记 `0x100 | index`，用 `bpf_sk_assign` 分配 UDP，不解析报文字节。缺少标记时 UDP 留给 `sk_lookup`；TCP SYN 保留其 `cb[3]`/`cb[4]` incarnation 载体及原生 established/TIME_WAIT 处理。
 - cgroup sock_create/connect4/6/sendmsg4/6（`src/cgroup.rs`）— 原生 socket storage 保留首次捕获的 `SocketIdentity{pid, pname}`，供进程名规则及控制面旁路使用；`pname` 通过运行时 kernel-BTF offset 读取 `argv[0]` 可执行文件 basename，限制为 15 字节，不可用或读取失败时回退到线程 `comm`。内核在 socket 对象销毁时回收 storage，不再有 release hook 或 cookie janitor。缺失必需的 cgroup/storage 支持会拒绝启动。这些 hook 挂在根 cgroup 上，因此身份捕获失败（storage 分配或 optmem 计费失败）不会拒绝宿主机操作：只计数，该 socket 的流量没有身份，进程名规则不会匹配它。honk 自身的 socket 仍通过 `dae_socket_mark` 识别。
 

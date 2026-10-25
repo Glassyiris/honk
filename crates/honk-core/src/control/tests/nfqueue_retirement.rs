@@ -25,16 +25,9 @@ fn netns_nfqueue_reconstruction_refuses_unresolved_retirement() -> anyhow::Resul
             .build()?
             .block_on(async {
                 let root = Path::new("/sys/fs/bpf/nfqueue-reconstruction");
-                let mut backend = RealEbpfBackend::load(
-                    crate::DEFAULT_BPF_OBJECT,
-                    root,
-                    12345,
-                    &dae0_setup,
-                    None,
-                    "",
-                    false,
-                )
-                .await?;
+                let mut backend =
+                    RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, root, 12345, &dae0_setup, 0)
+                        .await?;
                 let key = TuplesKey {
                     src_ip: In6Addr::from_ipv4_bytes([192, 0, 2, 10]),
                     dst_ip: In6Addr::from_ipv4_bytes([198, 51, 100, 20]),

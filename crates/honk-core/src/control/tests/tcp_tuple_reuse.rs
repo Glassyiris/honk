@@ -57,16 +57,16 @@ fn run_child(family: &str) -> anyhow::Result<()> {
         .block_on(async {
             let config = lab_config(&udp_test_node());
             let pin_root = Path::new("/sys/fs/bpf/tcp-tuple-reuse");
+            let local_ip = RealEbpfBackend::test_local_ip(&["honk-lan0"], &["honk-wan0"]);
             let mut backend = RealEbpfBackend::load(
                 crate::DEFAULT_BPF_OBJECT,
                 pin_root,
                 config.global.tproxy_port,
                 &dae0_setup,
-                Some("honk-lan0"),
-                "honk-wan0",
-                false,
+                local_ip,
             )
             .await?;
+            backend.bind_test_interfaces(&["honk-lan0"], &["honk-wan0"]);
             backend.attach_dae0_programs()?;
             daens::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
             backend.attach_sk_lookup()?;

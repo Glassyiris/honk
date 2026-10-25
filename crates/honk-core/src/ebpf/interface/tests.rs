@@ -1,0 +1,626 @@
+use super::*;
+
+const ETHER: u16 = 1;
+const NONE: u16 = 0xfffe;
+const PPP: u16 = 512;
+
+fn link(ifindex: u32, name: &str) -> LinkSnapshot {
+    LinkSnapshot {
+        ifindex: NonZeroU32::new(ifindex).unwrap(),
+        name: name.into(),
+        arphrd: ETHER,
+        flags: 0,
+        master: None,
+        kind: None,
+        mac: Some([2, 0, 0, 0, 0, ifindex as u8]),
+    }
+}
+
+trait LinkExt {
+    fn arphrd(self, arphrd: u16) -> Self;
+    fn master(self, master: u32) -> Self;
+    fn kind(self, kind: &str) -> Self;
+}
+
+impl LinkExt for LinkSnapshot {
+    fn arphrd(mut self, arphrd: u16) -> Self {
+        self.arphrd = arphrd;
+        self.mac = None;
+        self
+    }
+    fn master(mut self, master: u32) -> Self {
+        self.master = NonZeroU32::new(master);
+        self
+    }
+    fn kind(mut self, kind: &str) -> Self {
+        self.kind = Some(kind.into());
+        self
+    }
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| value.to_string()).collect()
+}
+
+fn base() -> Vec<LinkSnapshot> {
+    vec![link(1, "lo").arphrd(772), link(2, "ens3"), link(3, "eth1")]
+}
+
+/// br0 (10) with ports p1 (11) and p2 (12).
+fn bridge() -> Vec<LinkSnapshot> {
+    vec![
+        link(10, "br0").kind("bridge"),
+        link(11, "p1").master(10),
+        link(12, "p2").master(10),
+    ]
+}
+
+/// bond0 (20) with members m1 (21) and m2 (22).
+fn bond() -> Vec<LinkSnapshot> {
+    vec![
+        link(20, "bond0").kind("bond"),
+        link(21, "m1").master(20),
+        link(22, "m2").master(20),
+    ]
+}
+
+/// br0 (10) with port p1 (11) and port bond0 (20, members m1 21, m2 22).
+fn bond_in_bridge() -> Vec<LinkSnapshot> {
+    vec![
+        link(10, "br0").kind("bridge"),
+        link(11, "p1").master(10),
+        link(20, "bond0").kind("bond").master(10),
+        link(21, "m1").master(20),
+        link(22, "m2").master(20),
+    ]
+}
+
+fn topology(groups: &[Vec<LinkSnapshot>]) -> Topology {
+    Topology {
+        links: groups.iter().flatten().cloned().collect(),
+        default_route: None,
+    }
+}
+
+fn run(lan: &[&str], wan: &[&str], groups: &[Vec<LinkSnapshot>]) -> InterfacePlan {
+    plan(&strings(lan), &strings(wan), &topology(groups)).unwrap()
+}
+
+/// `"<ifindex> in|eg <program>"`, in plan order.
+fn set(plan: &InterfacePlan) -> Vec<String> {
+    plan.bindings
+        .iter()
+        .map(|binding| {
+            let direction = match binding.direction {
+                Direction::Ingress => "in",
+                Direction::Egress => "eg",
+            };
+            format!("{} {direction} {}", binding.ifindex, binding.program.name())
+        })
+        .collect()
+}
+
+fn ids(values: &[u32]) -> Vec<NonZeroU32> {
+    values
+        .iter()
+        .map(|v| NonZeroU32::new(*v).unwrap())
+        .collect()
+}
+
+#[test]
+fn program_names_are_unique_and_cover_all_variants() {
+    let mut names: Vec<_> = TcProgram::ALL
+        .iter()
+        .map(|program| program.name())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), 8);
+}
+
+#[test]
+fn single_lan() {
+    let plan = run(&["ens3"], &[], &[base()]);
+    assert_eq!(set(&plan), ["2 in lan_ingress_l2", "2 eg lan_egress_l2"]);
+    assert_eq!(plan.lan, ["ens3"]);
+    assert!(plan.wan.is_empty() && plan.wan_roots.is_empty() && plan.unbound.is_empty());
+    assert_eq!(plan.lan_roots, ["ens3"]);
+    assert_eq!(plan.primary, ids(&[2]));
+    assert!(plan.primary_missing.is_empty());
+    assert_eq!(plan.bindings[0].interface, "ens3");
+}
+
+#[test]
+fn wan_only_synthesizes_no_lan_or_loopback() {
+    let plan = run(&[], &["ens3"], &[base()]);
+    assert_eq!(set(&plan), ["2 in wan_ingress_l2", "2 eg wan_egress_l2"]);
+    assert!(plan.lan_roots.is_empty());
+    assert_eq!(
+        plan.wan_roots,
+        [(NonZeroU32::new(2).unwrap(), "ens3".to_string())]
+    );
+    assert_eq!(plan.primary, ids(&[2]));
+}
+
+#[test]
+fn fully_shared_interface_is_lan_wan() {
+    let plan = run(&["ens3"], &["ens3"], &[base()]);
+    assert_eq!(set(&plan), ["2 in lan_ingress_l2", "2 eg wan_egress_l2"]);
+    assert_eq!(plan.lan_roots, ["ens3"]);
+    assert_eq!(
+        plan.wan_roots,
+        [(NonZeroU32::new(2).unwrap(), "ens3".to_string())]
+    );
+    assert_eq!(plan.primary, ids(&[2]));
+}
+
+#[test]
+fn shared_second_lan_is_lan_wan_and_the_first_stays_lan() {
+    // A name in both lists is one entry that binds once.
+    let plan = run(&["ens3", "eth1"], &["eth1"], &[base()]);
+    assert_eq!(plan.lan_roots, ["ens3", "eth1"]);
+    // Single-homed parity: WAN contributes nothing, even though wan[0] is a LAN name.
+    assert_eq!(plan.primary, ids(&[2]));
+
+    // The shared name is eth1, the second LAN: wan[0] still adds nothing.
+    let plan = run(&["ens3", "eth1"], &["eth1"], &[base()]);
+    assert_eq!(plan.primary, ids(&[2]));
+    assert_eq!(
+        set(&plan),
+        [
+            "2 in lan_ingress_l2",
+            "2 eg lan_egress_l2",
+            "3 in lan_ingress_l2",
+            "3 eg wan_egress_l2",
+        ]
+    );
+}
+
+#[test]
+fn config_order_and_duplicates_do_not_change_bindings() {
+    let expected = run(&["ens3", "eth1"], &["ens3"], &[base()]).bindings;
+    for (lan, wan) in [
+        (&["eth1", "ens3"][..], &["ens3"][..]),
+        (&["ens3", "eth1", "ens3"], &["ens3", "ens3"]),
+        (&["eth1", "ens3", "eth1"], &["ens3"]),
+    ] {
+        assert_eq!(
+            run(lan, wan, &[base()]).bindings,
+            expected,
+            "{lan:?} {wan:?}"
+        );
+    }
+    let plan = run(&["ens3", "eth1", "ens3"], &["ens3", "ens3"], &[base()]);
+    assert_eq!(plan.lan, ["ens3", "eth1"]);
+    assert_eq!(plan.wan, ["ens3"]);
+}
+
+#[test]
+fn bridge_root_and_port_alias_cover_the_same_links() {
+    let expected = [
+        "10 in lan_ingress_l2",
+        "10 eg lan_egress_l2",
+        "11 in lan_ingress_l2",
+        "11 eg lan_egress_l2",
+        "12 in lan_ingress_l2",
+        "12 eg lan_egress_l2",
+    ];
+    for lan in [&["br0"][..], &["p1"], &["p2", "br0"], &["p1", "p2"]] {
+        let plan = run(lan, &[], &[base(), bridge()]);
+        assert_eq!(set(&plan), expected, "{lan:?}");
+        assert_eq!(plan.lan_roots, ["br0"], "{lan:?}");
+        assert_eq!(plan.primary, ids(&[10, 11, 12]), "{lan:?}");
+    }
+}
+
+#[test]
+
+fn wan_bridge_root_binds_only_itself() {
+    let plan = run(&[], &["br0"], &[bridge()]);
+    assert_eq!(set(&plan), ["10 in wan_ingress_l2", "10 eg wan_egress_l2"]);
+    assert_eq!(plan.primary, ids(&[10]));
+}
+
+#[test]
+fn bond_root_and_member_alias_dedup() {
+    let lan_expected = [
+        "20 in lan_ingress_l2",
+        "20 eg lan_egress_l2",
+        "21 in lan_ingress_l2",
+        "21 eg wan_egress_l2",
+        "22 in lan_ingress_l2",
+        "22 eg wan_egress_l2",
+    ];
+    for lan in [&["bond0"][..], &["m1"], &["m1", "bond0", "m2"]] {
+        let plan = run(lan, &[], &[bond()]);
+        assert_eq!(set(&plan), lan_expected, "{lan:?}");
+        assert_eq!(plan.lan_roots, ["bond0"], "{lan:?}");
+        assert_eq!(plan.primary, ids(&[20, 21, 22]), "{lan:?}");
+    }
+    let wan_expected = [
+        "20 in wan_ingress_l2",
+        "20 eg wan_egress_l2",
+        "21 eg wan_egress_l2",
+        "22 eg wan_egress_l2",
+    ];
+    for wan in [&["bond0"][..], &["m2", "bond0"]] {
+        let plan = run(&[], wan, &[bond()]);
+        assert_eq!(set(&plan), wan_expected, "{wan:?}");
+        assert_eq!(
+            plan.wan_roots,
+            [(NonZeroU32::new(20).unwrap(), "bond0".to_string())]
+        );
+    }
+}
+
+#[test]
+fn lan_bridge_with_wan_bond_port_upgrades_only_the_bridge() {
+    let expected = [
+        "10 in lan_ingress_l2",
+        "10 eg wan_egress_l2",
+        "11 in lan_ingress_l2",
+        "11 eg lan_egress_l2",
+        "20 in lan_ingress_l2",
+        "20 eg lan_egress_l2",
+    ];
+    // WAN names the bond port or one of its physical members: same plan, no members bound.
+    for wan in ["bond0", "m1", "br0"] {
+        let plan = run(&["br0"], &[wan], &[bond_in_bridge()]);
+        assert_eq!(set(&plan), expected, "{wan}");
+        assert_eq!(plan.lan_roots, ["br0"]);
+        assert_eq!(
+            plan.wan_roots,
+            [(NonZeroU32::new(10).unwrap(), "br0".to_string())]
+        );
+    }
+    let plan = run(&["br0"], &["bond0"], &[bond_in_bridge()]);
+    assert_eq!(plan.primary, ids(&[10, 11, 20]));
+}
+
+#[test]
+fn bond_in_bridge_member_and_port_alias_resolve_to_the_bridge() {
+    let reference = run(&["br0"], &[], &[bond_in_bridge()]).bindings;
+    for lan in ["bond0", "m1", "m2", "p1"] {
+        assert_eq!(
+            run(&[lan], &[], &[bond_in_bridge()]).bindings,
+            reference,
+            "{lan}"
+        );
+    }
+}
+
+#[test]
+fn explicit_vlan_keeps_its_own_boundary() {
+    let links = vec![link(4, "eth0"), link(5, "eth0.100").kind("vlan")];
+    let plan = run(&["eth0.100"], &[], &[links]);
+    assert_eq!(set(&plan), ["5 in lan_ingress_l2", "5 eg lan_egress_l2"]);
+    assert_eq!(plan.lan_roots, ["eth0.100"]);
+}
+
+#[test]
+fn vrf_member_is_not_promoted() {
+    let links = vec![link(30, "vrf0").kind("vrf"), link(31, "eth2").master(30)];
+    let plan = run(&["eth2"], &[], &[links]);
+    assert_eq!(set(&plan), ["31 in lan_ingress_l2", "31 eg lan_egress_l2"]);
+    assert_eq!(plan.lan_roots, ["eth2"]);
+
+    let links = vec![
+        link(32, "ovs-system").kind("openvswitch"),
+        link(33, "eth3").master(32),
+    ];
+    let plan = run(&[], &["eth3"], &[links]);
+    assert_eq!(set(&plan), ["33 in wan_ingress_l2", "33 eg wan_egress_l2"]);
+}
+
+#[test]
+fn team_member_is_promoted_without_member_expansion() {
+    let links = vec![
+        link(40, "team0").kind("team"),
+        link(41, "eth3").master(40),
+        link(42, "eth4").master(40),
+    ];
+    let plan = run(&["eth3"], &[], &[links]);
+    assert_eq!(set(&plan), ["40 in lan_ingress_l2", "40 eg lan_egress_l2"]);
+    assert_eq!(plan.lan_roots, ["team0"]);
+    // The configured name stays the resolved name; only the root is bound.
+    assert_eq!(plan.lan, ["eth3"]);
+}
+
+#[test]
+fn master_without_kind_is_promoted() {
+    let links = vec![link(40, "m0"), link(41, "eth3").master(40)];
+    let plan = run(&["eth3"], &[], &[links]);
+    assert_eq!(set(&plan), ["40 in lan_ingress_l2", "40 eg lan_egress_l2"]);
+}
+
+#[test]
+fn l3_devices_use_l3_programs_per_device() {
+    let links = vec![link(50, "wg0").arphrd(NONE), link(51, "ppp0").arphrd(PPP)];
+    let plan = run(&["wg0"], &["ppp0"], &[links]);
+    assert_eq!(
+        set(&plan),
+        [
+            "50 in lan_ingress_l3",
+            "50 eg lan_egress_l3",
+            "51 in wan_ingress_l3",
+            "51 eg wan_egress_l3",
+        ]
+    );
+
+    // Ports and members classify by their own ARPHRD, not the root's.
+    let mut links = bridge();
+    links.push(link(13, "p3").master(10).arphrd(NONE));
+    let plan = run(&["br0"], &[], &[links]);
+    assert!(set(&plan).contains(&"13 in lan_ingress_l3".to_string()));
+    assert!(set(&plan).contains(&"13 eg lan_egress_l3".to_string()));
+    assert!(set(&plan).contains(&"12 eg lan_egress_l2".to_string()));
+
+    let mut links = bond();
+    links.push(link(23, "m3").master(20).arphrd(NONE));
+    let plan = run(&["bond0"], &[], &[links]);
+    assert!(set(&plan).contains(&"23 in lan_ingress_l3".to_string()));
+    assert!(set(&plan).contains(&"23 eg wan_egress_l3".to_string()));
+}
+
+#[test]
+fn unresolved_auto_is_pending_without_dropping_explicit_entries() {
+    for auto in ["auto", "AUTO", " auto ", ""] {
+        let plan = run(&[auto, "eth1"], &[auto], &[base()]);
+        assert_eq!(plan.lan, ["eth1"], "{auto:?}");
+        assert!(plan.wan.is_empty() && plan.wan_roots.is_empty(), "{auto:?}");
+        assert_eq!(
+            plan.unbound,
+            [(auto.to_string(), UnboundReason::AutoUnresolved)],
+            "{auto:?}"
+        );
+        assert_eq!(set(&plan), ["3 in lan_ingress_l2", "3 eg lan_egress_l2"]);
+        assert_eq!(plan.primary, ids(&[3]));
+        assert!(plan.primary_missing.is_empty());
+    }
+}
+
+#[test]
+fn resolved_auto_follows_default_route_and_dedups() {
+    let mut topo = topology(&[base()]);
+    topo.default_route = Some("ens3".into());
+    let plan = plan(
+        &strings(&["auto", "ens3", "eth1"]),
+        &strings(&[" Auto "]),
+        &topo,
+    )
+    .unwrap();
+    assert_eq!(plan.lan, ["ens3", "eth1"]);
+    assert_eq!(plan.wan, ["ens3"]);
+    assert!(plan.unbound.is_empty());
+    assert_eq!(
+        set(&plan),
+        [
+            "2 in lan_ingress_l2",
+            "2 eg wan_egress_l2",
+            "3 in lan_ingress_l2",
+            "3 eg lan_egress_l2",
+        ]
+    );
+
+    // Resolved to a link that is gone: reported under the entry as written.
+    topo.default_route = Some("gone0".into());
+    let plan = plan_for(&["auto"], &[], &topo);
+    assert_eq!(plan.lan, ["gone0"]);
+    assert_eq!(plan.unbound, [("auto".to_string(), UnboundReason::Absent)]);
+    assert_eq!(plan.primary_missing, ["gone0"]);
+}
+
+fn plan_for(lan: &[&str], wan: &[&str], topology: &Topology) -> InterfacePlan {
+    plan(&strings(lan), &strings(wan), topology).unwrap()
+}
+
+#[test]
+fn absent_names_are_unbound_and_primary_missing_tracks_first_entries() {
+    let plan = run(&["nope", "ens3"], &["eth1"], &[base()]);
+    assert_eq!(plan.unbound, [("nope".to_string(), UnboundReason::Absent)]);
+    assert_eq!(plan.lan, ["nope", "ens3"]);
+    assert_eq!(plan.primary_missing, ["nope"]);
+    // Only the first entries are checked: ens3 is bound but not primary.
+    assert_eq!(plan.primary, ids(&[3]));
+    assert_eq!(plan.lan_roots, ["ens3"]);
+
+    let plan = run(&["ens3"], &["nope", "eth1"], &[base()]);
+    assert_eq!(plan.primary_missing, ["nope"]);
+    assert_eq!(plan.primary, ids(&[2]));
+
+    // Single-homed: wan[0] is not checked, so an absent shared WAN is not reported twice.
+    let plan = run(&["nope"], &["nope"], &[base()]);
+    assert_eq!(plan.primary_missing, ["nope"]);
+    assert_eq!(plan.unbound, [("nope".to_string(), UnboundReason::Absent)]);
+    assert!(plan.bindings.is_empty());
+
+    let plan = run(&["ens3", "nope"], &["nope"], &[base()]);
+    assert!(plan.primary_missing.is_empty());
+    assert_eq!(plan.primary, ids(&[2]));
+}
+
+#[test]
+fn primary_covers_first_lan_and_first_wan_roots_with_ports() {
+    let plan = run(&["br0", "ens3"], &["eth1"], &[base(), bridge()]);
+    assert_eq!(plan.primary, ids(&[3, 10, 11, 12]));
+    let plan = run(&["ens3"], &["bond0", "eth1"], &[base(), bond()]);
+    assert_eq!(plan.primary, ids(&[2, 20, 21, 22]));
+}
+
+#[test]
+fn unsupported_nesting_is_an_error() {
+    // bridge enslaved to a bond, bond enslaved to a bridge: loop.
+    let looped = vec![
+        link(10, "br0").kind("bridge").master(20),
+        link(20, "bond0").kind("bond").master(10),
+        link(21, "m1").master(20),
+    ];
+    for name in ["br0", "bond0", "m1"] {
+        assert!(
+            plan(&strings(&[name]), &[], &topology(&[looped.clone()])).is_err(),
+            "{name}"
+        );
+    }
+    // bridge under bridge, bond under bond, three levels, own master.
+    let cases: Vec<Vec<LinkSnapshot>> = vec![
+        vec![
+            link(1, "a").kind("bridge"),
+            link(2, "b").kind("bridge").master(1),
+            link(3, "c").master(2),
+        ],
+        vec![
+            link(1, "a").kind("bond"),
+            link(2, "b").kind("bond").master(1),
+            link(3, "c").master(2),
+        ],
+        vec![
+            link(1, "a").kind("bridge").master(4),
+            link(2, "b").kind("bond").master(1),
+            link(4, "x").kind("bridge"),
+            link(3, "c").master(2),
+        ],
+        vec![
+            link(1, "a").kind("bridge").master(1),
+            link(2, "c").master(1),
+        ],
+    ];
+    for (index, links) in cases.iter().enumerate() {
+        let result = plan(&strings(&["c"]), &[], &topology(&[links.clone()]));
+        assert!(
+            result.is_err(),
+            "case {index}: {:?}",
+            result.map(|p| set(&p))
+        );
+    }
+    // An error anywhere fails the whole plan, even for an otherwise valid entry.
+    assert!(plan(&strings(&["ens3", "m1"]), &[], &topology(&[base(), looped])).is_err());
+}
+
+#[test]
+fn bond_or_bridge_under_other_master_stays_the_root() {
+    let links = vec![
+        link(30, "vrf0").kind("vrf"),
+        link(10, "br0").kind("bridge").master(30),
+        link(11, "p1").master(10),
+    ];
+    let plan = run(&["p1"], &[], &[links]);
+    assert_eq!(plan.lan_roots, ["br0"]);
+    assert_eq!(plan.primary, ids(&[10, 11]));
+}
+
+#[test]
+fn local_ip_interface_is_the_canonical_root_the_binding_uses() {
+    let topo = topology(&[base(), bridge()]);
+    // A port binds its bridge: the address is the bridge's.
+    let plan = plan_for(&["nope", "p1"], &["ens3"], &topo);
+    assert_eq!(local_ip_interface(&plan), Some("br0"));
+
+    let plan = plan_for(&[], &["eth1", "ens3"], &topo);
+    assert_eq!(local_ip_interface(&plan), Some("eth1"));
+
+    let plan = plan_for(&["nope"], &["ens3"], &topo);
+    assert_eq!(local_ip_interface(&plan), Some("ens3"));
+
+    // A vrf member binds itself, so its own address is used, not the vrf's.
+    let vrf = topology(&[vec![
+        link(30, "vrf0").kind("vrf"),
+        link(31, "eth2").master(30),
+    ]]);
+    let plan = plan_for(&["eth2"], &[], &vrf);
+    assert_eq!(local_ip_interface(&plan), Some("eth2"));
+
+    // A bond that is a bridge port resolves to the bridge, member or not.
+    let nested = topology(&[bond_in_bridge()]);
+    for lan in ["m1", "bond0", "p1"] {
+        let plan = plan_for(&[lan], &[], &nested);
+        assert_eq!(local_ip_interface(&plan), Some("br0"), "{lan}");
+    }
+
+    // Unresolved auto and nothing configured: none.
+    let plan = plan_for(&["auto"], &[], &topo);
+    assert_eq!(local_ip_interface(&plan), None);
+    assert_eq!(local_ip(&plan), 0);
+    let plan = plan_for(&[], &[], &topo);
+    assert_eq!(local_ip_interface(&plan), None);
+}
+
+#[test]
+fn default_route_read_error_is_an_error_not_no_route() {
+    let error = default_route(Err(io::Error::from_raw_os_error(libc::EIO))).unwrap_err();
+    assert!(format!("{error:#}").contains("/proc/net/route"));
+    let header =
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n";
+    let route = format!("{header}eth0\t00000000\t0102A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n");
+    assert_eq!(default_route(Ok(route)).unwrap().as_deref(), Some("eth0"));
+    assert_eq!(default_route(Ok(header.into())).unwrap(), None);
+}
+
+#[test]
+fn dump_retry_stops_after_three_interrupts() {
+    let interrupted = || io::Error::from(io::ErrorKind::Interrupted);
+    let mut calls = 0;
+    let ok = retry_interrupted(|| {
+        calls += 1;
+        if calls < 3 {
+            Err(interrupted())
+        } else {
+            Ok(calls)
+        }
+    });
+    assert_eq!(ok.unwrap(), 3);
+
+    let mut calls = 0;
+    let err = retry_interrupted(|| -> io::Result<()> {
+        calls += 1;
+        Err(interrupted())
+    })
+    .unwrap_err();
+    assert_eq!((calls, err.kind()), (3, io::ErrorKind::Interrupted));
+
+    let mut calls = 0;
+    let err = retry_interrupted(|| -> io::Result<()> {
+        calls += 1;
+        Err(io::Error::from(io::ErrorKind::InvalidData))
+    })
+    .unwrap_err();
+    assert_eq!((calls, err.kind()), (1, io::ErrorKind::InvalidData));
+}
+
+#[test]
+fn startup_requires_every_primary_direction_and_the_desired_program() {
+    let plan = run(&["br0", "eth1"], &[], &[base(), bridge()]);
+    let owned: Vec<_> = plan
+        .bindings
+        .iter()
+        .map(|b| (b.ifindex, b.direction, b.program))
+        .collect();
+    assert!(check_primary(&plan, &owned, &[]).is_ok());
+    for binding in &plan.bindings {
+        let mut missing = owned.clone();
+        missing.retain(|(index, direction, _)| {
+            (*index, *direction) != (binding.ifindex, binding.direction)
+        });
+        let result = check_primary(&plan, &missing, &[]);
+        assert_eq!(result.is_err(), plan.primary.contains(&binding.ifindex));
+    }
+    let mut wrong_program = owned;
+    let target = wrong_program
+        .iter_mut()
+        .find(|(index, _, _)| plan.primary.contains(index))
+        .unwrap();
+    target.2 = TcProgram::WanIngressL3;
+    assert!(check_primary(&plan, &wrong_program, &[]).is_err());
+}
+
+#[test]
+fn startup_rejects_missing_first_name_but_not_extra_names_or_unresolved_auto() {
+    let absent_primary = run(&["missing", "eth1"], &[], &[base()]);
+    assert!(check_primary(&absent_primary, &[], &[]).is_err());
+    let extra_missing = run(&["ens3", "missing"], &["auto"], &[base()]);
+    let owned = extra_missing
+        .bindings
+        .iter()
+        .map(|b| (b.ifindex, b.direction, b.program))
+        .collect::<Vec<_>>();
+    assert!(check_primary(&extra_missing, &owned, &[]).is_ok());
+}

@@ -615,7 +615,7 @@ impl RealEbpfBackend {
             bpf: Some(bpf),
             pin_root: PathBuf::new(),
             pinned_maps: Vec::new(),
-            interface_links: Vec::new(),
+            bindings: Default::default(),
             cgroup_sock_links: Vec::new(),
             cgroup_sock_addr_links: Vec::new(),
             pname_mode: process_name::PnameCaptureMode::Argv0,
@@ -650,6 +650,49 @@ impl RealEbpfBackend {
             udp_staging_quiesce_incomplete: false,
             aux_deletes: Default::default(),
         })
+    }
+
+    /// What startup passes to `load` for these interfaces.
+    pub(crate) fn test_local_ip(lan: &[&str], wan: &[&str]) -> u32 {
+        let owned = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let topology = crate::ebpf::interface::read_topology(false).unwrap();
+        let plan = crate::ebpf::interface::plan(&owned(lan), &owned(wan), &topology).unwrap();
+        crate::ebpf::interface::local_ip(&plan)
+    }
+
+    /// Bind `lan`/`wan` the way startup does, for fixtures that need hooks:
+    /// `read_topology` + `plan` + `bind_interfaces`, preloading the TC variants
+    /// first when the fixture did not. Every binding must succeed.
+    pub(crate) fn bind_test_interfaces(
+        &mut self,
+        lan: &[&str],
+        wan: &[&str],
+    ) -> crate::ebpf::interface::ApplyReport {
+        let owned = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let (lan, wan) = (owned(lan), owned(wan));
+        if self.bindings.programs().is_empty() {
+            self.bindings = bindings::InterfaceBindings::preload(self.bpf_mut().unwrap()).unwrap();
+        }
+        let any_auto = lan
+            .iter()
+            .chain(&wan)
+            .any(|name| honk_config::config::is_auto_interface(name));
+        let topology = crate::ebpf::interface::read_topology(any_auto).unwrap();
+        let plan = crate::ebpf::interface::plan(&lan, &wan, &topology).unwrap();
+        let report = self.bind_interfaces(&plan, &topology);
+        assert!(report.failed.is_empty(), "bind failed: {:?}", report.failed);
+        assert!(!report.topology_changed);
+        report
     }
 
     pub(crate) fn run_routing_test(

@@ -14,18 +14,7 @@ use honk_ebpf_common::conn::BpfStatsKey;
 async fn allocation_failure_allows_create_connect_and_send_without_identity() {
     let pin_root =
         Path::new("/sys/fs/bpf").join(format!("honk-identity-failure-{}", std::process::id()));
-    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
-    let mut backend = RealEbpfBackend::load(
-        crate::DEFAULT_BPF_OBJECT,
-        &pin_root,
-        12345,
-        &dae0_setup,
-        Some("lo"),
-        "lo",
-        true,
-    )
-    .await
-    .expect("load required identity capture");
+    let (_dae0, mut backend) = load_bare(&pin_root).await;
     let stat = BpfStatsKey::SocketIdentityCaptureFailure as u32;
     let before = backend.get_bpf_stats(stat).unwrap().unwrap_or(0);
 
@@ -187,9 +176,7 @@ fn unavailable_cgroup_capture_refuses_startup() {
             &pin_root,
             12345,
             &dae0_setup,
-            Some("lo"),
-            "lo",
-            true,
+            0,
         ));
         assert!(
             result.is_err(),
@@ -229,6 +216,7 @@ impl LegacySockOps {
         attr.__bindgen_anon_5.attach_bpf_fd = self.program.as_raw_fd() as u32;
         attr.__bindgen_anon_5.attach_type = BPF_CGROUP_SOCK_OPS as u32;
         unsafe { syscall::bpf_syscall(command, &mut attr) }
+            .map(|_| ())
             .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))
     }
 }
@@ -264,16 +252,8 @@ async fn occupied_sock_ops_slot_refuses_startup_without_leaving_links() {
     let links_before = held_bpf_link_count();
     let programs_before = cgroup_attached_prog_count(foreign.cgroup.as_raw_fd());
 
-    let result = RealEbpfBackend::load(
-        crate::DEFAULT_BPF_OBJECT,
-        &pin_root,
-        12345,
-        &dae0_setup,
-        Some("lo"),
-        "lo",
-        true,
-    )
-    .await;
+    let result =
+        RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0).await;
     assert!(
         result.is_err(),
         "startup allowed an occupied root sock_ops slot"
