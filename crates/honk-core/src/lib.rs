@@ -1118,7 +1118,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         #[cfg(feature = "ebpf")]
         {
             if let Some(lan_ifname) = configured_ifaces.lan.first() {
-                let _ = sysctl::set_sysctl(&format!("net.ipv4.conf.{}.rp_filter", lan_ifname), "0");
+                let _ = sysctl::set_device_sysctl("ipv4", lan_ifname, "rp_filter", "0");
             }
             _dae0_link = Some(daens::create_dae0_link()?);
             for wan_ifname in &configured_ifaces.wan {
