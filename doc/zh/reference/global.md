@@ -98,9 +98,9 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 
 `auto`（在所有使用处均去除首尾空白并不区分 ASCII 大小写，因此 `AUTO`、` auto ` 与仅含空白的条目都算；`.dae` 列表解析器会丢弃真正为空的项，所以空列表仍表示没有接口）解析为拥有 metric 最低 IPv4 默认路由的网卡。如果不存在该路由，此项保持待定（绝不回退到 `lo`），直到默认路由出现。同一列表中显式命名的网卡继续工作。仅当某项为 `auto` 时才读取路由表；路由表无法读取是错误，而不是“没有默认路由”：启动时会失败，运行期间的失败则保持现有绑定不变。
 
-网卡存在即绑定，不要求 `IFF_UP`。每个网卡有各自的角色：只在 `lan_interface` 中为 LAN，只在 `wan_interface` 中为 WAN，两者都出现为 LAN/WAN 共用（见[接口挂钩集合](../design/datapath.md#接口挂钩集合)），因此共用网卡不会改变其他 LAN 网卡的 hook。bond、bridge 或其他 master 的成员通过该 master 绑定，但 `vrf` 与 `openvswitch` 的成员保持自身。LAN bridge 同时绑定其端口，bond 绑定其成员。
+网卡存在即绑定，不要求 `IFF_UP`。角色按网卡区分（见[接口挂钩集合](../design/datapath.md#接口挂钩集合)），因此 LAN/WAN 共用网卡不会改变其他 LAN 网卡的 hook。bond、bridge 或其他 master 的成员通过该 master 绑定，但 `vrf` 与 `openvswitch` 的成员保持自身；LAN bridge 还会以 LAN 角色绑定其端口，bond 的 hook 只挂在逻辑 master 上，不挂成员。
 
-每个已配置的条目都是惰性绑定，绝不会导致启动失败。网卡尚不存在、没有默认路由的 `auto` 条目或被拒绝的链路类型（见下）不会绑定任何 hook：其流量在绑定之前不被拦截。无法创建、更新或校验的 TCX link 可能让条目只绑定了部分 hook，因此有效的 hook 仍可能拦截流量。两种情况都由 `interface_binding` [降级](./api.md#原生-api)报告；`lifecycle.state` 仍为 `running`，监控必须读取该降级。只有内核的主名称会被匹配，altname 视为不存在。出现的设备会被绑定，消失的设备会释放其 hook，以新网卡 index 重建的设备会重新绑定。属于尚不存在的网卡的 `dns.bind` 地址不是网卡条目：绑定它仍会导致启动失败（`EADDRNOTAVAIL`）。
+每个已配置的条目都是惰性绑定，绝不会导致启动失败。网卡尚不存在、没有默认路由的 `auto` 条目或被拒绝的链路类型（见下）不会绑定任何 hook：其流量在绑定之前不被拦截。无法创建、更新或校验的 TCX link 可能让条目只绑定了部分 hook。两种情况都由 `interface_binding` [降级](./api.md#原生-api)报告。只有内核的主名称会被匹配，altname 视为不存在。出现的设备会被绑定，消失的设备会释放其 hook，以新网卡 index 重建的设备会重新绑定。属于尚不存在的网卡的 `dns.bind` 地址不是网卡条目：绑定它仍会导致启动失败（`EADDRNOTAVAIL`）。
 
 链路类型决定程序族：
 
@@ -111,7 +111,7 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 | GRE / IP6GRE | 仅当置位 `IFF_POINTOPOINT` 且未置位 `IFF_BROADCAST` 时为 `_l3`；否则拒绝 |
 | `lo`、`vcan`、InfiniBand、802.15.4、nlmon 及其他所有类型 | 拒绝 |
 
-被拒绝的项不绑定任何 hook，并按每个 episode 记录一次指明网卡与原因的错误日志：链路类型不受支持、`vrf` 设备（请配置成员；VRF 成员绑定自身）或 `dae0`/`dae0peer`。降级以原因 `unsupported_type` 报告；即使它是第一个已解析的 LAN 或 WAN 项，也不会导致启动失败。类型不受支持的 bridge 端口或 bond 成员被静默跳过。bond 或 team master 的类型取自其当前第一个端口，因此 InfiniBand bond 会被拒绝。L3S 模式的 ipvlan 与 `reorder_hdr off` 的 VLAN 设备属于不支持的组合。
+被拒绝的项不绑定任何 hook，并按每个 episode 记录一次指明网卡与原因的错误日志：链路类型不受支持、`vrf` 设备（请配置成员；VRF 成员绑定自身）或 `dae0`/`dae0peer`。降级以原因 `unsupported_type` 报告；即使它是第一个已解析的 LAN 或 WAN 项，也不会导致启动失败。类型不受支持的 bridge 端口被静默跳过。bond 或 team master 的类型取自其当前第一个端口，因此 InfiniBand bond 会被拒绝。L3S 模式的 ipvlan 与 `reorder_hdr off` 的 VLAN 设备属于不支持的组合。
 
 `IfaceWatcher` 订阅 link、address 和 IPv4/IPv6 route 事件，并每 60 秒执行一次 reconciliation。若无法订阅或无法注册轮询，它仍每 60 秒协调一次、没有事件通知，并报告 `iface_watch` 降级。它会随网卡和默认路由变化创建、更新或释放所需的 LAN/WAN hook。拓扑变化仍用于 ECS 刷新，并立即唤醒受健康状态控制的出站探测，但不再生成网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。网卡列表配置本身发生变化仍需重启；网关管理访问应使用[显式用户路由](./routing.md#显式本地路由)。启动顺序与导致启动失败的条件见[接口协调](../design/datapath.md#接口协调)。
 

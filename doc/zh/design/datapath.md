@@ -40,7 +40,7 @@ flowchart LR
 
 ### 接口挂钩集合
 
-接口的 `(ifi_type, ifi_flags)` 决定 `Framing`：以太网（`ARPHRD_ETHER`）使用 `_l2` 程序；`ARPHRD_NONE`、PPP、RAWIP、IPIP、IP6TNL 与 SIT 使用 `_l3`；GRE 与 IP6GRE 仅当置位 `IFF_POINTOPOINT` 且未置位 `IFF_BROADCAST` 时使用 `_l3`（组播 remote 或缺少 remote 会使设备带 `header_ops`，TC 处出现隧道头）；其余类型，包括 `lo`、`vcan`、InfiniBand 与 PIMREG，均不受支持，不绑定到任何位置。每个 bridge 端口和 bond 成员各自套用该规则，不受支持的被跳过。配置项的规范根接口若不受支持、是 `vrf` 设备（成员的 TC ingress 先于 `l3mdev` 接收，VRF 自身看不到入站流量）或是 `dae0`/`dae0peer`，则被拒绝：不产生绑定，在 `interface_binding` 降级中以原因 `unsupported_type` 体现，并按每个 episode 记录一条错误日志；启动继续。bond 或 team master 报告其当前第一个端口的类型，帧格式随之变化；类型变化会在下一次协调中产生不同的计划。所有程序变体随 BPF 对象一并预加载，且早于 BPF logger 启动，因此运行期协调只创建 TCX link，从不加载程序。
+接口的 `(ifi_type, ifi_flags)` 决定 `Framing`（`_l2` 或 `_l3`；对应关系见[网卡语义](../reference/global.md#网卡语义)）。GRE 与 IP6GRE 仅在点对点时使用 `_l3`，因为组播 remote 或缺少 remote 会使设备带 `header_ops`，TC 处出现隧道头。`vrf` 根接口被拒绝，因为成员的 TC ingress 先于 `l3mdev` 接收，VRF 自身看不到入站流量。bond 或 team master 报告其当前第一个端口的类型，帧格式随之变化；类型变化会在下一次协调中产生不同的计划。所有程序变体随 BPF 对象一并预加载，且早于 BPF logger 启动，因此运行期协调只创建 TCX link，从不加载程序。
 
 每个配置的名称先解析为规范根接口：bond 或 bridge 的成员解析为其 master；本身是 bridge 端口的 bond 解析为该 bridge；其他 master 的成员也解析为该 master，但 `vrf` 与 `openvswitch` 的成员保持自身。各根接口独立规划。只出现在 `lan_interface` 的根为 LAN，只出现在 `wan_interface` 的为 WAN，两者都出现的为 LAN/WAN 共用：
 
@@ -50,7 +50,11 @@ flowchart LR
 | WAN | `wan_ingress` + `wan_egress` |
 | LAN/WAN 共用 | `lan_ingress` + `wan_egress`；跳过 `lan_egress` 和 `wan_ingress` |
 
-角色按接口各自确定，因此多 LAN 配置中的一个共用接口不再改变其他 LAN 接口的挂钩。流量可能绕过 master 的挂钩，所以 LAN bridge 根接口还会绑定每个端口（LAN 角色；WAN 名称不会将其升级）。bond 根接口绑定每个成员：LAN bond 为 `lan_ingress` + `wan_egress`，WAN bond 为 `wan_egress`。纯 WAN 部署（未配置 `lan_interface`）不安装任何 LAN 挂钩。
+角色按接口各自确定，因此多 LAN 配置中的一个共用接口不再改变其他 LAN 接口的挂钩。流量可能绕过 bridge master 的挂钩，所以 LAN bridge 根接口还会绑定每个端口（LAN 角色；WAN 名称不会将其升级）。bond 根接口只按表中对应角色绑定逻辑 master，不绑定成员。作为 LAN bridge 端口的 bond 仍是一个逻辑 LAN 端口，保留 `lan_ingress` + `lan_egress`，不展开其成员。若 LAN 为 `br0`、WAN 为 `bond0`，且 `bond0` 属于 `br0`，则 bridge 为 LAN/WAN 共用，`bond0` 与其他端口仍为 LAN。纯 WAN 部署（未配置 `lan_interface`）不安装任何 LAN 挂钩。
+
+bond 拦截覆盖经过逻辑 master TC hook 的正常软件 skb 路径。bonding 先决定哪些接收帧会进入 master，honk 随后才分类，不会抢在 bonding 接收决策之前接管 inactive 成员上的帧。直接向成员注入的原始 `AF_PACKET` 帧，以及绕过这些 TC hook 的路径（包括此类硬件卸载）不在覆盖范围内。
+
+对于在 bond 上拦截的 LAN TCP 与非 DNS UDP，`REDIRECT_TRACK` 捕获 master ifindex；符合条件的 LAN UDP `CLIENT_REPLY_TRACK` 条目也保留该 index。回复走 master TX（`dev_queue_xmit`），由 bonding 选择当前出端口。WAN 本机流量拦截保存 master ifindex 与 `from_wan=1`，回复经 master RX（`BPF_F_INGRESS`）回到主机套接字，不依赖 `CLIENT_REPLY_TRACK`。切换 active 成员与成员热插拔都不需要 honk 成员 hook。
 
 `lan_ingress` 对转发的客户端流量分类。`wan_egress` 独立地对主机创建的流量分类。拓扑提供独立方向时，反向 ingress/egress 挂钩刷新已有连接状态。只有正向 TCP SYN 发布 TCP 状态：反向的纯 SYN 既不创建也不刷新它。
 

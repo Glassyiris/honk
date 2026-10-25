@@ -14,7 +14,7 @@ kernel=$(uname -r)
 printf 'Guest uname -r: %s\n' "$kernel" >> "${GITHUB_STEP_SUMMARY:?}"
 test "$kernel" = "${HONK_CI_EXPECTED_KERNEL:?}"
 test -d "/lib/modules/$kernel"
-modprobe -a tun veth sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue
+modprobe -a tun veth bonding bridge sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue
 test -e /sys/fs/cgroup/cgroup.controllers
 test -r "${HONK_ROUTING_TEST_OBJECT:?}"
 if ! mountpoint -q /sys/fs/bpf; then
@@ -67,6 +67,11 @@ done
 "$HONK_NFQUEUE_TEST_BIN" nfqueue_service_isolated_netns_kernel_contract \
   --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-nfqueue.log"
 for ownership_test in \
+  control::tests::bond_binding::netns_bond_lan_tcp_udp_master_reply_and_failover \
+  control::tests::bond_binding::netns_bond_wan_only_local_failover \
+  control::tests::bond_binding::netns_bond_inactive_member_respects_receive_admission \
+  control::tests::bond_binding::netns_bond_bridge_port_keeps_native_udp_reverse_path \
+  control::tests::bond_binding::netns_bond_non_lacp_modes_proxy_tcp_udp \
   control::tests::tcp_binding::netns_tcp_accepted_fd_proves_original_syn \
   control::tests::tcp_tuple_reuse::netns_tcp_reuses_tuple_during_daens_time_wait \
   control::tests::udp_fullcone::netns_udp_full_cone_source_contract; do

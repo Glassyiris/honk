@@ -1,4 +1,5 @@
 use super::support::netns::{add_address, build_lab, lab_config, pinned_map, run_isolated};
+use super::support::shared_udp::{SharedUdpMode, SharedUdpPeer};
 use super::support::{QuicUdpMode, QuicUdpPeer};
 use super::{NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder};
 use crate::control::{ControlCommand, ControlPlane};
@@ -10,14 +11,11 @@ use anyhow::{Context, ensure};
 use aya::maps::{Array, HashMap};
 use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::{RedirectEntry, RedirectTuple, TuplesKey};
-use shared_peers::{SharedUdpMode, SharedUdpPeer};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::net::UdpSocket;
-
-mod shared_peers;
 
 const CASE: &str = "control::tests::udp_fullcone::netns_udp_full_cone_source_contract";
 const CHILD: &str = "HONK_UDP_FULLCONE_CHILD";

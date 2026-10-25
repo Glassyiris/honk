@@ -652,6 +652,13 @@ impl RealEbpfBackend {
         })
     }
 
+    pub(crate) fn test_interface_chain(
+        ifindex: u32,
+        direction: crate::ebpf::interface::Direction,
+    ) -> std::io::Result<Vec<u32>> {
+        Ok(bindings::query_chain(ifindex, direction)?.links)
+    }
+
     /// What startup passes to `load` for these interfaces.
     pub(crate) fn test_local_ip(lan: &[&str], wan: &[&str]) -> u32 {
         let owned = |names: &[&str]| {

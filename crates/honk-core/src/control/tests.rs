@@ -16,6 +16,8 @@ use support::{
 };
 
 mod admission;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod bond_binding;
 mod diagnostics;
 mod dns_tcp_ownership;
 mod dns_udp_ownership;

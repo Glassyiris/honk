@@ -72,11 +72,8 @@ pub(in crate::control::tests) fn run_isolated(
     Ok(())
 }
 
-/// Enters private net/mount namespaces and wires the LAN and WAN veth edges.
-pub(in crate::control::tests) fn build_lab(
-    lan_ip: IpAddr,
-    wan_ip: IpAddr,
-) -> anyhow::Result<(OwnedFd, OwnedFd)> {
+/// Enters private net/mount namespaces with their own sysfs, bpffs and cgroup2.
+pub(in crate::control::tests) fn enter_lab_namespaces() -> anyhow::Result<()> {
     let expected_kernel = std::env::var("HONK_CI_EXPECTED_KERNEL").unwrap_or_default();
     anyhow::ensure!(
         std::env::var_os("HONK_CI_VM_LANE").is_some()
@@ -141,6 +138,15 @@ pub(in crate::control::tests) fn build_lab(
         MsFlags::empty(),
         None::<&str>,
     )?;
+    Ok(())
+}
+
+/// Enters private net/mount namespaces and wires the LAN and WAN veth edges.
+pub(in crate::control::tests) fn build_lab(
+    lan_ip: IpAddr,
+    wan_ip: IpAddr,
+) -> anyhow::Result<(OwnedFd, OwnedFd)> {
+    enter_lab_namespaces()?;
     let client_netns = fresh_test_netns();
     let server_netns = fresh_test_netns();
     let mut netlink = crate::netlink::NlSock::new()?;
