@@ -3,6 +3,7 @@
 //! degradation. Nothing about a configured interface fails startup except an
 //! unreadable topology; an absent, unsupported or unattachable one is reported
 //! through the `interface_binding` degradation and left to the watcher.
+//! Startup binds before backend publication/admission; watcher rounds need async lock handoffs.
 
 use std::os::fd::OwnedFd;
 use std::path::Path;
