@@ -25,6 +25,7 @@ use crate::ebpf::EbpfBackend;
 use crate::ebpf::interface::{
     self, ApplyReport, Binding, BindingSnapshot, Direction, InterfacePlan, TcProgram, Topology,
 };
+use crate::netlink::{RTM_DELLINK, RTM_NEWLINK};
 
 // A captive-portal login may add only a default route to an already-up link.
 const RTMGRP_LINK_MASK: u32 = 1;
@@ -37,8 +38,6 @@ const RTMGRP_NETWORK_MASK: u32 = RTMGRP_LINK_MASK
     | RTMGRP_IPV4_ROUTE
     | RTMGRP_IPV6_IFADDR
     | RTMGRP_IPV6_ROUTE;
-const RTM_NEWLINK: u16 = 16;
-const RTM_DELLINK: u16 = 17;
 // Events are a wakeup hint only — reconcile re-reads ground truth — but a
 // dropped datagram would stall a pending interface forever, so a slow ticker
 // backstops the subscription.
