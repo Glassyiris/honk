@@ -13,7 +13,7 @@ use crate::ebpf::EbpfBackend;
 use crate::ebpf::interface::{BindingSnapshot, Direction, TcProgram};
 use crate::ebpf::real::{IfaceWatcher, RealEbpfBackend, start_interfaces};
 use crate::routing::Router;
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use aya::maps::{Array, HashMap};
 use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
 use honk_ebpf_common::dae_ip::In6Addr;
@@ -121,11 +121,19 @@ fn add_member(peer_ns: &OwnedFd, number: u8) -> anyhow::Result<()> {
     ip(None, &["link", "set", &member, "up"])
 }
 
-fn bond_edge(peer_ns: &OwnedFd, mode: &str) -> anyhow::Result<()> {
+fn bond_edge(peer_ns: &OwnedFd, mode: Mode) -> anyhow::Result<()> {
     ip(
         None,
         &[
-            "link", "add", BOND, "type", "bond", "mode", mode, "miimon", "100",
+            "link",
+            "add",
+            BOND,
+            "type",
+            "bond",
+            "mode",
+            mode.name(),
+            "miimon",
+            "100",
         ],
     )?;
     ip(
@@ -163,9 +171,59 @@ fn address(name: &str, ip_addr: Ipv4Addr) -> anyhow::Result<()> {
     )
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Lan,
+    Wan,
+    Inactive,
+    Bridge,
+}
+
+impl Kind {
+    fn parse(name: &str) -> anyhow::Result<Self> {
+        Ok(match name {
+            "lan" => Self::Lan,
+            "wan" => Self::Wan,
+            "inactive" => Self::Inactive,
+            "bridge" => Self::Bridge,
+            _ => bail!("unknown bond kind {name:?}"),
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    ActiveBackup,
+    BalanceRr,
+    BalanceXor,
+    Broadcast,
+}
+
+impl Mode {
+    fn parse(name: &str) -> anyhow::Result<Self> {
+        Ok(match name {
+            "active-backup" => Self::ActiveBackup,
+            "balance-rr" => Self::BalanceRr,
+            "balance-xor" => Self::BalanceXor,
+            "broadcast" => Self::Broadcast,
+            _ => bail!("unknown bond mode {name:?}"),
+        })
+    }
+
+    /// The kernel's name for `ip link add ... mode`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::ActiveBackup => "active-backup",
+            Self::BalanceRr => "balance-rr",
+            Self::BalanceXor => "balance-xor",
+            Self::Broadcast => "broadcast",
+        }
+    }
+}
+
 struct Scenario {
-    kind: String,
-    mode: String,
+    kind: Kind,
+    mode: Mode,
     client_ns: Option<OwnedFd>,
     server_ns: OwnedFd,
     bond_peer: OwnedFd,
@@ -178,6 +236,7 @@ struct Scenario {
 
 fn run_child(case: &str) -> anyhow::Result<()> {
     let (kind, mode) = case.split_once('/').context("bond case")?;
+    let (kind, mode) = (Kind::parse(kind)?, Mode::parse(mode)?);
     enter_lab_namespaces()?;
     ip(None, &["link", "set", "lo", "up"])?;
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
@@ -189,75 +248,79 @@ fn run_child(case: &str) -> anyhow::Result<()> {
     }
     let peer = fresh_test_netns();
     bond_edge(&peer, mode)?;
-    let scenario = if kind == "wan" {
-        address(BOND, WAN)?;
-        configure_test_edge(&peer, PEER_BRIDGE, SERVER, WAN, &[]);
-        Scenario {
-            kind: kind.into(),
-            mode: mode.into(),
-            client_ns: None,
-            server_ns: peer.try_clone()?,
-            bond_peer: peer,
-            source: WAN,
-            server: SERVER,
-            local: WAN,
-            lan: vec![],
-            wan: vec![BOND.into()],
+    let scenario = match kind {
+        Kind::Wan => {
+            address(BOND, WAN)?;
+            configure_test_edge(&peer, PEER_BRIDGE, SERVER, WAN, &[]);
+            Scenario {
+                kind,
+                mode,
+                client_ns: None,
+                server_ns: peer.try_clone()?,
+                bond_peer: peer,
+                source: WAN,
+                server: SERVER,
+                local: WAN,
+                lan: vec![],
+                wan: vec![BOND.into()],
+            }
         }
-    } else if kind == "bridge" {
-        ip(
-            None,
-            &[
-                "link",
-                "add",
-                BRIDGE,
-                "type",
-                "bridge",
-                "forward_delay",
-                "0",
-            ],
-        )?;
-        ip(None, &["link", "set", BOND, "master", BRIDGE])?;
-        ip(None, &["link", "set", BRIDGE, "up"])?;
-        address(BRIDGE, LAN)?;
-        let client = fresh_test_netns();
-        veth("hl0", "hc0", &client)?;
-        ip(None, &["link", "set", "hl0", "master", BRIDGE])?;
-        ip(None, &["link", "set", "hl0", "up"])?;
-        configure_test_edge(&client, "hc0", LAN_CLIENT, LAN, &[]);
-        configure_test_edge(&peer, PEER_BRIDGE, BRIDGE_SERVER, LAN, &[]);
-        Scenario {
-            kind: kind.into(),
-            mode: mode.into(),
-            client_ns: Some(client),
-            server_ns: peer.try_clone()?,
-            bond_peer: peer,
-            source: LAN_CLIENT,
-            server: BRIDGE_SERVER,
-            local: LAN,
-            lan: vec![BRIDGE.into()],
-            wan: vec![BOND.into()],
+        Kind::Bridge => {
+            ip(
+                None,
+                &[
+                    "link",
+                    "add",
+                    BRIDGE,
+                    "type",
+                    "bridge",
+                    "forward_delay",
+                    "0",
+                ],
+            )?;
+            ip(None, &["link", "set", BOND, "master", BRIDGE])?;
+            ip(None, &["link", "set", BRIDGE, "up"])?;
+            address(BRIDGE, LAN)?;
+            let client = fresh_test_netns();
+            veth("hl0", "hc0", &client)?;
+            ip(None, &["link", "set", "hl0", "master", BRIDGE])?;
+            ip(None, &["link", "set", "hl0", "up"])?;
+            configure_test_edge(&client, "hc0", LAN_CLIENT, LAN, &[]);
+            configure_test_edge(&peer, PEER_BRIDGE, BRIDGE_SERVER, LAN, &[]);
+            Scenario {
+                kind,
+                mode,
+                client_ns: Some(client),
+                server_ns: peer.try_clone()?,
+                bond_peer: peer,
+                source: LAN_CLIENT,
+                server: BRIDGE_SERVER,
+                local: LAN,
+                lan: vec![BRIDGE.into()],
+                wan: vec![BOND.into()],
+            }
         }
-    } else {
-        address(BOND, LAN)?;
-        configure_test_edge(&peer, PEER_BRIDGE, LAN_CLIENT, LAN, &[]);
-        let server = fresh_test_netns();
-        veth("hw0", "hs0", &server)?;
-        ip(None, &["link", "set", "hw0", "up"])?;
-        address("hw0", WAN)?;
-        configure_test_edge(&server, "hs0", SERVER, WAN, &[]);
-        Scenario {
-            kind: kind.into(),
-            mode: mode.into(),
-            client_ns: Some(peer.try_clone()?),
-            server_ns: server,
-            bond_peer: peer,
-            source: LAN_CLIENT,
-            server: SERVER,
-            local: WAN,
-            // The canary proves a member-change event has completed a full reconcile.
-            lan: vec![BOND.into(), "hcan0".into()],
-            wan: vec!["hw0".into()],
+        Kind::Lan | Kind::Inactive => {
+            address(BOND, LAN)?;
+            configure_test_edge(&peer, PEER_BRIDGE, LAN_CLIENT, LAN, &[]);
+            let server = fresh_test_netns();
+            veth("hw0", "hs0", &server)?;
+            ip(None, &["link", "set", "hw0", "up"])?;
+            address("hw0", WAN)?;
+            configure_test_edge(&server, "hs0", SERVER, WAN, &[]);
+            Scenario {
+                kind,
+                mode,
+                client_ns: Some(peer.try_clone()?),
+                server_ns: server,
+                bond_peer: peer,
+                source: LAN_CLIENT,
+                server: SERVER,
+                local: WAN,
+                // The canary proves a member-change event has completed a full reconcile.
+                lan: vec![BOND.into(), "hcan0".into()],
+                wan: vec!["hw0".into()],
+            }
         }
     };
     let (_dae0, setup) = daens::create_dae0_link()?;
@@ -274,7 +337,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                 let mut config = lab_config(&peer.node);
                 config.global.lan_interface.clone_from(&scenario.lan);
                 config.global.wan_interface.clone_from(&scenario.wan);
-                if kind == "bridge" {
+                if kind == Kind::Bridge {
                     // Only requests match direct. A reply misclassified as a fresh LAN flow
                     // hits the proxy default, so absence of LAN reverse learning breaks data.
                     config.routing.rules.push(RoutingRule {
@@ -402,6 +465,24 @@ async fn switch_active(member: &str) -> anyhow::Result<()> {
     );
     // Wait for the bonding peer notification/bridge learning, not a new honk binding.
     tokio::time::sleep(Duration::from_millis(250)).await;
+    Ok(())
+}
+
+/// Makes `active` the bond's active member, runs `traffic`, and requires the replies
+/// to leave through `active` alone.
+async fn replies_follow(
+    active: &str,
+    idle: &str,
+    what: &str,
+    traffic: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    switch_active(active).await?;
+    let (idle_tx, active_tx) = (stats(idle, "tx_packets")?, stats(active, "tx_packets")?);
+    traffic.await?;
+    ensure!(
+        stats(active, "tx_packets")? > active_tx && stats(idle, "tx_packets")? == idle_tx,
+        "{what} replies did not leave exclusively through the current active member"
+    );
     Ok(())
 }
 
@@ -578,30 +659,24 @@ async fn exercise(s: &Scenario, ebpf: &Backend, peer: &mut SharedUdpPeer) -> any
         }
     });
     let result = async {
-        if s.kind == "inactive" {
-            return inactive(s, ebpf, tcp_target).await;
+        match s.kind {
+            Kind::Inactive => return inactive(s, ebpf, tcp_target).await,
+            Kind::Bridge => return bridge(s, ebpf, udp_target, tcp_target).await,
+            Kind::Lan | Kind::Wan => {}
         }
-        if s.kind == "bridge" {
-            return bridge(s, ebpf, udp_target, tcp_target).await;
-        }
-        let from_wan = u8::from(s.kind == "wan");
-        if s.mode == "active-backup" {
+        let from_wan = u8::from(s.kind == Kind::Wan);
+        let failover = s.mode == Mode::ActiveBackup;
+        if failover {
             switch_active("hm0").await?;
         }
         let mut tcp = Client::start("tcp", s.source, tcp_target, s.client_ns.as_ref()).await?;
         tcp.rounds(8).await?;
         redirected(ebpf, tcp.local, tcp_target, 6, BOND, from_wan).await?;
-        if s.mode == "active-backup" {
-            if s.kind == "lan" {
+        if failover {
+            if s.kind == Kind::Lan {
                 member_change(s, ebpf).await?;
             }
-            switch_active("hm1").await?;
-            let (old, active) = (stats("hm0", "tx_packets")?, stats("hm1", "tx_packets")?);
-            tcp.rounds(32).await?;
-            ensure!(
-                stats("hm1", "tx_packets")? > active && stats("hm0", "tx_packets")? == old,
-                "TCP replies did not leave exclusively through the current active member"
-            );
+            replies_follow("hm1", "hm0", "TCP", tcp.rounds(32)).await?;
             redirected(ebpf, tcp.local, tcp_target, 6, BOND, from_wan).await?;
         }
         tcp.finish().await?;
@@ -636,32 +711,29 @@ async fn exercise(s: &Scenario, ebpf: &Backend, peer: &mut SharedUdpPeer) -> any
             foreign.send_to(b"foreign", packet.mapping)?;
             udp.command("foreign").await?;
         }
-        if s.mode == "active-backup" {
-            switch_active("hm0").await?;
-            let (old, active) = (stats("hm1", "tx_packets")?, stats("hm0", "tx_packets")?);
-            udp.rounds(16).await?;
-            let mut final_payload = [0x6b; BLOCK];
-            final_payload[..4].copy_from_slice(&17u32.to_be_bytes());
-            tokio::time::timeout(TIMEOUT, async {
-                loop {
-                    let continued = peer.packets.recv().await.context("UDP proxy stopped")?;
-                    ensure!(
-                        continued.association == packet.association
-                            && continued.target == udp_target,
-                        "UDP changed proxy association/target after failover"
-                    );
-                    if continued.payload == final_payload {
-                        break;
+        if failover {
+            replies_follow("hm0", "hm1", "UDP", async {
+                udp.rounds(16).await?;
+                let mut final_payload = [0x6b; BLOCK];
+                final_payload[..4].copy_from_slice(&17u32.to_be_bytes());
+                tokio::time::timeout(TIMEOUT, async {
+                    loop {
+                        let continued = peer.packets.recv().await.context("UDP proxy stopped")?;
+                        ensure!(
+                            continued.association == packet.association
+                                && continued.target == udp_target,
+                            "UDP changed proxy association/target after failover"
+                        );
+                        if continued.payload == final_payload {
+                            break;
+                        }
                     }
-                }
-                Ok::<_, anyhow::Error>(())
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .context("post-switch UDP no longer traverses the proxy")?
             })
-            .await
-            .context("post-switch UDP no longer traverses the proxy")??;
-            ensure!(
-                stats("hm0", "tx_packets")? > active && stats("hm1", "tx_packets")? == old,
-                "UDP replies did not follow current member"
-            );
+            .await?;
             redirected(ebpf, udp.local, udp_target, 17, BOND, from_wan).await?;
         }
         udp.finish().await?;
