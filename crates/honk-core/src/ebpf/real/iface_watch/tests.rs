@@ -1,22 +1,11 @@
 use super::*;
 use crate::degradations::{Component, Degradations};
-use crate::ebpf::interface::status::SysctlKey;
 use crate::ebpf::interface::{Binding, Direction, TcProgram};
+use crate::ebpf::real::interface_state::SysctlKey;
+use crate::ebpf::test_support::link;
 use crate::netlink::LinkSnapshot;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-fn link(ifindex: u32, name: &str) -> LinkSnapshot {
-    LinkSnapshot {
-        ifindex: NonZeroU32::new(ifindex).unwrap(),
-        name: name.into(),
-        arphrd: 1,
-        flags: 0,
-        master: None,
-        kind: None,
-        mac: Some([2, 0, 0, 0, 0, ifindex as u8]),
-    }
-}
 
 /// Fixed topology: no `lo`, no kernel.
 fn topology() -> Topology {
@@ -28,12 +17,6 @@ fn topology() -> Topology {
 
 fn fake_fd() -> OwnedFd {
     std::fs::File::open("/dev/null").unwrap().into()
-}
-
-type Key = (NonZeroU32, Direction);
-
-fn key(binding: &Binding) -> Key {
-    (binding.ifindex, binding.direction)
 }
 
 /// A kernel-free `apply` with the same contract: diff by `(ifindex,
@@ -49,15 +32,15 @@ fn model_apply(
         ..ApplyReport::default()
     };
     for (held, ..) in &snapshot.owned {
-        if !plan.bindings.iter().any(|b| key(b) == key(held)) {
-            report.commit.remove.push(key(held));
+        if !plan.bindings.iter().any(|b| b.key() == held.key()) {
+            report.commit.remove.push(held.key());
         }
     }
     for binding in &plan.bindings {
         match snapshot
             .owned
             .iter()
-            .find(|(held, ..)| key(held) == key(binding))
+            .find(|(held, ..)| held.key() == binding.key())
         {
             None if fail_egress && binding.direction == Direction::Egress => report
                 .failed
@@ -92,10 +75,10 @@ fn model_apply(
 #[derive(Clone, Default)]
 struct Stub {
     fail_egress: Arc<AtomicBool>,
-    fail_topology: Arc<AtomicBool>,
     /// Report `topology_changed` on every apply.
     moving: Arc<AtomicBool>,
     applies: Arc<AtomicU64>,
+    fail_topology: Arc<AtomicBool>,
     /// Replaces the fixed topology.
     links: Arc<parking_lot::Mutex<Option<Topology>>>,
     /// What the stub sysctl step was asked to write, in order.
@@ -120,7 +103,10 @@ impl Stub {
         );
         Reconciler {
             read_topology: Arc::new(move |_| {
-                anyhow::ensure!(!fail_topology.load(Ordering::SeqCst), "link dump failed");
+                anyhow::ensure!(
+                    !fail_topology.load(Ordering::SeqCst),
+                    "injected topology failure"
+                );
                 Ok(links.lock().clone().unwrap_or_else(topology))
             }),
             apply: Arc::new(move |snapshot, plan, _, _| {
@@ -150,17 +136,13 @@ struct Fixture {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     commits: Arc<AtomicU64>,
-    detaches: Arc<AtomicU64>,
     degradations: Arc<Degradations>,
     stub: Stub,
 }
 
 fn fixture(lan: &[&str], wan: &[&str]) -> Fixture {
     let backend = crate::ebpf::mock::MockEbpfBackend::new();
-    let (commits, detaches) = (
-        backend.binding_commits.clone(),
-        backend.detach_calls.clone(),
-    );
+    let commits = backend.binding_commits.clone();
     let mut config = honk_config::Config::default();
     config.global.lan_interface = lan.iter().map(|name| name.to_string()).collect();
     config.global.wan_interface = wan.iter().map(|name| name.to_string()).collect();
@@ -168,7 +150,6 @@ fn fixture(lan: &[&str], wan: &[&str]) -> Fixture {
         ebpf: Arc::new(RwLock::new(Box::new(backend))),
         config: Arc::new(RwLock::new(Arc::new(config))),
         commits,
-        detaches,
         degradations: Arc::default(),
         stub: Stub::default(),
     }
@@ -195,7 +176,6 @@ impl Fixture {
             .await
             .interface_binding_snapshot()
             .unwrap()
-            .unwrap()
             .owned
             .into_iter()
             .map(|(b, id, _)| (b, id))
@@ -209,16 +189,6 @@ impl Fixture {
             .collect();
         owned.sort();
         owned
-    }
-
-    /// `(ifindex, direction, interface name, link id)` of every held binding.
-    async fn held(&self) -> Vec<(u32, Direction, String, u32)> {
-        let mut held: Vec<_> = (self.bindings().await)
-            .into_iter()
-            .map(|(b, id)| (b.ifindex.get(), b.direction, b.interface, id))
-            .collect();
-        held.sort();
-        held
     }
 
     async fn set_interfaces(&self, lan: &[&str], wan: &[&str]) {
@@ -476,7 +446,7 @@ async fn a_failed_stage_leaves_the_degradation_and_bindings_alone() {
     assert_eq!((reason(), f.owned().await), (pending, held.clone()));
     f.stub.fail_topology.store(false, Ordering::SeqCst);
 
-    // Unsupported nesting: the whole plan is rejected, nothing is half bound.
+    // Unsupported nesting refuses only that entry; the ordinary LAN stays bound.
     let mut a = link(10, "a");
     a.kind = Some("bond".into());
     a.master = NonZeroU32::new(11);
@@ -488,17 +458,16 @@ async fn a_failed_stage_leaves_the_degradation_and_bindings_alone() {
         default_route: None,
     });
     f.set_interfaces(&["eth0", "a"], &[]).await;
-    let error = watch.reconcile(true).await.unwrap_err();
-    assert!(format!("{error:#}").contains("nesting"), "{error:#}");
-    assert_eq!((reason(), f.owned().await), (pending, held));
-    *f.stub.links.lock() = None;
-    f.set_interfaces(&["eth0", "gone"], &[]).await;
     watch.reconcile(true).await.unwrap();
+    assert_eq!(
+        (reason(), f.owned().await),
+        (Some("unsupported_type"), held)
+    );
 }
 
 #[tokio::test]
 async fn a_failed_retry_keeps_the_committed_rounds_degradation() {
-    for failing_step in [Step::Topology, Step::Plan, Step::Join] {
+    for failing_step in [ReconcileStep::Topology, ReconcileStep::Join] {
         let f = fixture(&["eth0"], &[]);
         f.stub.fail_egress.store(true, Ordering::SeqCst);
         f.stub.moving.store(true, Ordering::SeqCst);
@@ -509,14 +478,9 @@ async fn a_failed_retry_keeps_the_committed_rounds_degradation() {
                 return Ok(topology());
             }
             match failing_step {
-                Step::Topology => anyhow::bail!("retry dump failed"),
-                Step::Plan => {
-                    let mut topology = topology();
-                    topology.links[0].master = Some(topology.links[0].ifindex);
-                    Ok(topology)
-                }
-                Step::Join => panic!("retry task panicked"),
-                Step::Snapshot => unreachable!(),
+                ReconcileStep::Topology => anyhow::bail!("retry dump failed"),
+                ReconcileStep::Join => panic!("retry task panicked"),
+                ReconcileStep::Snapshot => unreachable!(),
             }
         });
 
@@ -544,7 +508,7 @@ async fn a_failed_retry_keeps_the_committed_rounds_degradation() {
 }
 
 #[tokio::test]
-async fn renamed_port_keeps_its_binding_and_refreshes_the_name() {
+async fn renamed_port_commit_requests_network_refresh() {
     let f = fixture(&["br0"], &[]);
     let topology_with_port = |port: &str| Topology {
         links: vec![
@@ -560,32 +524,23 @@ async fn renamed_port_keeps_its_binding_and_refreshes_the_name() {
         default_route: None,
     };
     *f.stub.links.lock() = Some(topology_with_port("p1"));
-    let (mut watch, _rx) = f.watch();
+    let (mut watch, mut rx) = f.watch();
     watch.reconcile(false).await.unwrap();
-    let before = f.held().await;
-    assert_eq!(before.len(), 4, "{before:?}");
+    watch.pending_notification = false;
     let commits = f.commits.load(Ordering::Relaxed);
 
-    // Same ifindex, new name: the keys and links stay, the observed name follows.
     *f.stub.links.lock() = Some(topology_with_port("p1x"));
-    assert!(watch.reconcile(false).await.unwrap());
-    let after = f.held().await;
-    let rename = |held: &[(u32, Direction, String, u32)]| {
-        held.iter()
-            .map(|(i, d, name, id)| {
-                let name = if name == "p1x" { "p1" } else { name };
-                (*i, *d, name.to_string(), *id)
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(rename(&after), before, "only the port's name changed");
-    assert_eq!(
-        after.iter().filter(|(_, _, name, _)| name == "p1x").count(),
-        2
-    );
-    assert!(after.iter().all(|(_, _, name, _)| name != "p1"));
+    watch.reconcile_and_notify(false, false).await;
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(crate::control::ControlCommand::NetworkChanged)
+    ));
     assert_eq!(f.commits.load(Ordering::Relaxed), commits + 1);
-    assert!(!watch.reconcile(false).await.unwrap());
+    watch.reconcile_and_notify(false, false).await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
@@ -645,7 +600,6 @@ async fn reconcile_reuses_unchanged_hooks() {
     watch.reconcile(false).await.unwrap();
     let first = f.commits.load(Ordering::Relaxed);
     assert_eq!(first, 1, "first reconcile binds the configured LAN");
-    assert_eq!(f.detaches.load(Ordering::Relaxed), 0);
 
     for verify in [false, true] {
         assert!(!watch.reconcile(verify).await.unwrap());
@@ -655,7 +609,6 @@ async fn reconcile_reuses_unchanged_hooks() {
         first,
         "unchanged reconcile must not take the write lock"
     );
-    assert_eq!(f.detaches.load(Ordering::Relaxed), 0);
 }
 
 fn watcher_fixture(

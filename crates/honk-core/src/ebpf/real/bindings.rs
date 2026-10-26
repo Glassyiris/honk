@@ -99,8 +99,6 @@ impl InterfaceBindings {
         })
     }
 
-    /// Returns the replaced and removed link FDs; the caller closes them
-    /// outside any lock because the last close takes the rtnl lock.
     pub(super) fn commit(&mut self, commit: BindingCommit) -> Vec<OwnedFd> {
         commit.apply_to(&mut self.owned)
     }
@@ -139,20 +137,16 @@ enum Step<'a> {
     Rename(&'a Binding),
 }
 
-fn key_of(binding: &Binding) -> Key {
-    (binding.ifindex, binding.direction)
-}
-
 /// The whole diff between what is held and what the plan wants, by
 /// `(ifindex, direction)`. Unchanged keys cost nothing unless `verify`.
 fn diff<'a>(held: &[Held], wanted: &'a [Binding], verify: bool) -> Vec<Step<'a>> {
     let mut steps: Vec<Step> = held
         .iter()
-        .filter(|h| !wanted.iter().any(|b| key_of(b) == h.key))
+        .filter(|h| !wanted.iter().any(|b| b.key() == h.key))
         .map(|h| Step::Remove(h.key))
         .collect();
     for binding in wanted {
-        let Some(h) = held.iter().find(|h| h.key == key_of(binding)) else {
+        let Some(h) = held.iter().find(|h| h.key == binding.key()) else {
             steps.push(Step::Create(binding));
             continue;
         };
@@ -193,7 +187,7 @@ pub(crate) fn apply(
     let held: Vec<Held> = owned
         .iter()
         .map(|(binding, link_id, _)| Held {
-            key: key_of(binding),
+            key: binding.key(),
             program: binding.program,
             link_id: *link_id,
             interface: binding.interface.clone(),
@@ -201,7 +195,7 @@ pub(crate) fn apply(
         .collect();
     let links: HashMap<Key, OwnedFd> = owned
         .into_iter()
-        .map(|(binding, _, fd)| (key_of(&binding), fd))
+        .map(|(binding, _, fd)| (binding.key(), fd))
         .collect();
 
     let mut report = ApplyReport::default();
@@ -249,8 +243,8 @@ pub(crate) fn apply(
                 confirmation => {
                     // Drop the new FD and forget any dead owner it would have
                     // replaced. Other healthy keys are untouched.
-                    if links.contains_key(&key_of(&binding)) {
-                        report.commit.remove.push(key_of(&binding));
+                    if links.contains_key(&binding.key()) {
+                        report.commit.remove.push(binding.key());
                     }
                     match confirmation {
                         Ok(false) => report.topology_changed = true,
@@ -344,7 +338,7 @@ fn replace_dead(
     report: &mut ApplyReport,
 ) {
     if !create_into(programs, binding, created, report) {
-        report.commit.remove.push(key_of(binding));
+        report.commit.remove.push(binding.key());
     }
 }
 
@@ -372,7 +366,7 @@ fn update(
     let new = program_fd(programs, to.program)?;
     let old = program_fd(programs, from)?;
     let link = links
-        .get(&key_of(to))
+        .get(&to.key())
         .ok_or_else(|| anyhow::anyhow!("owned link is missing from the snapshot"))?;
     link_update(link.as_raw_fd(), new.as_raw_fd(), old.as_raw_fd()).with_context(|| {
         format!(

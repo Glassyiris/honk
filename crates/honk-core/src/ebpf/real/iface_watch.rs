@@ -5,7 +5,7 @@
 //! owner (`bindings`). Every step that can wait on rtnl (link dump, TCX
 //! create/update/query, closing a link FD, sysctl) runs on a blocking thread
 //! with no backend lock held; the backend lock is taken only to snapshot
-//! (read) and to commit (write, O(1) transfers). Without a usable event
+//! (read) and to commit (write). Without a usable event
 //! subscription the same loop runs on the ticker alone.
 
 use nix::errno::Errno;
@@ -22,11 +22,11 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::interface_startup::InterfaceHandoff;
+use super::interface_state::{self, InterfaceState, SysctlWrite};
 use crate::ebpf::EbpfBackend;
-use crate::ebpf::interface::status::{
-    self, BindFailure, InterfaceState, Step, StepError, SysctlWrite,
-};
+use crate::ebpf::interface::status::{BindFailure, ReconcileStep};
 use crate::ebpf::interface::{self, ApplyReport, BindingSnapshot, InterfacePlan, Topology};
+use crate::netlink::{RTM_DELLINK, RTM_NEWLINK};
 
 // A captive-portal login may add only a default route to an already-up link.
 const RTMGRP_LINK_MASK: u32 = 1;
@@ -39,8 +39,6 @@ const RTMGRP_NETWORK_MASK: u32 = RTMGRP_LINK_MASK
     | RTMGRP_IPV4_ROUTE
     | RTMGRP_IPV6_IFADDR
     | RTMGRP_IPV6_ROUTE;
-const RTM_NEWLINK: u16 = 16;
-const RTM_DELLINK: u16 = 17;
 // Events are a wakeup hint only — reconcile re-reads ground truth — but a
 // dropped datagram would stall a pending interface forever, so a slow ticker
 // backstops the subscription (and is the only trigger without one).
@@ -68,7 +66,7 @@ impl Default for Reconciler {
         Self {
             read_topology: Arc::new(interface::read_topology),
             apply: Arc::new(super::bindings::apply),
-            sysctl: Arc::new(status::write_sysctl),
+            sysctl: Arc::new(interface_state::write_sysctl),
             interval: RECONCILE_INTERVAL,
         }
     }
@@ -124,7 +122,7 @@ impl IfaceWatcher {
     }
 }
 
-fn watcher_disabled(reason: &'static str) -> crate::degradations::Issue {
+fn watcher_ticker_only(reason: &'static str) -> crate::degradations::Issue {
     crate::degradations::Issue {
         code: "interface_watcher_disabled",
         message: "The interface watcher reconciles every 60 seconds without event notifications.",
@@ -145,7 +143,7 @@ pub(super) fn subscribe(degradations: &crate::degradations::Degradations) -> Opt
             );
             degradations.set(
                 crate::degradations::Component::IfaceWatch,
-                watcher_disabled("subscribe_failed"),
+                watcher_ticker_only("subscribe_failed"),
             );
             None
         }
@@ -168,11 +166,8 @@ fn subscribe_network_events() -> std::io::Result<OwnedFd> {
 /// What one bounded drain of the subscription saw.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Drained {
-    /// The socket ran dry (as opposed to hitting the 64-message bound).
     empty: bool,
-    /// A link was added, changed or removed: retained links need re-proving.
     link_event: bool,
-    /// The kernel dropped events: anything may have changed.
     overrun: bool,
 }
 
@@ -246,7 +241,7 @@ async fn run(
                 );
                 degradations.set(
                     crate::degradations::Component::IfaceWatch,
-                    watcher_disabled("poll_setup_failed"),
+                    watcher_ticker_only("poll_setup_failed"),
                 );
                 None
             }
@@ -280,7 +275,7 @@ async fn run(
             }
             // The second write of a late device's sysctls, after its udev run;
             // without this a quiet host would wait for the ticker.
-            _ = sysctl_due(watch.state.sysctl.due()) => {
+            _ = sysctl_due(watch.state.sysctl_due()) => {
                 watch.reconcile_and_notify(false, false).await;
             }
             guard = readable(async_fd.as_ref(), netlink_retry_at) => {
@@ -367,10 +362,6 @@ pub(super) struct Watch {
     reconciler: Reconciler,
     degradations: Arc<crate::degradations::Degradations>,
     state: InterfaceState,
-    /// Held bindings whose last verification failed; reported again until a
-    /// verifying pass proves them (or they are replaced).
-    unproven: Vec<BindFailure>,
-    last_verify: Option<Instant>,
     pending_notification: bool,
 }
 
@@ -390,8 +381,6 @@ impl Watch {
             reconciler,
             degradations,
             state,
-            unproven: Vec::new(),
-            last_verify: None,
             pending_notification: true,
         }
     }
@@ -419,7 +408,7 @@ impl Watch {
     }
 
     /// A stage failed as a whole: log its episode and keep what is bound.
-    fn step_failed(&mut self, step: Step, error: anyhow::Error) -> anyhow::Error {
+    fn step_failed(&mut self, step: ReconcileStep, error: anyhow::Error) -> anyhow::Error {
         self.state.step_failed(step, &error);
         error
     }
@@ -435,6 +424,7 @@ impl Watch {
                 config.global.wan_interface.clone(),
             )
         };
+
         let mut changed = false;
         let mut last = None;
         // A device that changed under the apply is retried once; the ticker
@@ -443,49 +433,52 @@ impl Watch {
             let read = Arc::clone(&self.reconciler.read_topology);
             let (lan, wan) = (lan.clone(), wan.clone());
             let planned = tokio::task::spawn_blocking(move || {
-                interface::read_and_plan_with(|any_auto| read(any_auto), &lan, &wan)
+                let topology = read(interface::any_auto(&lan, &wan))?;
+                let plan = interface::plan(&lan, &wan, &topology);
+                Ok::<_, anyhow::Error>((topology, plan))
             })
             .await;
             let (topology, plan) = match planned {
                 Ok(Ok(planned)) => planned,
-                Ok(Err(StepError { step, error })) => return Err(self.step_failed(step, error)),
-                Err(error) => return Err(self.step_failed(Step::Join, error.into())),
+                Ok(Err(error)) => return Err(self.step_failed(ReconcileStep::Topology, error)),
+                Err(error) => return Err(self.step_failed(ReconcileStep::Join, error.into())),
             };
 
             // On sight: the device is in the dump, whether or not it binds.
-            let owed = self.state.sysctl.claim(&plan, &topology, Instant::now());
+            let owed = self.state.claim_sysctls(&plan, &topology, Instant::now());
             if !owed.is_empty() {
                 let write = Arc::clone(&self.reconciler.sysctl);
                 if let Err(error) =
-                    tokio::task::spawn_blocking(move || status::perform(&owed, &*write)).await
+                    tokio::task::spawn_blocking(move || interface_state::perform(&owed, &*write))
+                        .await
                 {
-                    return Err(self.step_failed(Step::Join, error.into()));
+                    return Err(self.step_failed(ReconcileStep::Join, error.into()));
                 }
             }
 
             let snapshot = self.ebpf.read().await.interface_binding_snapshot();
             let snapshot = match snapshot {
-                Ok(Some(snapshot)) => snapshot,
-                Ok(None) => return Ok(false),
-                Err(error) => return Err(self.step_failed(Step::Snapshot, error)),
+                Ok(snapshot) => snapshot,
+                Err(error) => return Err(self.step_failed(ReconcileStep::Snapshot, error)),
             };
             let held: Vec<_> = snapshot
                 .owned
                 .iter()
-                .map(|(binding, ..)| (binding.ifindex, binding.direction))
+                .map(|(binding, ..)| binding.key())
                 .collect();
 
             let now = Instant::now();
             // A binding that failed its proof is looked at again, but no more
             // often than the ticker, so one stuck binding does not turn every
             // route event into a TCX query per binding.
-            let retry_due = !self.unproven.is_empty()
+            let retry_due = !self.state.unproven.is_empty()
                 && self
+                    .state
                     .last_verify
                     .is_none_or(|at| now.duration_since(at) >= self.reconciler.interval);
             let verify = verify || retry_due || round != 0;
             if verify {
-                self.last_verify = Some(now);
+                self.state.last_verify = Some(now);
             }
             let apply = Arc::clone(&self.reconciler.apply);
             let applied = tokio::task::spawn_blocking(move || {
@@ -495,22 +488,17 @@ impl Watch {
             .await;
             let (report, plan) = match applied {
                 Ok(applied) => applied,
-                Err(error) => return Err(self.step_failed(Step::Join, error.into())),
+                Err(error) => return Err(self.step_failed(ReconcileStep::Join, error.into())),
             };
             let ApplyReport {
                 commit,
                 failed,
                 topology_changed,
             } = report;
-            let removed: Vec<_> = commit.remove.clone();
-            let added: Vec<_> = commit
+            let touched: Vec<_> = commit
                 .add
                 .iter()
-                .map(|(binding, ..)| (binding.ifindex, binding.direction))
-                .collect();
-            let touched: Vec<_> = added
-                .iter()
-                .copied()
+                .map(|(binding, ..)| binding.key())
                 .chain(
                     commit
                         .reprogram
@@ -518,14 +506,14 @@ impl Watch {
                         .map(|(ifindex, direction, _)| (*ifindex, *direction)),
                 )
                 .collect();
-            let owned = status::owned_after(&held, &removed, &added);
+            let owned = commit.keys_after(&held);
             if !commit.is_empty() {
                 changed = true;
                 log_commit(&commit);
                 let closed = self.ebpf.write().await.commit_interface_bindings(commit);
                 // The last close of a link takes the rtnl lock.
                 if let Err(error) = tokio::task::spawn_blocking(move || drop(closed)).await {
-                    return Err(self.step_failed(Step::Join, error.into()));
+                    return Err(self.step_failed(ReconcileStep::Join, error.into()));
                 }
             }
             let mut failures: Vec<BindFailure> = failed
@@ -535,6 +523,7 @@ impl Watch {
             if !verify {
                 // Not looked at this pass: still as unproven as before.
                 let carried: Vec<_> = self
+                    .state
                     .unproven
                     .iter()
                     .filter(|old| {
@@ -548,7 +537,7 @@ impl Watch {
             }
             self.state
                 .settle(&plan, &owned, &failures, &self.degradations);
-            self.unproven = failures
+            self.state.unproven = failures
                 .iter()
                 .filter(|failure| owned.contains(&failure.key))
                 .cloned()

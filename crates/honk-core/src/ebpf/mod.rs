@@ -12,6 +12,8 @@ pub use retirement::*;
 pub mod real;
 #[cfg(feature = "ebpf")]
 pub use real::TcpKernelPin;
+#[cfg(all(test, feature = "ebpf"))]
+pub(crate) mod test_support;
 
 /// Resume state for a bounded traversal of one tuple map. A completed traversal
 /// resets it, so the next scan starts a new pass. Batch cursors name buckets,
@@ -565,21 +567,17 @@ pub trait EbpfBackend: Send + Sync {
     async fn cleanup(&mut self) -> anyhow::Result<()>;
 
     /// Snapshot what this backend owns for the interface reconciler: program
-    /// FDs plus dup'd link FDs. `None` means the backend has no TCX hooks.
+    /// FDs plus dup'd link FDs.
     #[cfg(feature = "ebpf")]
-    fn interface_binding_snapshot(&self) -> anyhow::Result<Option<interface::BindingSnapshot>> {
-        Ok(None)
-    }
+    fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
 
-    /// Transfer the reconciled bindings in. O(1)-ish; the returned FDs
-    /// (replaced or removed links) are closed by the caller outside any lock.
+    /// Apply the commit and return replaced or removed link FDs. The caller
+    /// must close them outside any lock: the last close takes the rtnl lock.
     #[cfg(feature = "ebpf")]
     fn commit_interface_bindings(
         &mut self,
-        _commit: interface::BindingCommit,
-    ) -> Vec<std::os::fd::OwnedFd> {
-        Vec::new()
-    }
+        commit: interface::BindingCommit,
+    ) -> Vec<std::os::fd::OwnedFd>;
 
     /// Atomically publish a complete compiled routing plan into an inactive slot.
     /// Implementations stage every generation-owned fact map and program before

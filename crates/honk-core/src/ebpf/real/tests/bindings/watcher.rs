@@ -4,8 +4,8 @@
 //! kernel (TCX chains, link info, `/proc/sys`), not the owner's records.
 
 use super::*;
-use crate::ebpf::interface::status::InterfaceState;
 use crate::ebpf::real::iface_watch::{Reconciler, Watch};
+use crate::ebpf::real::interface_state::InterfaceState;
 use crate::netlink::{FAM_V4, PROTO_STATIC, ROUTE_UNICAST, SCOPE_LINK};
 use std::sync::Arc;
 use tokio::sync::mpsc;

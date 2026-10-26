@@ -53,9 +53,9 @@ const NLM_F_DUMP: u16 = 0x300;
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 
-const RTM_NEWLINK: u16 = 16;
+pub(crate) const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
-const RTM_DELLINK: u16 = 17;
+pub(crate) const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_NEWROUTE: u16 = 24;

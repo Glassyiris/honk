@@ -40,9 +40,9 @@ flowchart LR
 
 ### 接口挂钩集合
 
-接口的 `(ifi_type, ifi_flags)` 决定 `Framing`（`_l2` 或 `_l3`；对应关系见[网卡语义](../reference/global.md#网卡语义)）。GRE 与 IP6GRE 仅在点对点时使用 `_l3`，因为组播 remote 或缺少 remote 会使设备带 `header_ops`，TC 处出现隧道头。`vrf` 根接口被拒绝，因为成员的 TC ingress 先于 `l3mdev` 接收，VRF 自身看不到入站流量。bond 或 team master 报告其当前第一个端口的类型，帧格式随之变化；类型变化会在下一次协调中产生不同的计划。所有程序变体随 BPF 对象一并预加载，且早于 BPF logger 启动，因此运行期协调只创建 TCX link，从不加载程序。
+每个接口的[帧格式分类](../reference/global.md#网卡语义)选择 `_l2` 或 `_l3`；所有变体都早于 BPF logger 预加载，因此运行期协调只创建 TCX link，从不加载程序。
 
-每个配置的名称先解析为规范根接口：bond 或 bridge 的成员解析为其 master；本身是 bridge 端口的 bond 解析为该 bridge；其他 master 的成员也解析为该 master，但 `vrf` 与 `openvswitch` 的成员保持自身。各根接口独立规划。只出现在 `lan_interface` 的根为 LAN，只出现在 `wan_interface` 的为 WAN，两者都出现的为 LAN/WAN 共用：
+每个配置的名称先解析为规范根接口：bond 或 bridge 的成员解析为其 master；本身是 bridge 端口的 bond 解析为该 bridge；其他 master 的成员也解析为该 master，但 `vrf` 与 `openvswitch` 的成员保持自身。受支持的嵌套为一层 bond/bridge，外加作为 bridge 端口的 bond；其他任何 bond/bridge 嵌套，或自身即 master 的接口，仅将该配置项以 `unsupported_type` 拒绝。其他项仍在启动时绑定并正常协调。各根接口独立规划。只出现在 `lan_interface` 的根为 LAN，只出现在 `wan_interface` 的为 WAN，两者都出现的为 LAN/WAN 共用：
 
 | 根接口角色 | 挂钩 |
 | --- | --- |
@@ -64,11 +64,11 @@ Linux 6.12+ 上，honk 把接口挂钩创建为 FD 持有的 TCX BPF link，追�
 
 ### 接口协调
 
-唯一的 `InterfaceBindings` 持有者保存预加载的程序 FD，并为每个自有 `(ifindex, direction)` 保存一个由 FD 持有的 TCX link。启动时先打开 rtnetlink 订阅，再读取一次拓扑快照（被打断的 link dump 会重试，最多三次），推导计划，解析 `local_ip`，加载 BPF 对象，然后绑定。绑定从不导致启动失败：接口不存在、未解析的 `auto` 或被拒绝的类型不会绑定任何 hook，其流量 fail-open（不被拦截）。TCX 创建/更新/校验失败可能保留部分有效的 hook，因此 `attach_failed` 项在 watcher 重试期间仍可能拦截部分流量。启动仅在以下情况失败：无法读取拓扑（打断的 dump 之外的任何错误立即失败），存在 `auto` 项时无法读取默认路由，八个 TC 变体中任何一个无法预加载（即使它属于未使用的程序族），或内部 link（`dae0`/`dae0peer`、cgroup、`sk_lookup`）失败；为零的 `dae0`/`dae0peer` ifindex 或全零的 `dae0peer` MAC 同样视为失败。启动序列是一个与真实 eBPF VM 测试共用的函数。watcher 接管该订阅，不带种子启动，自行重新读取拓扑。
+唯一的 `InterfaceBindings` 持有者保存预加载的程序 FD，并为每个自有 `(ifindex, direction)` 保存一个由 FD 持有的 TCX link。启动时先打开 rtnetlink 订阅，再读取一次拓扑快照（被打断的 link dump 会重试，最多三次），推导计划，解析 `local_ip`，加载 BPF 对象，然后绑定。配置项的行为契约见[网卡语义](../reference/global.md#网卡语义)。启动仅在以下情况失败：无法读取拓扑（打断的 dump 之外的任何错误立即失败），存在 `auto` 项时无法读取默认路由，八个 TC 变体中任何一个无法预加载（即使它属于未使用的程序族），或内部 link（`dae0`/`dae0peer`、cgroup、`sk_lookup`）失败；为零的 `dae0`/`dae0peer` ifindex 或全零的 `dae0peer` MAC 同样视为失败。启动序列是一个与真实 eBPF VM 测试共用的函数，并在数据路径准入或 READY 前完成。
 
-接口存在即绑定，不要求 `IFF_UP`。只匹配内核的主名称，altname 视为不存在。出现的设备被绑定，消失的设备被释放，重建的设备（新 ifindex）重新绑定。`auto`（匹配规则见[网卡语义](../reference/global.md#网卡语义)）解析为当前默认路由接口，在没有 IPv4 默认路由时保持待定，绝不回退到 `lo`；仅当某项为 `auto` 时才读取 `/proc/net/route`，读取错误就是错误，而不是“没有默认路由”（启动时致命；之后属于 reconcile 失败，保持现有绑定）。
+仅当某项为 `auto` 时才读取 `/proc/thread-self/net/route`；读取错误并不表示“没有默认路由”（启动时致命；之后属于 reconcile 失败，保持现有绑定）。
 
-未完全绑定的项以 `interface_binding` 降级报告，使接口不存在、被拒绝或只部分挂载的情况可见而不导致启动失败；原因与优先级见 [API 参考](../reference/api.md#原生-api)。所有已配置项都绑定后自动清除，`lifecycle.state` 仍为 `running`。启动时计划错误（如不支持的嵌套）会记录警告，在没有任何已配置接口 hook 的状态下以 `pending` 启动，直到成功的计划确定各项的实际状态。Reconcile 层面的失败会保留最近一轮已完成的 apply/commit 结果所对应的绑定与降级。
+[API 参考](../reference/api.md#原生-api)定义 `interface_binding` 降级与原因优先级。Reconcile 层面的失败会保留最近一轮已完成的 apply/commit 结果所对应的绑定与降级。
 
 `IfaceWatcher` 接管启动时在拓扑 dump 之前打开的 rtnetlink 订阅；每 60 秒一次的 tick 作为事件交付的后备，无条件执行的首次 reconcile 覆盖启动期间的变化。若订阅或其 poll 注册失败，则仅由 tick 驱动 reconcile，并报告 `iface_watch` 降级。每一批都在 backend 锁之外运行：读取拓扑并规划，仅在读锁下复制自有 link 的快照，无锁应用计划（不在持锁时进行内核 I/O），再仅在写锁下转移 commit。计划不变且 link 健康时不提交任何内容；角色变化就地更新已有 link，而不是再叠加一个。
 

@@ -79,23 +79,16 @@ impl RealEbpfBackend {
             result.hooks = DatapathCheck::Absent;
         }
         let tracked = owned.len() + usize::from(self.dae0_ingress_link.is_some());
-        let mut queries = HookQueries::new();
         let dae0 = self
             .dae0_ingress_link
             .as_ref()
             .filter(|_| owned.len() < MAX_DATAPATH_ATTACHMENTS)
-            .map(|link| observe_dae0(link, &result.loaded_programs, &mut queries));
+            .map(|link| observe_dae0(link, &result.loaded_programs));
         let bound = owned
             .iter()
             .take(MAX_DATAPATH_ATTACHMENTS)
             .map(|(binding, link_id, fd)| {
-                observe_binding(
-                    binding,
-                    *link_id,
-                    fd.as_raw_fd(),
-                    &result.loaded_programs,
-                    &mut queries,
-                )
+                observe_binding(binding, *link_id, fd.as_raw_fd(), &result.loaded_programs)
             })
             .chain(dae0)
             .collect::<Vec<_>>();
@@ -131,7 +124,6 @@ fn observe_binding(
     link_id: u32,
     link: RawFd,
     programs: &[DatapathProgram],
-    queries: &mut HookQueries,
 ) -> anyhow::Result<DatapathAttachment> {
     let info = bindings::link_info(link)?;
     anyhow::ensure!(
@@ -144,7 +136,9 @@ fn observe_binding(
         .iter()
         .find(|program| program.id == info.program_id)
         .ok_or_else(|| anyhow::anyhow!("hook program is not owned"))?;
-    let verified = queried_link(queries, binding.ifindex.get(), binding.direction, link_id)?;
+    let verified = bindings::query_chain(binding.ifindex.get(), binding.direction)
+        .map_err(|error| anyhow::anyhow!("query TCX chain: {error}"))?
+        .contains_link(link_id);
     Ok(DatapathAttachment {
         program: program.name.clone(),
         interface: binding.interface.clone(),
@@ -162,7 +156,6 @@ fn observe_binding(
 fn observe_dae0(
     link: &aya::programs::tc::SchedClassifierLink,
     programs: &[DatapathProgram],
-    queries: &mut HookQueries,
 ) -> anyhow::Result<DatapathAttachment> {
     let ifindex = nix::net::if_::if_nametoindex("dae0")?;
     let fd: &FdLink = link.try_into()?;
@@ -171,7 +164,9 @@ fn observe_dae0(
         .iter()
         .find(|program| program.id == info.program_id())
         .ok_or_else(|| anyhow::anyhow!("hook program is not owned"))?;
-    let verified = queried_link(queries, ifindex, Direction::Ingress, info.id())?;
+    let verified = bindings::query_chain(ifindex, Direction::Ingress)
+        .map_err(|error| anyhow::anyhow!("query TCX chain: {error}"))?
+        .contains_link(info.id());
     Ok(DatapathAttachment {
         program: program.name.clone(),
         interface: "dae0".to_owned(),
@@ -182,21 +177,4 @@ fn observe_dae0(
             DatapathCheck::Absent
         },
     })
-}
-
-type HookQueries = std::collections::HashMap<(u32, Direction), std::io::Result<bindings::Chain>>;
-
-fn queried_link(
-    queries: &mut HookQueries,
-    ifindex: u32,
-    direction: Direction,
-    link_id: u32,
-) -> anyhow::Result<bool> {
-    let chain = queries
-        .entry((ifindex, direction))
-        .or_insert_with(|| bindings::query_chain(ifindex, direction));
-    match chain {
-        Ok(chain) => Ok(chain.contains_link(link_id)),
-        Err(error) => Err(anyhow::anyhow!("query TCX chain: {error}")),
-    }
 }

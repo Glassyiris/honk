@@ -410,11 +410,7 @@ async fn assert_hooks(
     device: &str,
     expected: [TcProgram; 2],
 ) -> anyhow::Result<()> {
-    let snapshot = ebpf
-        .read()
-        .await
-        .interface_binding_snapshot()?
-        .context("real bindings")?;
+    let snapshot = ebpf.read().await.interface_binding_snapshot()?;
     let index = crate::netlink::ifindex_of(device)?;
     for (direction, program) in [Direction::Ingress, Direction::Egress]
         .into_iter()
@@ -497,7 +493,7 @@ async fn wait_until(
 ) -> anyhow::Result<()> {
     tokio::time::timeout(TIMEOUT, async {
         loop {
-            if done(&ebpf.read().await.interface_binding_snapshot()?.unwrap()) {
+            if done(&ebpf.read().await.interface_binding_snapshot()?) {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -512,7 +508,6 @@ async fn member_change(s: &Scenario, ebpf: &Backend) -> anyhow::Result<()> {
         .read()
         .await
         .interface_binding_snapshot()?
-        .unwrap()
         .owned
         .into_iter()
         .filter(|(binding, ..)| binding.interface == BOND)
@@ -539,7 +534,6 @@ async fn member_change(s: &Scenario, ebpf: &Backend) -> anyhow::Result<()> {
         .read()
         .await
         .interface_binding_snapshot()?
-        .unwrap()
         .owned
         .into_iter()
         .filter(|(binding, ..)| binding.interface == BOND)
@@ -679,7 +673,7 @@ async fn exercise(s: &Scenario, ebpf: &Backend, peer: &mut SharedUdpPeer) -> any
         assert_hooks(ebpf, BOND, programs).await?;
         no_member_hooks()?;
         if from_wan == 1 {
-            let snapshot = ebpf.read().await.interface_binding_snapshot()?.unwrap();
+            let snapshot = ebpf.read().await.interface_binding_snapshot()?;
             ensure!(
                 snapshot.owned.iter().all(|(binding, ..)| matches!(
                     binding.program,

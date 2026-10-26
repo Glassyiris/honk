@@ -83,7 +83,7 @@ pub(crate) fn enable_wan_accept_ra(ifname: &str) -> anyhow::Result<()> {
     set_device_sysctl("ipv6", ifname, "accept_ra", "2")
 }
 
-/// `rp_filter=0` for the first configured LAN interface.
+/// Disable reverse-path filtering on the first existing, non-refused resolved LAN name.
 #[cfg(feature = "ebpf")]
 pub(crate) fn disable_rp_filter(ifname: &str) -> anyhow::Result<()> {
     set_device_sysctl("ipv4", ifname, "rp_filter", "0")

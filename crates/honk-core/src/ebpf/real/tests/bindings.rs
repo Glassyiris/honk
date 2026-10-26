@@ -5,7 +5,7 @@
 //! kernel's own chain and link info rather than the owner's records.
 //!
 //! The private mount namespace deliberately keeps the parent's sysfs, so a
-//! veth created here is invisible to `/sys/class/net`: the #268 condition.
+//! veth created here is invisible to `/sys/class/net`.
 
 use super::super::bindings as owner;
 use super::*;
@@ -32,7 +32,7 @@ fn ip(args: &[&str]) {
 fn plan_for(lan: &[&str], wan: &[&str]) -> (InterfacePlan, Topology) {
     let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
     let topology = read_topology(false).unwrap();
-    let plan = plan_interfaces(&owned(lan), &owned(wan), &topology).unwrap();
+    let plan = plan_interfaces(&owned(lan), &owned(wan), &topology);
     (plan, topology)
 }
 
@@ -51,28 +51,12 @@ fn chain(ifindex: u32, direction: Direction) -> Vec<u32> {
         .links
 }
 
-fn is_erange(error: &anyhow::Error) -> bool {
+fn has_errno(error: &anyhow::Error, errno: i32) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<io::Error>()
-            .is_some_and(|io| io.raw_os_error() == Some(libc::ERANGE))
+            .is_some_and(|io| io.raw_os_error() == Some(errno))
     })
-}
-
-fn bpf_call(cmd: bpf_cmd, attr: &mut bpf_attr) -> io::Result<libc::c_long> {
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_bpf,
-            cmd as libc::c_long,
-            attr as *mut bpf_attr,
-            core::mem::size_of::<bpf_attr>(),
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result)
-    }
 }
 
 /// A TCX link nobody here owns: a fresh `r0 = 0; exit` classifier appended to a
@@ -89,15 +73,17 @@ fn foreign_link(ifindex: u32, direction: Direction) -> io::Result<Foreign> {
     load.__bindgen_anon_3.insn_cnt = 2;
     load.__bindgen_anon_3.insns = insns.as_ptr() as u64;
     load.__bindgen_anon_3.license = c"GPL".as_ptr() as u64;
-    let program =
-        unsafe { OwnedFd::from_raw_fd(bpf_call(bpf_cmd::BPF_PROG_LOAD, &mut load)? as i32) };
+    let program = unsafe { syscall::bpf_syscall(bpf_cmd::BPF_PROG_LOAD as _, &mut load) }
+        .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
+    let program = unsafe { OwnedFd::from_raw_fd(program as i32) };
     let mut create: bpf_attr = unsafe { core::mem::zeroed() };
     create.link_create.__bindgen_anon_1.prog_fd = program.as_raw_fd() as u32;
     create.link_create.__bindgen_anon_2.target_ifindex = ifindex;
     create.link_create.attach_type = attach_type(direction);
     create.link_create.flags = BPF_F_AFTER;
-    let link =
-        unsafe { OwnedFd::from_raw_fd(bpf_call(bpf_cmd::BPF_LINK_CREATE, &mut create)? as i32) };
+    let link = unsafe { syscall::bpf_syscall(bpf_cmd::BPF_LINK_CREATE as _, &mut create) }
+        .map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
+    let link = unsafe { OwnedFd::from_raw_fd(link as i32) };
     let id = owner::link_info(link.as_raw_fd())?.id;
     Ok(Foreign { id, _link: link })
 }
@@ -166,10 +152,7 @@ impl Lab {
     }
 
     fn snapshot(&self) -> BindingSnapshot {
-        self.backend
-            .interface_binding_snapshot()
-            .unwrap()
-            .expect("real backend owns TCX bindings")
+        self.backend.interface_binding_snapshot().unwrap()
     }
 
     /// `reconcile` with a caller-supplied (possibly stale or tampered) snapshot.
@@ -310,12 +293,7 @@ async fn kernel_held(
     ebpf: &RwLock<Box<dyn EbpfBackend>>,
     programs: &BTreeMap<TcProgram, u32>,
 ) -> Vec<Held> {
-    let snapshot = ebpf
-        .read()
-        .await
-        .interface_binding_snapshot()
-        .unwrap()
-        .expect("real backend owns TCX bindings");
+    let snapshot = ebpf.read().await.interface_binding_snapshot().unwrap();
     let held = held_of(snapshot);
     assert_truthful(&held, programs);
     held
@@ -656,7 +634,7 @@ fn full_chain_fails_one_direction_and_retry_does_not_stack() {
             assert_eq!(round.failed.len(), 1, "{label}: {round:?}");
             let (binding, error) = &round.failed[0];
             assert_eq!(binding.direction, Direction::Ingress, "{label}");
-            assert!(is_erange(error), "{label}: {error:#}");
+            assert!(has_errno(error, libc::ERANGE), "{label}: {error:#}");
             let owned = lab.owned();
             assert_eq!(
                 owned.keys().copied().collect::<Vec<_>>(),
@@ -726,19 +704,22 @@ fn observation_follows_add_replace_remove() {
         // reported as a verified hook.
         lab.netlink.del_link(ifindex).unwrap();
         let observation = lab.backend.observe_datapath();
-        let stale = seen(&lab);
+        let stale: Vec<_> = observation
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.interface == "hbo_a")
+            .collect();
         assert!(
             stale
                 .iter()
-                .all(|(_, _, state)| *state != DatapathCheck::Verified),
+                .all(|attachment| attachment.state != DatapathCheck::Verified),
             "deleted device still reported verified: {stale:?}"
         );
         assert!(
             observation
                 .errors
-                .contains(&DatapathObservationError::Hooks)
-                || !stale.is_empty(),
-            "a stale binding must surface as a hook error or a non-verified attachment"
+                .contains(&DatapathObservationError::Hooks),
+            "a stale binding must surface as a hook error: {observation:?}"
         );
 
         let round = lab.round(&[], &[]);
