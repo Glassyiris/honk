@@ -1,33 +1,12 @@
     use super::*;
-    use crate::ebpf::interface::plan;
     use crate::ebpf::interface::Topology;
-    use crate::netlink::LinkSnapshot;
+    use crate::ebpf::test_support::{LinkExt, link, planned};
 
-    fn link(ifindex: u32, name: &str) -> LinkSnapshot {
-        LinkSnapshot {
-            ifindex: NonZeroU32::new(ifindex).unwrap(),
-            name: name.into(),
-            arphrd: 1,
-            flags: 0,
-            master: None,
-            kind: None,
-            mac: None,
-        }
-    }
-
-    fn planned(lan: &[&str], wan: &[&str], links: Vec<LinkSnapshot>) -> InterfacePlan {
-        let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        let topology = Topology {
-            links,
-            default_route: None,
-        };
-        plan(&owned(lan), &owned(wan), &topology)
-    }
 
     fn keys(plan: &InterfacePlan) -> Vec<Key> {
         plan.bindings
             .iter()
-            .map(|b| (b.ifindex, b.direction))
+            .map(|b| b.key())
             .collect()
     }
 
@@ -76,11 +55,10 @@
         let plan = planned(
             &["eth0", "gone"],
             &["lo", "eth1"],
-            vec![
-                link(1, "lo").with_arphrd(772),
-                link(2, "eth0"),
-                link(3, "eth1"),
-            ],
+            &Topology {
+                links: vec![link(1, "lo").arphrd(772), link(2, "eth0"), link(3, "eth1")],
+                default_route: None,
+            },
         );
         let all = keys(&plan);
         let state = |plan: &InterfacePlan, owned: &[Key], failures: &[BindFailure]| {
@@ -125,7 +103,7 @@
         bridge.kind = Some("bridge".into());
         let mut port = link(11, "p1");
         port.master = NonZeroU32::new(10);
-        let plan = planned(&["br0"], &[], vec![bridge, port]);
+        let plan = planned(&["br0"], &[], &Topology { links: vec![bridge, port], default_route: None });
         assert_eq!(plan.bound[0].1.len(), 2);
         let port_ingress = (NonZeroU32::new(11).unwrap(), Direction::Ingress);
         let owned: Vec<Key> = keys(&plan)
@@ -191,13 +169,4 @@
         assert_eq!(steps.recovered(), Some(ReconcileStep::Topology));
         assert_eq!(steps.recovered(), None);
         assert_eq!(steps.failed(ReconcileStep::Topology), StepTransition::Begins);
-    }
-    trait WithArphrd {
-        fn with_arphrd(self, arphrd: u16) -> Self;
-    }
-    impl WithArphrd for LinkSnapshot {
-        fn with_arphrd(mut self, arphrd: u16) -> Self {
-            self.arphrd = arphrd;
-            self
-        }
     }

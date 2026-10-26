@@ -12,6 +12,8 @@ pub use retirement::*;
 pub mod real;
 #[cfg(feature = "ebpf")]
 pub use real::TcpKernelPin;
+#[cfg(all(test, feature = "ebpf"))]
+pub(crate) mod test_support;
 
 /// Resume state for a bounded traversal of one tuple map. A completed traversal
 /// resets it, so the next scan starts a new pass. Batch cursors name buckets,

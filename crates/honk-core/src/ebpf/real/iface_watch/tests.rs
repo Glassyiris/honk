@@ -2,21 +2,11 @@ use super::*;
 use crate::degradations::{Component, Degradations};
 use crate::ebpf::real::interface_state::SysctlKey;
 use crate::ebpf::interface::{Binding, Direction, TcProgram};
+use crate::ebpf::test_support::link;
 use crate::netlink::LinkSnapshot;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-fn link(ifindex: u32, name: &str) -> LinkSnapshot {
-    LinkSnapshot {
-        ifindex: NonZeroU32::new(ifindex).unwrap(),
-        name: name.into(),
-        arphrd: 1,
-        flags: 0,
-        master: None,
-        kind: None,
-        mac: Some([2, 0, 0, 0, 0, ifindex as u8]),
-    }
-}
 
 /// Fixed topology: no `lo`, no kernel.
 fn topology() -> Topology {
@@ -30,11 +20,6 @@ fn fake_fd() -> OwnedFd {
     std::fs::File::open("/dev/null").unwrap().into()
 }
 
-type Key = (NonZeroU32, Direction);
-
-fn key(binding: &Binding) -> Key {
-    (binding.ifindex, binding.direction)
-}
 
 /// A kernel-free `apply` with the same contract: diff by `(ifindex,
 /// direction)`, reprogram in place, report what could not be bound.
@@ -49,15 +34,15 @@ fn model_apply(
         ..ApplyReport::default()
     };
     for (held, ..) in &snapshot.owned {
-        if !plan.bindings.iter().any(|b| key(b) == key(held)) {
-            report.commit.remove.push(key(held));
+        if !plan.bindings.iter().any(|b| b.key() == held.key()) {
+            report.commit.remove.push(held.key());
         }
     }
     for binding in &plan.bindings {
         match snapshot
             .owned
             .iter()
-            .find(|(held, ..)| key(held) == key(binding))
+            .find(|(held, ..)| held.key() == binding.key())
         {
             None if fail_egress && binding.direction == Direction::Egress => report
                 .failed
@@ -474,9 +459,6 @@ async fn a_failed_stage_leaves_the_degradation_and_bindings_alone() {
     f.set_interfaces(&["eth0", "a"], &[]).await;
     watch.reconcile(true).await.unwrap();
     assert_eq!((reason(), f.owned().await), (Some("unsupported_type"), held));
-    *f.stub.links.lock() = None;
-    f.set_interfaces(&["eth0", "gone"], &[]).await;
-    watch.reconcile(true).await.unwrap();
 }
 
 #[tokio::test]

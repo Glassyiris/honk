@@ -1,18 +1,6 @@
 use super::*;
-use crate::ebpf::interface::plan;
-use crate::netlink::LinkSnapshot;
+use crate::ebpf::test_support::{LinkExt, link, planned};
 
-fn link(ifindex: u32, name: &str) -> LinkSnapshot {
-    LinkSnapshot {
-        ifindex: NonZeroU32::new(ifindex).unwrap(),
-        name: name.into(),
-        arphrd: 1,
-        flags: 0,
-        master: None,
-        kind: None,
-        mac: None,
-    }
-}
 
     fn write_names(owed: &[SysctlWrite]) -> Vec<(SysctlKey, &str, bool)> {
         owed.iter()
@@ -30,7 +18,7 @@ fn link(ifindex: u32, name: &str) -> LinkSnapshot {
             links: links(),
             default_route: None,
         };
-        let plan = plan_of(&["br0", "eth1"], &["wan.100"], &topology);
+        let plan = planned(&["br0", "eth1"], &["wan.100"], &topology);
         assert_eq!(
             write_names(&tracker.claim(&plan, &topology, t0)),
             [
@@ -59,7 +47,7 @@ fn link(ifindex: u32, name: &str) -> LinkSnapshot {
             links: recreated,
             default_route: None,
         };
-        let plan = plan_of(&["br0", "eth1"], &["wan.100"], &topology);
+        let plan = planned(&["br0", "eth1"], &["wan.100"], &topology);
         let owed = tracker.claim(&plan, &topology, after(61_000));
         assert_eq!(
             write_names(&owed),
@@ -72,14 +60,14 @@ fn link(ifindex: u32, name: &str) -> LinkSnapshot {
             links: vec![link(9, "wan.100"), link(4, "eth1")],
             default_route: None,
         };
-        let plan = plan_of(&["br0", "eth1"], &["wan.100"], &topology);
+        let plan = planned(&["br0", "eth1"], &["wan.100"], &topology);
         assert_eq!(
             write_names(&tracker.claim(&plan, &topology, after(61_500))),
             [(SysctlKey::RpFilter, "eth1", false)]
         );
         // Everything gone: the tracker forgets it, so a return is written again.
         let topology = Topology::default();
-        let plan = plan_of(&["br0"], &["wan.100"], &topology);
+        let plan = planned(&["br0"], &["wan.100"], &topology);
         assert!(tracker.claim(&plan, &topology, after(62_000)).is_empty());
         assert!(tracker.attempted.is_empty());
         assert_eq!(tracker.due(), None);
@@ -93,12 +81,12 @@ fn link(ifindex: u32, name: &str) -> LinkSnapshot {
             default_route: Some("wan0".into()),
         };
         let mut tracker = SysctlTracker::default();
-        let plan = plan_of(&["br0", "eth1"], &["auto"], &topology);
+        let plan = planned(&["br0", "eth1"], &["auto"], &topology);
         assert_eq!(tracker.claim(&plan, &topology, t0).len(), 2);
 
         topology.links.push(link(5, "br0"));
         topology.default_route = Some("wan1".into());
-        let plan = plan_of(&["br0", "eth1"], &["auto"], &topology);
+        let plan = planned(&["br0", "eth1"], &["auto"], &topology);
         let moved = t0 + std::time::Duration::from_millis(500);
         assert_eq!(
             write_names(&tracker.claim(&plan, &topology, moved)),
@@ -115,11 +103,11 @@ fn link(ifindex: u32, name: &str) -> LinkSnapshot {
     #[test]
     fn rp_filter_skips_refused_lan_entries_including_auto() {
         let topology = Topology {
-            links: vec![link(1, "lo").with_arphrd(libc::ARPHRD_LOOPBACK), link(2, "eth1")],
+            links: vec![link(1, "lo").arphrd(libc::ARPHRD_LOOPBACK), link(2, "eth1")],
             default_route: Some("lo".into()),
         };
         for first in ["lo", "auto"] {
-            let plan = plan_of(&[first, "eth1"], &[], &topology);
+            let plan = planned(&[first, "eth1"], &[], &topology);
             let mut tracker = SysctlTracker::default();
             assert_eq!(
                 write_names(&tracker.claim(&plan, &topology, tokio::time::Instant::now())),
@@ -129,10 +117,6 @@ fn link(ifindex: u32, name: &str) -> LinkSnapshot {
         }
     }
 
-    fn plan_of(lan: &[&str], wan: &[&str], topology: &Topology) -> InterfacePlan {
-        let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        plan(&owned(lan), &owned(wan), topology)
-    }
 
     #[test]
     fn a_wan_that_is_also_lan_gets_accept_ra_once() {
@@ -140,7 +124,7 @@ fn link(ifindex: u32, name: &str) -> LinkSnapshot {
             links: vec![link(2, "eth0")],
             default_route: None,
         };
-        let plan = plan_of(&["eth0"], &["eth0"], &topology);
+        let plan = planned(&["eth0"], &["eth0"], &topology);
         let mut tracker = SysctlTracker::default();
         assert_eq!(
             write_names(&tracker.claim(&plan, &topology, tokio::time::Instant::now())),
@@ -149,13 +133,4 @@ fn link(ifindex: u32, name: &str) -> LinkSnapshot {
                 (SysctlKey::RpFilter, "eth0", false)
             ]
         );
-    }
-    trait WithArphrd {
-        fn with_arphrd(self, arphrd: u16) -> Self;
-    }
-    impl WithArphrd for LinkSnapshot {
-        fn with_arphrd(mut self, arphrd: u16) -> Self {
-            self.arphrd = arphrd;
-            self
-        }
     }

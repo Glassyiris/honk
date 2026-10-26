@@ -1,42 +1,9 @@
 use super::*;
+use crate::ebpf::test_support::{LinkExt, link, planned};
 
-const ETHER: u16 = 1;
 const NONE: u16 = 0xfffe;
 const PPP: u16 = 512;
 
-fn link(ifindex: u32, name: &str) -> LinkSnapshot {
-    LinkSnapshot {
-        ifindex: NonZeroU32::new(ifindex).unwrap(),
-        name: name.into(),
-        arphrd: ETHER,
-        flags: 0,
-        master: None,
-        kind: None,
-        mac: Some([2, 0, 0, 0, 0, ifindex as u8]),
-    }
-}
-
-trait LinkExt {
-    fn arphrd(self, arphrd: u16) -> Self;
-    fn master(self, master: u32) -> Self;
-    fn kind(self, kind: &str) -> Self;
-}
-
-impl LinkExt for LinkSnapshot {
-    fn arphrd(mut self, arphrd: u16) -> Self {
-        self.arphrd = arphrd;
-        self.mac = None;
-        self
-    }
-    fn master(mut self, master: u32) -> Self {
-        self.master = NonZeroU32::new(master);
-        self
-    }
-    fn kind(mut self, kind: &str) -> Self {
-        self.kind = Some(kind.into());
-        self
-    }
-}
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| value.to_string()).collect()
@@ -83,7 +50,7 @@ fn topology(groups: &[Vec<LinkSnapshot>]) -> Topology {
 }
 
 fn run(lan: &[&str], wan: &[&str], groups: &[Vec<LinkSnapshot>]) -> InterfacePlan {
-    plan(&strings(lan), &strings(wan), &topology(groups))
+    planned(lan, wan, &topology(groups))
 }
 
 /// `"<ifindex> in|eg <program>"`, in plan order.
@@ -406,14 +373,11 @@ fn resolved_auto_follows_default_route_and_dedups() {
 
     // Resolved to a link that is gone: reported under the entry as written.
     topo.default_route = Some("gone0".into());
-    let plan = plan_for(&["auto"], &[], &topo);
+    let plan = planned(&["auto"], &[], &topo);
     assert_eq!(plan.lan, ["gone0"]);
     assert_eq!(plan.unbound, [("auto".to_string(), UnboundReason::Absent)]);
 }
 
-fn plan_for(lan: &[&str], wan: &[&str], topology: &Topology) -> InterfacePlan {
-    plan(&strings(lan), &strings(wan), topology)
-}
 
 #[test]
 fn absent_names_are_unbound_and_not_bound_entries() {
@@ -517,13 +481,13 @@ fn bond_or_bridge_under_other_master_stays_the_root() {
 fn local_ip_interface_is_the_canonical_root_the_binding_uses() {
     let topo = topology(&[base(), bridge()]);
     // A port binds its bridge: the address is the bridge's.
-    let plan = plan_for(&["nope", "p1"], &["ens3"], &topo);
+    let plan = planned(&["nope", "p1"], &["ens3"], &topo);
     assert_eq!(local_ip_interface(&plan), Some("br0"));
 
-    let plan = plan_for(&[], &["eth1", "ens3"], &topo);
+    let plan = planned(&[], &["eth1", "ens3"], &topo);
     assert_eq!(local_ip_interface(&plan), Some("eth1"));
 
-    let plan = plan_for(&["nope"], &["ens3"], &topo);
+    let plan = planned(&["nope"], &["ens3"], &topo);
     assert_eq!(local_ip_interface(&plan), Some("ens3"));
 
     // A vrf member binds itself, so its own address is used, not the vrf's.
@@ -531,21 +495,21 @@ fn local_ip_interface_is_the_canonical_root_the_binding_uses() {
         link(30, "vrf0").kind("vrf"),
         link(31, "eth2").master(30),
     ]]);
-    let plan = plan_for(&["eth2"], &[], &vrf);
+    let plan = planned(&["eth2"], &[], &vrf);
     assert_eq!(local_ip_interface(&plan), Some("eth2"));
 
     // A bond that is a bridge port resolves to the bridge, member or not.
     let nested = topology(&[bond_in_bridge()]);
     for lan in ["m1", "bond0", "p1"] {
-        let plan = plan_for(&[lan], &[], &nested);
+        let plan = planned(&[lan], &[], &nested);
         assert_eq!(local_ip_interface(&plan), Some("br0"), "{lan}");
     }
 
     // Unresolved auto and nothing configured: none.
-    let plan = plan_for(&["auto"], &[], &topo);
+    let plan = planned(&["auto"], &[], &topo);
     assert_eq!(local_ip_interface(&plan), None);
     assert_eq!(local_ip(&plan), 0);
-    let plan = plan_for(&[], &[], &topo);
+    let plan = planned(&[], &[], &topo);
     assert_eq!(local_ip_interface(&plan), None);
 }
 
@@ -600,12 +564,6 @@ const IP6GRE: u16 = 823;
 const P2P: u32 = libc::IFF_POINTOPOINT as u32;
 const BROADCAST: u32 = libc::IFF_BROADCAST as u32;
 
-impl LinkSnapshot {
-    fn flags(mut self, flags: u32) -> Self {
-        self.flags = flags;
-        self
-    }
-}
 
 #[test]
 fn framing_table() {
@@ -714,7 +672,7 @@ fn honk_owned_links_are_refused_even_when_absent() {
 }
 
 #[test]
-fn bond_root_takes_its_type_from_the_first_port() {
+fn non_ethernet_bond_root_is_refused() {
     // An INFINIBAND bond is refused as a root; its members are never bound.
     let links = vec![
         link(20, "bond0").kind("bond").arphrd(32),
@@ -747,13 +705,13 @@ fn local_ip_interface_never_names_a_refused_root() {
     let vrf = vec![link(30, "vrf0").kind("vrf"), link(31, "m1").master(30)];
     let topo = topology(&[base(), vrf]);
     // `lo`, a vrf root and `dae0` are refused: the first bindable root wins.
-    let plan = plan_for(&["lo", "vrf0", "dae0", "ens3"], &[], &topo);
+    let plan = planned(&["lo", "vrf0", "dae0", "ens3"], &[], &topo);
     assert_eq!(local_ip_interface(&plan), Some("ens3"));
     // Refused LAN entries leave the WAN root as the source address.
-    let plan = plan_for(&["lo"], &["eth1"], &topo);
+    let plan = planned(&["lo"], &["eth1"], &topo);
     assert_eq!(local_ip_interface(&plan), Some("eth1"));
     // Nothing bindable: no address, never `lo`'s.
-    let plan = plan_for(&["lo", "vrf0"], &[], &topo);
+    let plan = planned(&["lo", "vrf0"], &[], &topo);
     assert_eq!(local_ip_interface(&plan), None);
     assert_eq!(local_ip(&plan), 0);
 }
