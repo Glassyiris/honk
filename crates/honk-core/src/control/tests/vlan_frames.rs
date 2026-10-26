@@ -422,17 +422,22 @@ async fn with_datapath(scenario: Scenario) -> anyhow::Result<()> {
     let object = std::env::var_os("HONK_TEST_BPF_OBJECT")
         .map(std::fs::read)
         .transpose()?;
-    let config = lab_config(&udp_test_node());
+    let mut config = lab_config(&udp_test_node());
+    config.global.lan_interface = std::iter::once("honk-lan0")
+        .chain(scenario.lan_extra.iter().copied())
+        .map(str::to_owned)
+        .collect();
+    config.global.wan_interface = vec![scenario.wan.to_owned()];
     let mut backend = RealEbpfBackend::load(
         object.as_deref().unwrap_or(crate::DEFAULT_BPF_OBJECT),
         Path::new(ROOT),
         config.global.tproxy_port,
-        Some("honk-lan0"),
-        scenario.wan,
+        Some(&config.global.lan_interface[0]),
+        &config.global.wan_interface[0],
         false,
     )
     .await?;
-    for lan in &scenario.lan_extra {
+    for lan in &config.global.lan_interface[1..] {
         backend.attach_lan(lan, false)?;
     }
     backend.attach_dae0_programs()?;
