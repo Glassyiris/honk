@@ -173,6 +173,13 @@ fn isolated(f: impl FnOnce() + Send + 'static) {
     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
+/// Per-CPU state (parser scratch, rate budgets): keep consecutive runs on one CPU.
+fn pin_to_current_cpu() {
+    let mut set = nix::sched::CpuSet::new();
+    set.set(unsafe { libc::sched_getcpu() } as usize).unwrap();
+    nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set).unwrap();
+}
+
 fn fixture_param() -> DaeParam {
     DaeParam {
         tproxy_port: 12345u16.to_be() as u32,

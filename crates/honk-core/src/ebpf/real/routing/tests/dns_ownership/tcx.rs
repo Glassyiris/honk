@@ -224,13 +224,7 @@ fn unsupported_lan_ingress_frames_continue_tcx_without_marking() {
     isolated(|| {
         // The parser scratch is per CPU: pin so each frame follows the TCP
         // packet on the same CPU, exposing any read of a previous packet's headers.
-        let allowed = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
-        let cpu = (0..nix::sched::CpuSet::count())
-            .find(|cpu| allowed.is_set(*cpu).unwrap())
-            .unwrap();
-        let mut pinned = nix::sched::CpuSet::new();
-        pinned.set(cpu).unwrap();
-        nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &pinned).unwrap();
+        pin_to_current_cpu();
         let mut backend =
             RealEbpfBackend::load_routing_test_fixture(&object(), fixture_param()).unwrap();
         for name in ["lan_ingress_l2", "lan_ingress_l3"] {
