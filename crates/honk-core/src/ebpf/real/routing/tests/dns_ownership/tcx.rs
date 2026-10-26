@@ -30,11 +30,14 @@ fn untouched_passes_return_next_before_backend_admission() {
     });
 }
 
-fn assert_next(backend: &RealEbpfBackend, name: &str, bytes: &[u8], input: SkbInput) {
+fn assert_next(backend: &RealEbpfBackend, name: &str, case: &str, bytes: &[u8], input: SkbInput) {
     let result = run(backend, name, bytes, input);
-    assert_eq!(result.verdict, TC_ACT_UNSPEC, "{name}, input={bytes:02x?}");
-    assert_eq!(result.mark, input.mark, "{name}");
-    assert_eq!(&result.data[..bytes.len()], bytes, "{name}");
+    assert_eq!(
+        result.verdict, TC_ACT_UNSPEC,
+        "{name} {case}, input={bytes:02x?}"
+    );
+    assert_eq!(result.mark, input.mark, "{name} {case}");
+    assert_eq!(&result.data[..bytes.len()], bytes, "{name} {case}");
 }
 
 fn l3_packet(mut bytes: Vec<u8>) -> Vec<u8> {
@@ -90,7 +93,7 @@ fn pure_passes_continue_tcx_without_changing_marks() {
             let bytes = packet(src, dst, IPPROTO_UDP, port, 443, 0, 0);
             set_array(&mut backend, "DATAPATH_STATE_MAP", 0, 0u32);
             for name in ["lan_ingress_l2", "wan_egress_l2"] {
-                assert_next(&backend, name, &bytes, input);
+                assert_next(&backend, name, "", &bytes, input);
             }
             set_array(&mut backend, "DATAPATH_STATE_MAP", 0, 1u32);
 
@@ -102,16 +105,16 @@ fn pure_passes_continue_tcx_without_changing_marks() {
                 "wan_egress_l2",
                 "dae0_ingress",
             ] {
-                assert_next(&backend, name, &unsupported, input);
+                assert_next(&backend, name, "", &unsupported, input);
             }
-            assert_next(&backend, "dae0_ingress", &bytes, input);
+            assert_next(&backend, "dae0_ingress", "", &bytes, input);
 
             let special = packet(src, multicast, IPPROTO_UDP, port + 1, 5353, 0, 0);
             for name in ["lan_egress_l2", "wan_egress_l2"] {
-                assert_next(&backend, name, &special, input);
+                assert_next(&backend, name, "", &special, input);
                 let mut broadcast = bytes.clone();
                 broadcast[..6].fill(0xff);
-                assert_next(&backend, name, &broadcast, input);
+                assert_next(&backend, name, "", &broadcast, input);
             }
             let result = run(&backend, "lan_ingress_l2", &special, input);
             assert_eq!(
@@ -128,11 +131,12 @@ fn pure_passes_continue_tcx_without_changing_marks() {
                     0,
                     0,
                 );
-                assert_next(&backend, "wan_egress_l2", &local, input);
+                assert_next(&backend, "wan_egress_l2", "", &local, input);
             }
             assert_next(
                 &backend,
                 "wan_egress_l2",
+                "",
                 &bytes,
                 SkbInput {
                     ingress_ifindex: 1,
@@ -142,11 +146,11 @@ fn pure_passes_continue_tcx_without_changing_marks() {
             for name in ["lan_egress_l2", "wan_ingress_l2"] {
                 for (sport, dport) in [(53, port + 3), (port + 4, 3478)] {
                     let reply = packet(src, dst, IPPROTO_UDP, sport, dport, 0, 0);
-                    assert_next(&backend, name, &reply, input);
+                    assert_next(&backend, name, "", &reply, input);
                 }
             }
             let ack = packet(src, dst, IPPROTO_TCP, port + 5, 443, 0, 0x10);
-            assert_next(&backend, "wan_egress_l2", &ack, input);
+            assert_next(&backend, "wan_egress_l2", "", &ack, input);
             let time = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC).unwrap();
             let state = ConnState {
                 incarnation: 1,
@@ -160,7 +164,7 @@ fn pure_passes_continue_tcx_without_changing_marks() {
                     &state,
                 )
                 .unwrap();
-            assert_next(&backend, "wan_egress_l2", &ack, input);
+            assert_next(&backend, "wan_egress_l2", "", &ack, input);
             let reply_state = ConnState {
                 is_wan_ingress_direction: 1,
                 ..state
@@ -172,18 +176,18 @@ fn pure_passes_continue_tcx_without_changing_marks() {
                     &reply_state,
                 )
                 .unwrap();
-            assert_next(&backend, "wan_egress_l2", &bytes, input);
+            assert_next(&backend, "wan_egress_l2", "", &bytes, input);
         }
         for (src, dst, multicast) in PEERS {
             let bytes = l3_packet(packet(src, dst, IPPROTO_UDP, 46102, 443, 0, 0));
             let mut unsupported = bytes.clone();
             unsupported[if src.is_ipv4() { 9 } else { 6 }] = 47;
             for name in ["lan_egress_l3", "wan_ingress_l3", "wan_egress_l3"] {
-                assert_next(&backend, name, &unsupported, input);
+                assert_next(&backend, name, "", &unsupported, input);
             }
             let special = l3_packet(packet(src, multicast, IPPROTO_UDP, 46103, 5353, 0, 0));
             for name in ["lan_egress_l3", "wan_egress_l3"] {
-                assert_next(&backend, name, &special, input);
+                assert_next(&backend, name, "", &special, input);
             }
             let result = run(
                 &backend,
@@ -271,13 +275,7 @@ fn unsupported_lan_ingress_frames_continue_tcx_without_marking() {
                 }
                 for (what, frame) in &unsupported {
                     let _ = run(&backend, name, &tcp, input);
-                    let result = run(&backend, name, frame, input);
-                    assert_eq!(
-                        (result.verdict, result.mark),
-                        (TC_ACT_UNSPEC, USER_MARK),
-                        "{name} {what} {src}"
-                    );
-                    assert_eq!(&result.data[..frame.len()], frame, "{name} {what}");
+                    assert_next(&backend, name, &format!("{what} {src}"), frame, input);
                 }
                 // These keep the terminal, classified pass.
                 let mut classified = Vec::new();
@@ -338,6 +336,7 @@ fn conn_capacity_native_passes_continue_tcx_without_clearing_marks() {
                 assert_next(
                     &backend,
                     "wan_egress_l2",
+                    "",
                     &bytes,
                     SkbInput {
                         mark: USER_MARK,
