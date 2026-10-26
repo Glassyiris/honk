@@ -100,7 +100,7 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 
 网卡存在即绑定，不要求 `IFF_UP`。每个网卡有各自的角色：只在 `lan_interface` 中为 LAN，只在 `wan_interface` 中为 WAN，两者都出现为 LAN/WAN 共用（见[接口挂钩集合](../design/datapath.md#接口挂钩集合)），因此共用网卡不会改变其他 LAN 网卡的 hook。bond、bridge 或其他 master 的成员通过该 master 绑定，但 `vrf` 与 `openvswitch` 的成员保持自身。LAN bridge 同时绑定其端口，bond 绑定其成员。
 
-启动时第一个已解析的 LAN 和 WAN 项必须存在并绑定成功，否则启动失败；后续项的失败记录警告并重试，后续不存在的项保持待定。`IfaceWatcher` 订阅 link、address 和 IPv4/IPv6 route 事件，并每 60 秒执行一次 reconciliation。它会随网卡和默认路由变化创建、更新或释放所需的 LAN/WAN hook。拓扑变化仍用于 ECS 刷新，并立即唤醒受健康状态控制的出站探测，但不再生成网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。网卡列表配置本身发生变化仍需重启；网关管理访问应使用[显式用户路由](./routing.md#显式本地路由)。
+启动时第一个已解析的 LAN 项和第一个已解析的 WAN 项必须存在并绑定成功，否则启动失败；当某个 WAN 名称同时也是 LAN 名称时不检查第一个 WAN 项（`lan_interface: a`、`wan_interface: b, a` 只检查 `a`）。任一已存在的项出现不受支持的 bond/bridge 嵌套，或接口自身即其 master，同样使启动失败（受支持：一层 bond/bridge，外加作为 bridge 端口的 bond）。其余各项的挂载失败记录警告并重试，不存在的其余项保持待定；计划仍因嵌套原因失败时，watcher 保持现有绑定不变。`IfaceWatcher` 订阅 link、address 和 IPv4/IPv6 route 事件，并每 60 秒执行一次 reconciliation。它会随网卡和默认路由变化创建、更新或释放所需的 LAN/WAN hook。拓扑变化仍用于 ECS 刷新，并立即唤醒受健康状态控制的出站探测，但不再生成网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。网卡列表配置本身发生变化仍需重启；网关管理访问应使用[显式用户路由](./routing.md#显式本地路由)。
 
 真实 LAN 绑定还会执行提示性的[自保覆盖检查](./routing.md#显式本地路由)。无法确认时仅告警，不拒绝启动或重载，也不插入路由规则。
 
