@@ -122,7 +122,7 @@ impl IfaceWatcher {
     }
 }
 
-fn watcher_disabled(reason: &'static str) -> crate::degradations::Issue {
+fn watcher_ticker_only(reason: &'static str) -> crate::degradations::Issue {
     crate::degradations::Issue {
         code: "interface_watcher_disabled",
         message: "The interface watcher reconciles every 60 seconds without event notifications.",
@@ -143,7 +143,7 @@ pub(super) fn subscribe(degradations: &crate::degradations::Degradations) -> Opt
             );
             degradations.set(
                 crate::degradations::Component::IfaceWatch,
-                watcher_disabled("subscribe_failed"),
+                watcher_ticker_only("subscribe_failed"),
             );
             None
         }
@@ -241,7 +241,7 @@ async fn run(
                 );
                 degradations.set(
                     crate::degradations::Component::IfaceWatch,
-                    watcher_disabled("poll_setup_failed"),
+                    watcher_ticker_only("poll_setup_failed"),
                 );
                 None
             }

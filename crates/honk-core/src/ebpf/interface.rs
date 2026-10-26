@@ -451,22 +451,15 @@ fn mark_roots<'a>(
     let mut ids = Vec::with_capacity(names.len());
     for (name, entry) in names {
         // honk's own links are refused by configured name (`dae0peer` is in daens).
-        let owned = matches!(name.as_str(), "dae0" | "dae0peer");
-        let link = index.by_name.get(name.as_str());
-        let (Some(link), false) = (link, owned) else {
-            let reason = if owned {
-                UnboundReason::Refused(RefusedReason::OwnedLink)
-            } else {
-                UnboundReason::Absent
-            };
-            note_unbound(unbound, entry, reason);
-            ids.push(None);
-            continue;
+        let root = match (name.as_str(), index.by_name.get(name.as_str())) {
+            ("dae0" | "dae0peer", _) => Err(UnboundReason::Refused(RefusedReason::OwnedLink)),
+            (_, None) => Err(UnboundReason::Absent),
+            (_, Some(link)) => canonical_root(index, link).map_err(UnboundReason::Refused),
         };
-        let root = match canonical_root(index, link) {
+        let root = match root {
             Ok(root) => root,
             Err(reason) => {
-                note_unbound(unbound, entry, UnboundReason::Refused(reason));
+                note_unbound(unbound, entry, reason);
                 ids.push(None);
                 continue;
             }
