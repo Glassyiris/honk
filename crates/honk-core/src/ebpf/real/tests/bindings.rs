@@ -702,19 +702,22 @@ fn observation_follows_add_replace_remove() {
         // reported as a verified hook.
         lab.netlink.del_link(ifindex).unwrap();
         let observation = lab.backend.observe_datapath();
-        let stale = seen(&lab);
+        let stale: Vec<_> = observation
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.interface == "hbo_a")
+            .collect();
         assert!(
             stale
                 .iter()
-                .all(|(_, _, state)| *state != DatapathCheck::Verified),
+                .all(|attachment| attachment.state != DatapathCheck::Verified),
             "deleted device still reported verified: {stale:?}"
         );
         assert!(
             observation
                 .errors
-                .contains(&DatapathObservationError::Hooks)
-                || !stale.is_empty(),
-            "a stale binding must surface as a hook error or a non-verified attachment"
+                .contains(&DatapathObservationError::Hooks),
+            "a stale binding must surface as a hook error: {observation:?}"
         );
 
         let round = lab.round(&[], &[]);
