@@ -2,8 +2,8 @@
 //! entries and one rtnetlink topology snapshot to the set of TCX bindings the
 //! datapath wants. No Aya, no I/O except [`read_topology`] and [`local_ip`].
 //!
-//! Relations (at most two levels, anything deeper or looping is an `Err`, never
-//! a half plan):
+//! Relations (at most two levels; an entry nested deeper or in a loop is
+//! refused as unsupported, the rest of the plan still binds):
 //! - a member of a `bond`/`bridge` resolves to that master; a bond that is a
 //!   bridge port resolves to the bridge;
 //! - a member of any other master except `vrf`/`openvswitch` resolves to that
