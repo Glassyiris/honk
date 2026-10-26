@@ -5,7 +5,7 @@
 //! kernel's own chain and link info rather than the owner's records.
 //!
 //! The private mount namespace deliberately keeps the parent's sysfs, so a
-//! veth created here is invisible to `/sys/class/net`: the #268 condition.
+//! veth created here is invisible to `/sys/class/net`.
 
 use super::super::bindings as owner;
 use super::*;

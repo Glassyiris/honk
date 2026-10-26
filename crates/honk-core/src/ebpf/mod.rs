@@ -569,8 +569,8 @@ pub trait EbpfBackend: Send + Sync {
     #[cfg(feature = "ebpf")]
     fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
 
-    /// Transfer the reconciled bindings in. O(1)-ish; the returned FDs
-    /// (replaced or removed links) are closed by the caller outside any lock.
+    /// Apply the commit and return replaced or removed link FDs. The caller
+    /// must close them outside any lock: the last close takes the rtnl lock.
     #[cfg(feature = "ebpf")]
     fn commit_interface_bindings(
         &mut self,

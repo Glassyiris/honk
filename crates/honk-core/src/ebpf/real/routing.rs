@@ -652,7 +652,6 @@ impl RealEbpfBackend {
         })
     }
 
-    /// What startup passes to `load` for these interfaces.
     pub(crate) fn test_local_ip(lan: &[&str], wan: &[&str]) -> u32 {
         let owned = |names: &[&str]| {
             names

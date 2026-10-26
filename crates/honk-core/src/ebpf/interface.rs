@@ -66,7 +66,6 @@ impl TcProgram {
         }
     }
 
-    /// `lan` selects the LAN program family; `l2` the Ethernet framing.
     fn select(lan: bool, direction: Direction, l2: bool) -> Self {
         match (lan, direction, l2) {
             (true, Direction::Ingress, true) => Self::LanIngressL2,
@@ -98,9 +97,7 @@ impl Binding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnboundReason {
-    /// No link with that name in the snapshot.
     Absent,
-    /// `auto` with no IPv4 default route.
     AutoUnresolved,
 }
 
@@ -163,8 +160,7 @@ impl BindingCommit {
     /// Apply to an owner's `(binding, link id, link fd)` table: removals, then
     /// reprograms and renames, then adds. An add for an existing
     /// `(ifindex, direction)` replaces it; a removal, reprogram or rename of a
-    /// missing key is ignored. The replaced or removed FDs are returned so the
-    /// caller closes them outside any lock.
+    /// missing key is ignored. Returns the replaced or removed FDs.
     pub(crate) fn apply_to(self, owned: &mut Vec<(Binding, u32, OwnedFd)>) -> Vec<OwnedFd> {
         let mut closed = Vec::new();
         for gone in self.remove {
@@ -233,7 +229,6 @@ pub(crate) fn any_auto(lan: &[String], wan: &[String]) -> bool {
     lan.iter().chain(wan).any(|name| is_auto_interface(name))
 }
 
-/// Startup: one topology read and the plan derived from it.
 pub(crate) fn read_and_plan(
     lan: &[String],
     wan: &[String],

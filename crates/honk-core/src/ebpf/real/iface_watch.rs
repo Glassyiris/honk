@@ -5,7 +5,7 @@
 //! owner (`bindings`). Every step that can wait on rtnl (link dump, TCX
 //! create/update/query, closing a link FD, sysctl) runs on a blocking thread
 //! with no backend lock held; the backend lock is taken only to snapshot
-//! (read) and to commit (write, O(1) transfers).
+//! (read) and to commit (write).
 
 use nix::errno::Errno;
 use nix::sys::socket::{
@@ -151,11 +151,8 @@ fn subscribe_network_events() -> std::io::Result<OwnedFd> {
 /// What one bounded drain of the subscription saw.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Drained {
-    /// The socket ran dry (as opposed to hitting the 64-message bound).
     empty: bool,
-    /// A link was added, changed or removed: retained links need re-proving.
     link_event: bool,
-    /// The kernel dropped events: anything may have changed.
     overrun: bool,
 }
 
@@ -422,7 +419,6 @@ impl Watch {
                     .map(|(_, name)| name.clone())
                     .collect();
                 let closed = self.ebpf.write().await.commit_interface_bindings(commit);
-                // The last close of a link takes the rtnl lock.
                 let write_accept_ra = Arc::clone(&self.reconciler.accept_ra);
                 tokio::task::spawn_blocking(move || {
                     drop(closed);

@@ -99,8 +99,6 @@ impl InterfaceBindings {
         })
     }
 
-    /// Returns the replaced and removed link FDs; the caller closes them
-    /// outside any lock because the last close takes the rtnl lock.
     pub(super) fn commit(&mut self, commit: BindingCommit) -> Vec<OwnedFd> {
         commit.apply_to(&mut self.owned)
     }
