@@ -42,8 +42,16 @@ const SERVER: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 2);
 const HOST_MAC: &str = "02:00:00:00:0a:01";
 const CLIENT_MAC: &str = "02:00:00:00:0c:01";
 
+#[derive(Debug)]
+enum Case {
+    Lan { vlan_hook: bool },
+    Vid0,
+    Wan { vlan_hook: bool },
+    Macsec,
+}
+
 macro_rules! vlan_case {
-    ($name:ident, $case:literal) => {
+    ($name:ident, $case:expr) => {
         #[test]
         #[ignore = "requires Linux 6.12+, root, 8021q/macsec and the disposable kernel VM gate"]
         fn $name() -> anyhow::Result<()> {
@@ -53,8 +61,8 @@ macro_rules! vlan_case {
             run_isolated(
                 concat!("control::tests::vlan_frames::", stringify!($name)),
                 CHILD,
-                [$case],
-                run_child,
+                [stringify!($case)],
+                |_| run_child($case),
             )
         }
     };
@@ -63,26 +71,32 @@ macro_rules! vlan_case {
 // Without the lan_ingress VLAN skip the parent redirects the tagged SYN and daens drops it as OTHERHOST.
 vlan_case!(
     netns_vlan_client_on_parent_lan_is_forwarded_natively,
-    "lan_parent"
+    Case::Lan { vlan_hook: false }
 );
 // Without the skip the parent hook classifies first, so the VLAN device never gets the frame.
 vlan_case!(
     netns_vlan_device_lan_is_proxied_beside_its_parent,
-    "lan_parent_and_vlan"
+    Case::Lan { vlan_hook: true }
 );
 // An 802.1p priority tag (VID 0) is delivered by the parent: the skip must not apply.
 vlan_case!(
     netns_vlan_priority_tagged_lan_client_is_still_proxied,
-    "vid0"
+    Case::Vid0
 );
 // Without the wan_egress VLAN skip the tagged SYN is redirected into daens and dropped.
 vlan_case!(
     netns_vlan_host_connection_on_parent_wan_is_native,
-    "wan_parent"
+    Case::Wan { vlan_hook: false }
 );
-vlan_case!(netns_vlan_device_wan_intercepts_host_connection, "wan_vlan");
+vlan_case!(
+    netns_vlan_device_wan_intercepts_host_connection,
+    Case::Wan { vlan_hook: true }
+);
 // Without the unsupported-frame NEXT the encrypted frame is marked classified and the decrypted upper flow skipped.
-vlan_case!(netns_macsec_upper_device_lan_flow_is_classified, "macsec");
+vlan_case!(
+    netns_macsec_upper_device_lan_flow_is_classified,
+    Case::Macsec
+);
 
 /// One request/reply exchange from the host namespace, in its own process.
 fn host_client(target: &str) -> anyhow::Result<()> {
@@ -157,11 +171,19 @@ enum Expect {
     Wan,
 }
 
+enum Client {
+    /// The host namespace: the control plane's own sockets are exempt from interception,
+    /// so this is the test binary re-run as another process.
+    Host,
+    Namespace {
+        netns: OwnedFd,
+        source: Ipv4Addr,
+    },
+}
+
 /// The scenario a case builds: who connects, where, and what honk was told to hook.
 struct Scenario {
-    /// Network namespace of the connecting socket; `None` is the host itself.
-    client_ns: Option<OwnedFd>,
-    source: Option<IpAddr>,
+    client: Client,
     server_ns: OwnedFd,
     target: SocketAddr,
     lan_extra: Vec<&'static str>,
@@ -171,7 +193,7 @@ struct Scenario {
     peer: IpAddr,
 }
 
-fn run_child(case: &str) -> anyhow::Result<()> {
+fn run_child(case: Case) -> anyhow::Result<()> {
     let (client_ns, server_ns) = build_lab(LAN.into(), WAN.into())?;
     configure_test_edge(&server_ns, "honk-s0", SERVER, WAN, &[]);
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
@@ -213,26 +235,29 @@ fn run_child(case: &str) -> anyhow::Result<()> {
         )?;
         default_via(Ipv4Addr::new(10, 20, 0, 1), "honk-c0.20")
     };
-    let to_server = SocketAddr::new(SERVER.into(), PORT);
     let scenario = match case {
-        "lan_parent" | "lan_parent_and_vlan" => {
+        Case::Lan { vlan_hook } => {
             vlan_lan()?;
-            let (lan_extra, expect, peer) = match case {
-                "lan_parent" => (vec![], Expect::Native, Ipv4Addr::new(10, 20, 0, 2)),
-                _ => (vec!["honk-lan0.20"], Expect::LanOn("honk-lan0.20"), WAN),
+            let source = Ipv4Addr::new(10, 20, 0, 2);
+            let (lan_extra, expect, peer) = if vlan_hook {
+                (vec!["honk-lan0.20"], Expect::LanOn("honk-lan0.20"), WAN)
+            } else {
+                (vec![], Expect::Native, source)
             };
             Scenario {
-                client_ns: Some(client_ns),
-                source: Some(Ipv4Addr::new(10, 20, 0, 2).into()),
+                client: Client::Namespace {
+                    netns: client_ns,
+                    source,
+                },
                 server_ns,
-                target: to_server,
+                target: SocketAddr::new(SERVER.into(), PORT),
                 lan_extra,
                 wan: "honk-wan0",
                 expect,
                 peer: peer.into(),
             }
         }
-        "vid0" => {
+        Case::Vid0 => {
             // VID 0 is an 802.1p priority tag (priority 3 here, so vlan_tci is non-zero)
             // that the parent delivers itself. The host replies untagged, so pin both
             // neighbours instead of relying on ARP.
@@ -274,17 +299,19 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                 ],
             )?;
             Scenario {
-                client_ns: Some(client_ns),
-                source: Some(client.into()),
+                client: Client::Namespace {
+                    netns: client_ns,
+                    source: client,
+                },
                 server_ns,
-                target: to_server,
+                target: SocketAddr::new(SERVER.into(), PORT),
                 lan_extra: vec![],
                 wan: "honk-wan0",
                 expect: Expect::LanOn("honk-lan0"),
                 peer: WAN.into(),
             }
         }
-        "wan_parent" | "wan_vlan" => {
+        Case::Wan { vlan_hook } => {
             let host = Ipv4Addr::new(10, 30, 0, 1);
             upper(
                 None,
@@ -300,13 +327,13 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                 &["vlan", "id", "20"],
                 Ipv4Addr::new(10, 30, 0, 2),
             )?;
-            let (wan, expect) = match case {
-                "wan_parent" => ("honk-wan0", Expect::Native),
-                _ => ("honk-wan0.20", Expect::Wan),
+            let (wan, expect) = if vlan_hook {
+                ("honk-wan0.20", Expect::Wan)
+            } else {
+                ("honk-wan0", Expect::Native)
             };
             Scenario {
-                client_ns: None,
-                source: None,
+                client: Client::Host,
                 server_ns,
                 target: SocketAddr::new(Ipv4Addr::new(10, 30, 0, 2).into(), PORT),
                 lan_extra: vec![],
@@ -315,7 +342,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                 peer: host.into(),
             }
         }
-        "macsec" => {
+        Case::Macsec => {
             // Static SAs need no daemon. A missing module or cipher fails here, loudly.
             let (host, client) = (Ipv4Addr::new(10, 76, 0, 1), Ipv4Addr::new(10, 76, 0, 2));
             let keys = [
@@ -368,24 +395,25 @@ fn run_child(case: &str) -> anyhow::Result<()> {
             )?;
             default_via(host, "macsec0")?;
             Scenario {
-                client_ns: Some(client_ns),
-                source: Some(client.into()),
+                client: Client::Namespace {
+                    netns: client_ns,
+                    source: client,
+                },
                 server_ns,
-                target: to_server,
+                target: SocketAddr::new(SERVER.into(), PORT),
                 lan_extra: vec!["macsec0"],
                 wan: "honk-wan0",
                 expect: Expect::LanOn("macsec0"),
                 peer: WAN.into(),
             }
         }
-        _ => anyhow::bail!("unknown VLAN frame case {case}"),
     };
     let _dae0 = daens::create_dae0_link()?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(with_datapath(scenario))
-        .with_context(|| format!("VLAN frames {case}"))
+        .with_context(|| format!("VLAN frames {case:?}"))
 }
 
 /// Boots the production control plane over the real hooks, drives one TCP exchange and
@@ -487,32 +515,28 @@ async fn exchange(scenario: &Scenario) -> anyhow::Result<()> {
         Ok::<_, anyhow::Error>((peer.ip(), maps))
     });
     let client = async {
-        if scenario.client_ns.is_none() {
-            // The control plane's own sockets are exempt from interception, so the host
-            // client is this test binary run as another process.
-            let status = tokio::time::timeout(
-                NETNS_TEST_TIMEOUT,
-                tokio::process::Command::new(std::env::current_exe()?)
-                    .args([HOST_CLIENT_TEST, "--ignored", "--exact", "--nocapture"])
-                    .env(HOST_CLIENT, scenario.target.to_string())
-                    .kill_on_drop(true)
-                    .status(),
-            )
-            .await
-            .context("host client exchange timed out")??;
-            ensure!(status.success(), "host client failed: {status}");
-            return Ok(());
-        }
-        let socket = || -> anyhow::Result<_> {
-            let socket = TcpSocket::new_v4()?;
-            if let Some(source) = scenario.source {
-                socket.bind(SocketAddr::new(source, 0))?;
+        let socket = match &scenario.client {
+            Client::Host => {
+                let status = tokio::time::timeout(
+                    NETNS_TEST_TIMEOUT,
+                    tokio::process::Command::new(std::env::current_exe()?)
+                        .args([HOST_CLIENT_TEST, "--ignored", "--exact", "--nocapture"])
+                        .env(HOST_CLIENT, scenario.target.to_string())
+                        .kill_on_drop(true)
+                        .status(),
+                )
+                .await
+                .context("host client exchange timed out")??;
+                ensure!(status.success(), "host client failed: {status}");
+                return Ok(());
             }
-            Ok(socket)
-        };
-        let socket = match &scenario.client_ns {
-            Some(netns) => in_test_netns(netns, socket)?,
-            None => socket()?,
+            Client::Namespace { netns, source } => {
+                in_test_netns(netns, || -> anyhow::Result<_> {
+                    let socket = TcpSocket::new_v4()?;
+                    socket.bind(SocketAddr::new((*source).into(), 0))?;
+                    Ok(socket)
+                })?
+            }
         };
         tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
             let mut stream: TcpStream = socket
