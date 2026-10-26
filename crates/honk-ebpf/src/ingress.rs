@@ -50,7 +50,7 @@ use crate::{
     sk,
     transport::{
         ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, PARSE_FRAGMENT, PASS_UNSUPPORTED,
-        parse_packet, udp_has_quic_long_header,
+        is_vlan_tagged, parse_packet, udp_has_quic_long_header,
     },
 };
 const AF_INET: u8 = 2;
@@ -481,11 +481,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if !crate::maps::datapath_ready() {
         return Err(TC_ACT_UNSPEC);
     }
-    // A non-zero-VID frame is still tagged here (hwaccel vlan_tci, cleared by
-    // vlan_do_receive before the VLAN device's own TC). Redirecting it into
-    // daens drops it as OTHERHOST, so leave it to the VLAN device. VID 0
-    // priority tags are cleared and delivered normally: not skipped.
-    if link_h_len == ETH_HLEN && unsafe { (*ctx.skb.skb).vlan_tci } & 0x0fff != 0 {
+    if is_vlan_tagged(ctx, link_h_len) {
         return Err(TC_ACT_UNSPEC);
     }
     // Bridge master/slave double attachment must not reclassify either an

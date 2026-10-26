@@ -21,6 +21,7 @@ pub const PARSE_FRAGMENT: i32 = 2;
 /// causing unnecessary slow-path fallback.
 pub const HEADER_PULL_SIZE: u32 = 256;
 pub const ETH_HLEN: u32 = 14;
+pub const VLAN_VID_MASK: u32 = 0x0fff;
 pub const ETH_P_IP: u16 = 0x0800;
 pub const ETH_P_IPV6: u16 = 0x86DD;
 pub const IPPROTO_NONE: u8 = 59;
@@ -91,6 +92,15 @@ pub const PASS_UNSUPPORTED: c_long = 1;
 
 /// Parsed ICMPv6 Redirect; egress suppresses it when locally originated.
 pub const PASS_NDP_REDIRECT: c_long = 3;
+
+/// True when an Ethernet frame still carries a non-zero-VID tag (hwaccel
+/// `vlan_tci`, cleared by `vlan_do_receive` before the VLAN device's own TC).
+/// Redirecting it into daens would drop it as OTHERHOST, so the VLAN device
+/// must classify it instead. VID 0 priority tags are delivered normally.
+#[inline(always)]
+pub fn is_vlan_tagged(ctx: &TcContext, link_h_len: u32) -> bool {
+    link_h_len == ETH_HLEN && unsafe { (*ctx.skb.skb).vlan_tci } & VLAN_VID_MASK != 0
+}
 
 /// Destinations that must never enter routing/conntrack: L2
 /// broadcast/multicast, IPv4 limited broadcast + multicast + 0.0.0.0, IPv6

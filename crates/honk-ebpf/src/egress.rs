@@ -37,7 +37,7 @@ use crate::{
     socket_identity,
     transport::{
         ETH_HLEN, ETH_P_IP, IPPROTO_TCP, IPPROTO_UDP, PARSE_FRAGMENT, PASS_NDP_REDIRECT,
-        parse_packet,
+        is_vlan_tagged, parse_packet,
     },
 };
 
@@ -795,9 +795,8 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     {
         return Err(TC_ACT_SHOT);
     }
-    // A non-zero-VID frame still tagged on the parent belongs to the VLAN
-    // device (see lan ingress); redirecting it into daens would drop it.
-    if link_h_len == ETH_HLEN && unsafe { (*ctx.skb.skb).vlan_tci } & 0x0fff != 0 {
+    // After the carrier drop so a VLAN-tagged queue carrier is still shot.
+    if is_vlan_tagged(ctx, link_h_len) {
         return Err(TC_ACT_UNSPEC);
     }
     if !crate::maps::datapath_ready() {
