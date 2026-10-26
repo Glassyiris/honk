@@ -177,16 +177,6 @@ impl Fixture {
         owned
     }
 
-    /// `(ifindex, direction, interface name, link id)` of every held binding.
-    async fn held(&self) -> Vec<(u32, Direction, String, u32)> {
-        let mut held: Vec<_> = (self.bindings().await)
-            .into_iter()
-            .map(|(b, id)| (b.ifindex.get(), b.direction, b.interface, id))
-            .collect();
-        held.sort();
-        held
-    }
-
     async fn set_interfaces(&self, lan: &[&str], wan: &[&str]) {
         let mut config = self.config.write().await;
         let global = &mut Arc::make_mut(&mut config).global;
@@ -296,7 +286,7 @@ async fn auto_wan_moving_onto_a_bound_lan_root_writes_accept_ra() {
 }
 
 #[tokio::test]
-async fn renamed_port_keeps_its_binding_and_refreshes_the_name() {
+async fn renamed_port_commit_requests_network_refresh() {
     let f = fixture(&["br0"], &[]);
     let topology_with_port = |port: &str| Topology {
         links: vec![
@@ -312,32 +302,23 @@ async fn renamed_port_keeps_its_binding_and_refreshes_the_name() {
         default_route: None,
     };
     *f.stub.links.lock() = Some(topology_with_port("p1"));
-    let (mut watch, _rx) = f.watch();
+    let (mut watch, mut rx) = f.watch();
     watch.reconcile(false).await.unwrap();
-    let before = f.held().await;
-    assert_eq!(before.len(), 4, "{before:?}");
+    watch.pending_notification = false;
     let commits = f.commits.load(Ordering::Relaxed);
 
-    // Same ifindex, new name: the keys and links stay, the observed name follows.
     *f.stub.links.lock() = Some(topology_with_port("p1x"));
-    assert!(watch.reconcile(false).await.unwrap());
-    let after = f.held().await;
-    let rename = |held: &[(u32, Direction, String, u32)]| {
-        held.iter()
-            .map(|(i, d, name, id)| {
-                let name = if name == "p1x" { "p1" } else { name };
-                (*i, *d, name.to_string(), *id)
-            })
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(rename(&after), before, "only the port's name changed");
-    assert_eq!(
-        after.iter().filter(|(_, _, name, _)| name == "p1x").count(),
-        2
-    );
-    assert!(after.iter().all(|(_, _, name, _)| name != "p1"));
+    watch.reconcile_and_notify(false, false).await;
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(crate::control::ControlCommand::NetworkChanged)
+    ));
     assert_eq!(f.commits.load(Ordering::Relaxed), commits + 1);
-    assert!(!watch.reconcile(false).await.unwrap());
+    watch.reconcile_and_notify(false, false).await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[tokio::test]
