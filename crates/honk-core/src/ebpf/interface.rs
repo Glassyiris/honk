@@ -120,13 +120,12 @@ pub(crate) struct InterfacePlan {
     pub lan_roots: Vec<String>,
     /// Canonical roots with WAN intent, `LanWan` included (accept_ra targets).
     pub wan_roots: Vec<(NonZeroU32, String)>,
-    /// c3/c4 only (c5 deletes): every ifindex derived from the roots of
-    /// `lan[0]` and, unless some WAN name is also a LAN name, `wan[0]`
-    /// (root, bridge ports, bond members). Startup is fatal when one of them
-    /// does not end up bound.
+    /// Every ifindex derived from the roots of `lan[0]` and, unless some WAN
+    /// name is also a LAN name, `wan[0]` (root, bridge ports, bond members).
+    /// Startup is fatal when one of them does not end up bound.
     pub primary: Vec<NonZeroU32>,
-    /// c3/c4 only (c5 deletes): the checked first names (`lan[0]`, `wan[0]`
-    /// under the same single-homed rule) that are absent from the topology.
+    /// The checked first names (`lan[0]`, `wan[0]` under the same single-homed
+    /// rule) that are absent from the topology.
     pub primary_missing: Vec<String>,
 }
 
@@ -236,9 +235,9 @@ pub(crate) fn read_and_plan(
     Ok((topology, plan))
 }
 
-/// c3/c4 only (c5 deletes): startup stays fatal when a first LAN/WAN entry is
-/// absent or a binding derived from it (its root, ports, members) is not owned
-/// after the bind. Failures of any other binding are the watcher's to retry.
+/// Startup stays fatal when a first LAN/WAN entry is absent or a binding
+/// derived from it (its root, ports, members) is not owned after the bind.
+/// Failures of any other binding are the watcher's to retry.
 pub(crate) fn check_primary(
     plan: &InterfacePlan,
     owned: &[(NonZeroU32, Direction, TcProgram)],
@@ -564,7 +563,7 @@ pub(crate) fn plan(
 }
 
 /// The canonical root the binding uses: first LAN root, else first WAN root
-/// (refused and absent names never reach either list).
+/// (absent names never reach either list).
 pub(crate) fn local_ip_interface(plan: &InterfacePlan) -> Option<&str> {
     plan.lan_roots
         .first()

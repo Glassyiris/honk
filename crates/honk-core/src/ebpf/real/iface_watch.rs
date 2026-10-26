@@ -421,8 +421,7 @@ impl Watch {
                 changed = true;
                 log_commit(&commit);
                 // accept_ra follows WAN-role roots that gained a binding or moved
-                // onto a WAN egress program (c5 moves this to on-sight
-                // per-ifindex writes).
+                // onto a WAN egress program.
                 let accept_ra: Vec<String> = plan
                     .wan_roots
                     .iter()
