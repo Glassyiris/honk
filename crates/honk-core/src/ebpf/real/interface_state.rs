@@ -140,6 +140,9 @@ pub(crate) struct InterfaceState {
     episodes: Episodes,
     steps: StepEpisode,
     sysctl: SysctlTracker,
+    /// Held bindings whose verification failed until a verifying pass or replacement.
+    pub(super) unproven: Vec<BindFailure>,
+    pub(super) last_verify: Option<tokio::time::Instant>,
 }
 
 impl InterfaceState {

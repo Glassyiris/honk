@@ -229,6 +229,21 @@ impl BindingCommit {
             && self.rename.is_empty()
     }
 
+    pub(crate) fn keys_after(&self, held: &[(NonZeroU32, Direction)]) -> Vec<(NonZeroU32, Direction)> {
+        let mut owned: Vec<_> = held
+            .iter()
+            .copied()
+            .filter(|key| !self.remove.contains(key))
+            .collect();
+        for (binding, ..) in &self.add {
+            let key = binding.key();
+            if !owned.contains(&key) {
+                owned.push(key);
+            }
+        }
+        owned
+    }
+
     /// Apply to an owner's `(binding, link id, link fd)` table: removals, then
     /// reprograms and renames, then adds. An add for an existing
     /// `(ifindex, direction)` replaces it; a removal, reprogram or rename of a

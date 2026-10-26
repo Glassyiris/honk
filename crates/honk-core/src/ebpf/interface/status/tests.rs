@@ -192,20 +192,6 @@
         assert_eq!(steps.recovered(), None);
         assert_eq!(steps.failed(ReconcileStep::Topology), StepTransition::Begins);
     }
-    #[test]
-    fn owned_after_applies_removals_and_additions() {
-        let key = |i: u32, d| (NonZeroU32::new(i).unwrap(), d);
-        let held = [key(2, Direction::Ingress), key(2, Direction::Egress)];
-        let after = owned_after(
-            &held,
-            &[key(2, Direction::Egress)],
-            &[key(3, Direction::Ingress), key(2, Direction::Ingress)],
-        );
-        assert_eq!(
-            after,
-            [key(2, Direction::Ingress), key(3, Direction::Ingress)]
-        );
-    }
     trait WithArphrd {
         fn with_arphrd(self, arphrd: u16) -> Self;
     }

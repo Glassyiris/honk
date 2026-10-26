@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 use super::interface_startup::InterfaceHandoff;
 use super::interface_state::{self, InterfaceState, SysctlWrite};
 use crate::ebpf::EbpfBackend;
-use crate::ebpf::interface::status::{self, BindFailure, ReconcileStep};
+use crate::ebpf::interface::status::{BindFailure, ReconcileStep};
 use crate::ebpf::interface::{self, ApplyReport, BindingSnapshot, InterfacePlan, Topology};
 use crate::netlink::{RTM_DELLINK, RTM_NEWLINK};
 
@@ -362,10 +362,6 @@ pub(super) struct Watch {
     reconciler: Reconciler,
     degradations: Arc<crate::degradations::Degradations>,
     state: InterfaceState,
-    /// Held bindings whose last verification failed; reported again until a
-    /// verifying pass proves them (or they are replaced).
-    unproven: Vec<BindFailure>,
-    last_verify: Option<Instant>,
     pending_notification: bool,
 }
 
@@ -385,8 +381,6 @@ impl Watch {
             reconciler,
             degradations,
             state,
-            unproven: Vec::new(),
-            last_verify: None,
             pending_notification: true,
         }
     }
@@ -469,20 +463,20 @@ impl Watch {
             let held: Vec<_> = snapshot
                 .owned
                 .iter()
-                .map(|(binding, ..)| (binding.ifindex, binding.direction))
+                .map(|(binding, ..)| binding.key())
                 .collect();
 
             let now = Instant::now();
             // A binding that failed its proof is looked at again, but no more
             // often than the ticker, so one stuck binding does not turn every
             // route event into a TCX query per binding.
-            let retry_due = !self.unproven.is_empty()
-                && self
+            let retry_due = !self.state.unproven.is_empty()
+                && self.state
                     .last_verify
                     .is_none_or(|at| now.duration_since(at) >= self.reconciler.interval);
             let verify = verify || retry_due || round != 0;
             if verify {
-                self.last_verify = Some(now);
+                self.state.last_verify = Some(now);
             }
             let apply = Arc::clone(&self.reconciler.apply);
             let applied = tokio::task::spawn_blocking(move || {
@@ -499,15 +493,9 @@ impl Watch {
                 failed,
                 topology_changed,
             } = report;
-            let removed: Vec<_> = commit.remove.clone();
-            let added: Vec<_> = commit
-                .add
+            let touched: Vec<_> = commit.add
                 .iter()
-                .map(|(binding, ..)| (binding.ifindex, binding.direction))
-                .collect();
-            let touched: Vec<_> = added
-                .iter()
-                .copied()
+                .map(|(binding, ..)| binding.key())
                 .chain(
                     commit
                         .reprogram
@@ -515,7 +503,7 @@ impl Watch {
                         .map(|(ifindex, direction, _)| (*ifindex, *direction)),
                 )
                 .collect();
-            let owned = status::owned_after(&held, &removed, &added);
+            let owned = commit.keys_after(&held);
             if !commit.is_empty() {
                 changed = true;
                 log_commit(&commit);
@@ -531,7 +519,7 @@ impl Watch {
                 .collect();
             if !verify {
                 // Not looked at this pass: still as unproven as before.
-                let carried: Vec<_> = self
+                let carried: Vec<_> = self.state
                     .unproven
                     .iter()
                     .filter(|old| {
@@ -545,7 +533,7 @@ impl Watch {
             }
             self.state
                 .settle(&plan, &owned, &failures, &self.degradations);
-            self.unproven = failures
+            self.state.unproven = failures
                 .iter()
                 .filter(|failure| owned.contains(&failure.key))
                 .cloned()

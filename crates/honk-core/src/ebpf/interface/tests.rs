@@ -787,6 +787,7 @@ fn commit_replaces_existing_add_and_ignores_missing_removals() {
             (NonZeroU32::new(99).unwrap(), Egress, "gone".into()),
         ],
     };
+    assert_eq!(commit.keys_after(&[old.key(), other.key()]), [old.key(), other.key()]);
     let closed = commit.apply_to(&mut owned);
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].as_raw_fd(), first_fd);
@@ -801,6 +802,7 @@ fn commit_replaces_existing_add_and_ignores_missing_removals() {
         remove: vec![updated.key()],
         ..BindingCommit::default()
     };
+    assert_eq!(commit.keys_after(&[updated.key(), other.key()]), [other.key()]);
     assert_eq!(commit.apply_to(&mut owned).len(), 1);
     assert_eq!(owned.len(), 1);
     assert_eq!(owned[0].0.key(), other.key());

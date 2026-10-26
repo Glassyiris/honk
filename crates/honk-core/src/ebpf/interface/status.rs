@@ -42,7 +42,7 @@ pub(crate) struct BindFailure {
 impl BindFailure {
     pub(crate) fn new(binding: &Binding, error: &anyhow::Error) -> Self {
         Self {
-            key: (binding.ifindex, binding.direction),
+            key: binding.key(),
             program: binding.program.name(),
             interface: binding.interface.clone(),
             message: format!("{error:#}"),
@@ -81,7 +81,7 @@ pub(crate) fn entry_states(
         let missing = plan
             .bindings
             .iter()
-            .find(|b| derived.contains(&b.ifindex) && !owned.contains(&(b.ifindex, b.direction)));
+            .find(|b| derived.contains(&b.ifindex) && !owned.contains(&b.key()));
         let (state, detail) = match (failure, missing) {
             (Some(f), _) => (
                 EntryState::AttachFailed,
@@ -242,20 +242,6 @@ impl StepEpisode {
 }
 
 
-/// Keys the owner holds after applying `remove` and `add` to `held`.
-pub(crate) fn owned_after(held: &[Key], remove: &[Key], add: &[Key]) -> Vec<Key> {
-    let mut owned: Vec<Key> = held
-        .iter()
-        .copied()
-        .filter(|key| !remove.contains(key))
-        .collect();
-    for key in add {
-        if !owned.contains(key) {
-            owned.push(*key);
-        }
-    }
-    owned
-}
 
 #[cfg(test)]
 mod tests;
