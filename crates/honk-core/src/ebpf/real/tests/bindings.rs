@@ -166,10 +166,7 @@ impl Lab {
     }
 
     fn snapshot(&self) -> BindingSnapshot {
-        self.backend
-            .interface_binding_snapshot()
-            .unwrap()
-            .expect("real backend owns TCX bindings")
+        self.backend.interface_binding_snapshot().unwrap()
     }
 
     /// `reconcile` with a caller-supplied (possibly stale or tampered) snapshot.
@@ -310,12 +307,7 @@ async fn kernel_held(
     ebpf: &RwLock<Box<dyn EbpfBackend>>,
     programs: &BTreeMap<TcProgram, u32>,
 ) -> Vec<Held> {
-    let snapshot = ebpf
-        .read()
-        .await
-        .interface_binding_snapshot()
-        .unwrap()
-        .expect("real backend owns TCX bindings");
+    let snapshot = ebpf.read().await.interface_binding_snapshot().unwrap();
     let held = held_of(snapshot);
     assert_truthful(&held, programs);
     held

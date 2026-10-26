@@ -827,18 +827,16 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     #[cfg(feature = "ebpf")]
-    fn interface_binding_snapshot(
-        &self,
-    ) -> anyhow::Result<Option<ebpf::interface::BindingSnapshot>> {
+    fn interface_binding_snapshot(&self) -> anyhow::Result<ebpf::interface::BindingSnapshot> {
         let owned = self
             .bound_interfaces
             .iter()
             .map(|(binding, id, fd)| Ok((binding.clone(), *id, fd.try_clone()?)))
             .collect::<std::io::Result<_>>()?;
-        Ok(Some(ebpf::interface::BindingSnapshot {
+        Ok(ebpf::interface::BindingSnapshot {
             programs: Vec::new(),
             owned,
-        }))
+        })
     }
 
     #[cfg(feature = "ebpf")]

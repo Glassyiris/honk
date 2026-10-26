@@ -400,9 +400,6 @@ impl Watch {
                 let backend = self.ebpf.read().await;
                 backend.interface_binding_snapshot()?
             };
-            let Some(snapshot) = snapshot else {
-                return Ok(false);
-            };
 
             let apply = Arc::clone(&self.reconciler.apply);
             let verify = verify || !self.warned.is_empty() || round != 0;

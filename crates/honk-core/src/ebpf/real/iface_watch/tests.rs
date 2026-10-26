@@ -172,7 +172,6 @@ impl Fixture {
             .await
             .interface_binding_snapshot()
             .unwrap()
-            .unwrap()
             .owned
             .into_iter()
             .map(|(b, id, _)| (b, id))

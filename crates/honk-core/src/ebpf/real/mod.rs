@@ -505,10 +505,8 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     #[cfg(feature = "ebpf")]
-    fn interface_binding_snapshot(
-        &self,
-    ) -> anyhow::Result<Option<super::interface::BindingSnapshot>> {
-        self.bindings.snapshot().map(Some)
+    fn interface_binding_snapshot(&self) -> anyhow::Result<super::interface::BindingSnapshot> {
+        self.bindings.snapshot()
     }
 
     #[cfg(feature = "ebpf")]
