@@ -372,7 +372,7 @@ fn startup_attach_failure_degrades_and_recovers_without_stacking() {
     });
 }
 
-/// G9: a configured bridge member binds the bridge and every port; once it
+/// A configured bridge member binds the bridge and every port; once it
 /// leaves the bridge the master and the other ports are released, and a
 /// bridge that is deleted and recreated gets its hooks back when re-enslaved.
 #[test]

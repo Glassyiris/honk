@@ -1,8 +1,4 @@
-//! Startup of the configured interfaces, shared by `run()` and the VM tests:
-//! subscription, topology, plan, sysctl on sight, `local_ip`, `load`, bind,
-//! degradation. Nothing about a configured interface fails startup except an
-//! unreadable topology; an absent, unsupported or unattachable one is reported
-//! through the `interface_binding` degradation and left to the watcher.
+//! Bind configured interfaces before publishing the real backend.
 //! Startup binds before backend publication/admission; watcher rounds need async lock handoffs.
 
 use std::os::fd::OwnedFd;

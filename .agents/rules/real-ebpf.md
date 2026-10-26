@@ -61,7 +61,8 @@ its dependency and boots only one guest. The complete routing suite also has
 root-cgroup cases, so neither recipe executes ignored tests on the host.
 The VM gate includes compiled routing, real backend/datapath, NFQUEUE/netns,
 TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership,
-native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher, lazy interface binding (absent, appearing, deleted and recreated interfaces through the shared startup function; these run under `ebpf::real::tests`) and SO_MARK socket checks. Exact nonempty
+native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher,
+lazy interface binding and SO_MARK socket checks. Exact nonempty
 selections in the guest gate must remain intact.
 
 Use skill `honk-real-ebpf-tests` for the prerequisite sequence from CI: an
