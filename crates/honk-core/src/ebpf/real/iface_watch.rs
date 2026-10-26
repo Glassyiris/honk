@@ -22,8 +22,9 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::interface_startup::InterfaceHandoff;
+use super::interface_state::{self, InterfaceState, SysctlWrite};
 use crate::ebpf::EbpfBackend;
-use crate::ebpf::interface::status::{self, BindFailure, InterfaceState, Step, SysctlWrite};
+use crate::ebpf::interface::status::{self, BindFailure, Step};
 use crate::ebpf::interface::{self, ApplyReport, BindingSnapshot, InterfacePlan, Topology};
 use crate::netlink::{RTM_DELLINK, RTM_NEWLINK};
 
@@ -65,7 +66,7 @@ impl Default for Reconciler {
         Self {
             read_topology: Arc::new(interface::read_topology),
             apply: Arc::new(super::bindings::apply),
-            sysctl: Arc::new(status::write_sysctl),
+            sysctl: Arc::new(interface_state::write_sysctl),
             interval: RECONCILE_INTERVAL,
         }
     }
@@ -274,7 +275,7 @@ async fn run(
             }
             // The second write of a late device's sysctls, after its udev run;
             // without this a quiet host would wait for the ticker.
-            _ = sysctl_due(watch.state.sysctl.due()) => {
+            _ = sysctl_due(watch.state.sysctl_due()) => {
                 watch.reconcile_and_notify(false, false).await;
             }
             guard = readable(async_fd.as_ref(), netlink_retry_at) => {
@@ -450,11 +451,11 @@ impl Watch {
             };
 
             // On sight: the device is in the dump, whether or not it binds.
-            let owed = self.state.sysctl.claim(&plan, &topology, Instant::now());
+            let owed = self.state.claim_sysctls(&plan, &topology, Instant::now());
             if !owed.is_empty() {
                 let write = Arc::clone(&self.reconciler.sysctl);
                 if let Err(error) =
-                    tokio::task::spawn_blocking(move || status::perform(&owed, &*write)).await
+                    tokio::task::spawn_blocking(move || interface_state::perform(&owed, &*write)).await
                 {
                     return Err(self.step_failed(Step::Join, error.into()));
                 }

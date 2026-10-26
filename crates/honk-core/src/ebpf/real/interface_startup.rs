@@ -9,8 +9,9 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use super::RealEbpfBackend;
+use super::interface_state::{self, InterfaceState};
 use crate::degradations::Degradations;
-use crate::ebpf::interface::status::{self, BindFailure, InterfaceState, Step};
+use crate::ebpf::interface::status::{BindFailure, Step};
 use crate::ebpf::interface::{self, InterfacePlan, Topology};
 
 /// What startup hands the watcher: the subscription opened before the first
@@ -77,8 +78,6 @@ pub(crate) async fn start_interfaces(
 /// Startup writes run on the startup task (the only place besides the watcher's
 /// blocking step where `sysctl -w` may be spawned).
 fn write_sysctls(state: &mut InterfaceState, plan: &InterfacePlan, topology: &Topology) {
-    let owed = state
-        .sysctl
-        .claim(plan, topology, tokio::time::Instant::now());
-    status::perform(&owed, &status::write_sysctl);
+    let owed = state.claim_sysctls(plan, topology, tokio::time::Instant::now());
+    interface_state::perform(&owed, &interface_state::write_sysctl);
 }

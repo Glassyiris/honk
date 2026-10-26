@@ -1,6 +1,6 @@
 use super::*;
 use crate::degradations::{Component, Degradations};
-use crate::ebpf::interface::status::SysctlKey;
+use crate::ebpf::real::interface_state::SysctlKey;
 use crate::ebpf::interface::{Binding, Direction, TcProgram};
 use crate::netlink::LinkSnapshot;
 use std::num::NonZeroU32;
