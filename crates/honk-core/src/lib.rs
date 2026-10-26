@@ -1024,12 +1024,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "ebpf")]
     if !mock_mode
         && detect_default_interface().is_none()
-        && config
-            .global
-            .lan_interface
-            .iter()
-            .chain(&config.global.wan_interface)
-            .any(|name| honk_config::config::is_auto_interface(name))
+        && ebpf::interface::any_auto(&config.global.lan_interface, &config.global.wan_interface)
     {
         warn!(
             "default route unavailable; auto interface binding is pending until a network route appears"

@@ -377,10 +377,7 @@ impl Watch {
                 config.global.wan_interface.clone(),
             )
         };
-        let any_auto = lan
-            .iter()
-            .chain(&wan)
-            .any(|name| honk_config::config::is_auto_interface(name));
+        let any_auto = interface::any_auto(&lan, &wan);
         let mut changed = false;
         let mut failed = Vec::new();
         // A device that changed under the apply is retried once; the ticker

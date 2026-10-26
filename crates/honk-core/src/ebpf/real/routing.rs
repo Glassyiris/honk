@@ -683,10 +683,7 @@ impl RealEbpfBackend {
         if self.bindings.programs().is_empty() {
             self.bindings = bindings::InterfaceBindings::preload(self.bpf_mut().unwrap()).unwrap();
         }
-        let any_auto = lan
-            .iter()
-            .chain(&wan)
-            .any(|name| honk_config::config::is_auto_interface(name));
+        let any_auto = crate::ebpf::interface::any_auto(&lan, &wan);
         let topology = crate::ebpf::interface::read_topology(any_auto).unwrap();
         let plan = crate::ebpf::interface::plan(&lan, &wan, &topology).unwrap();
         let report = self.bind_interfaces(&plan, &topology);

@@ -224,13 +224,16 @@ pub(crate) fn read_topology(need_default_route: bool) -> anyhow::Result<Topology
     })
 }
 
+pub(crate) fn any_auto(lan: &[String], wan: &[String]) -> bool {
+    lan.iter().chain(wan).any(|name| is_auto_interface(name))
+}
+
 /// Startup: one topology read and the plan derived from it.
 pub(crate) fn read_and_plan(
     lan: &[String],
     wan: &[String],
 ) -> anyhow::Result<(Topology, InterfacePlan)> {
-    let any_auto = lan.iter().chain(wan).any(|name| is_auto_interface(name));
-    let topology = read_topology(any_auto)?;
+    let topology = read_topology(any_auto(lan, wan))?;
     let plan = plan(lan, wan, &topology)?;
     Ok((topology, plan))
 }
