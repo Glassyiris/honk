@@ -440,6 +440,11 @@ async fn with_datapath(scenario: Scenario, dae0: &daens::Dae0Setup) -> anyhow::R
         crate::ebpf::interface::read_topology,
     )
     .await?;
+    ensure!(
+        degradations.snapshot().is_empty(),
+        "interface binding degraded: {:?}",
+        degradations.snapshot()
+    );
     backend.attach_dae0_programs()?;
     daens::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
     backend.attach_sk_lookup()?;
