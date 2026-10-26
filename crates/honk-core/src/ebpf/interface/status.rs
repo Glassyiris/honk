@@ -282,8 +282,8 @@ pub(crate) struct SysctlTracker {
 }
 
 impl SysctlTracker {
-    /// The writes owed now for devices in `topology`: `accept_ra=2` for every
-    /// WAN-role root, `rp_filter=0` for the first resolved LAN name that exists.
+    /// The writes owed now: `accept_ra=2` for every WAN-role root and
+    /// `rp_filter=0` for the first existing, bindable resolved LAN name.
     pub(crate) fn claim(
         &mut self,
         plan: &InterfacePlan,
@@ -296,6 +296,13 @@ impl SysctlTracker {
         let lan = plan
             .lan
             .iter()
+            .filter(|name| {
+                plan.bound.iter().any(|(entry, _)| {
+                    entry == *name
+                        || (honk_config::config::is_auto_interface(entry)
+                            && topology.default_route.as_ref() == Some(*name))
+                })
+            })
             .find_map(|name| topology.links.iter().find(|link| &link.name == name))
             .map(|link| (link.ifindex, link.name.clone()));
         for ((key, ifindex), first) in &mut self.attempted {
@@ -716,6 +723,23 @@ mod tests {
         assert_eq!(tracker.due(), Some(moved + SYSCTL_REASSERT_AFTER));
         assert_eq!(tracker.claim(&plan, &topology, moved + SYSCTL_REASSERT_AFTER).len(), 2);
         assert_eq!(tracker.due(), None);
+    }
+
+    #[test]
+    fn rp_filter_skips_refused_lan_entries_including_auto() {
+        let topology = Topology {
+            links: vec![link(1, "lo").with_arphrd(libc::ARPHRD_LOOPBACK), link(2, "eth1")],
+            default_route: Some("lo".into()),
+        };
+        for first in ["lo", "auto"] {
+            let plan = plan_of(&[first, "eth1"], &[], &topology);
+            let mut tracker = SysctlTracker::default();
+            assert_eq!(
+                write_names(&tracker.claim(&plan, &topology, tokio::time::Instant::now())),
+                [(SysctlKey::RpFilter, "eth1", false)],
+                "{first}"
+            );
+        }
     }
 
     fn plan_of(lan: &[&str], wan: &[&str], topology: &Topology) -> InterfacePlan {
