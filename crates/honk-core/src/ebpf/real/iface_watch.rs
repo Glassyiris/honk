@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 use super::interface_startup::InterfaceHandoff;
 use super::interface_state::{self, InterfaceState, SysctlWrite};
 use crate::ebpf::EbpfBackend;
-use crate::ebpf::interface::status::{self, BindFailure, Step};
+use crate::ebpf::interface::status::{self, BindFailure, ReconcileStep};
 use crate::ebpf::interface::{self, ApplyReport, BindingSnapshot, InterfacePlan, Topology};
 use crate::netlink::{RTM_DELLINK, RTM_NEWLINK};
 
@@ -414,7 +414,7 @@ impl Watch {
     }
 
     /// A stage failed as a whole: log its episode and keep what is bound.
-    fn step_failed(&mut self, step: Step, error: anyhow::Error) -> anyhow::Error {
+    fn step_failed(&mut self, step: ReconcileStep, error: anyhow::Error) -> anyhow::Error {
         self.state.step_failed(step, &error);
         error
     }
@@ -446,8 +446,8 @@ impl Watch {
             .await;
             let (topology, plan) = match planned {
                 Ok(Ok(planned)) => planned,
-                Ok(Err(error)) => return Err(self.step_failed(Step::Topology, error)),
-                Err(error) => return Err(self.step_failed(Step::Join, error.into())),
+                Ok(Err(error)) => return Err(self.step_failed(ReconcileStep::Topology, error)),
+                Err(error) => return Err(self.step_failed(ReconcileStep::Join, error.into())),
             };
 
             // On sight: the device is in the dump, whether or not it binds.
@@ -457,14 +457,14 @@ impl Watch {
                 if let Err(error) =
                     tokio::task::spawn_blocking(move || interface_state::perform(&owed, &*write)).await
                 {
-                    return Err(self.step_failed(Step::Join, error.into()));
+                    return Err(self.step_failed(ReconcileStep::Join, error.into()));
                 }
             }
 
             let snapshot = self.ebpf.read().await.interface_binding_snapshot();
             let snapshot = match snapshot {
                 Ok(snapshot) => snapshot,
-                Err(error) => return Err(self.step_failed(Step::Snapshot, error)),
+                Err(error) => return Err(self.step_failed(ReconcileStep::Snapshot, error)),
             };
             let held: Vec<_> = snapshot
                 .owned
@@ -492,7 +492,7 @@ impl Watch {
             .await;
             let (report, plan) = match applied {
                 Ok(applied) => applied,
-                Err(error) => return Err(self.step_failed(Step::Join, error.into())),
+                Err(error) => return Err(self.step_failed(ReconcileStep::Join, error.into())),
             };
             let ApplyReport {
                 commit,
@@ -522,7 +522,7 @@ impl Watch {
                 let closed = self.ebpf.write().await.commit_interface_bindings(commit);
                 // The last close of a link takes the rtnl lock.
                 if let Err(error) = tokio::task::spawn_blocking(move || drop(closed)).await {
-                    return Err(self.step_failed(Step::Join, error.into()));
+                    return Err(self.step_failed(ReconcileStep::Join, error.into()));
                 }
             }
             let mut failures: Vec<BindFailure> = failed

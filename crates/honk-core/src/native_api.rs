@@ -762,7 +762,7 @@ mod tests {
         state.observation.attach_for_test();
         crate::ebpf::interface::status::publish(
             &state.observation.degradations,
-            Some("unsupported_type"),
+            Some(crate::ebpf::interface::status::EntryState::Unsupported),
         );
         let body = runtime_body(&state).await;
         let entry = &body["degradations"][0];

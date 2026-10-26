@@ -481,7 +481,7 @@ async fn a_failed_stage_leaves_the_degradation_and_bindings_alone() {
 
 #[tokio::test]
 async fn a_failed_retry_keeps_the_committed_rounds_degradation() {
-    for failing_step in [Step::Topology, Step::Join] {
+    for failing_step in [ReconcileStep::Topology, ReconcileStep::Join] {
         let f = fixture(&["eth0"], &[]);
         f.stub.fail_egress.store(true, Ordering::SeqCst);
         f.stub.moving.store(true, Ordering::SeqCst);
@@ -492,9 +492,9 @@ async fn a_failed_retry_keeps_the_committed_rounds_degradation() {
                 return Ok(topology());
             }
             match failing_step {
-                Step::Topology => anyhow::bail!("retry dump failed"),
-                Step::Join => panic!("retry task panicked"),
-                Step::Snapshot => unreachable!(),
+                ReconcileStep::Topology => anyhow::bail!("retry dump failed"),
+                ReconcileStep::Join => panic!("retry task panicked"),
+                ReconcileStep::Snapshot => unreachable!(),
             }
         });
 

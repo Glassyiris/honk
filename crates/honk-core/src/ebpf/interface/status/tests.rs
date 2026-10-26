@@ -59,12 +59,16 @@
         };
         assert_eq!(reason(&[]), None);
         assert_eq!(reason(&[Bound, Bound]), None);
-        assert_eq!(reason(&[Bound, Pending]), Some("pending"));
-        assert_eq!(reason(&[Pending, Unsupported]), Some("unsupported_type"));
+        assert_eq!(reason(&[Bound, Pending]), Some(Pending));
+        assert_eq!(reason(&[Pending, Unsupported]), Some(Unsupported));
         assert_eq!(
             reason(&[Unsupported, Pending, AttachFailed, Bound]),
-            Some("attach_failed")
+            Some(AttachFailed)
         );
+        assert_eq!(interface_issue(Bound), None);
+        for (state, reason) in [(Pending, "pending"), (Unsupported, "unsupported_type"), (AttachFailed, "attach_failed")] {
+            assert_eq!(interface_issue(state).unwrap().reason, reason);
+        }
     }
 
     #[test]
@@ -181,12 +185,12 @@
     #[test]
     fn a_failing_step_warns_once_and_recovers_once() {
         let mut steps = StepEpisode::default();
-        assert_eq!(steps.failed(Step::Snapshot), StepTransition::Begins);
-        assert_eq!(steps.failed(Step::Snapshot), StepTransition::Continues);
-        assert_eq!(steps.failed(Step::Topology), StepTransition::Begins);
-        assert_eq!(steps.recovered(), Some(Step::Topology));
+        assert_eq!(steps.failed(ReconcileStep::Snapshot), StepTransition::Begins);
+        assert_eq!(steps.failed(ReconcileStep::Snapshot), StepTransition::Continues);
+        assert_eq!(steps.failed(ReconcileStep::Topology), StepTransition::Begins);
+        assert_eq!(steps.recovered(), Some(ReconcileStep::Topology));
         assert_eq!(steps.recovered(), None);
-        assert_eq!(steps.failed(Step::Topology), StepTransition::Begins);
+        assert_eq!(steps.failed(ReconcileStep::Topology), StepTransition::Begins);
     }
     #[test]
     fn owned_after_applies_removals_and_additions() {

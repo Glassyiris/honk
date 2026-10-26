@@ -10,15 +10,15 @@ use crate::degradations::{Component, Degradations, Issue};
 
 type Key = (NonZeroU32, Direction);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum EntryState {
     Bound,
     /// Absent, or `auto` without a default route: appears later on its own.
     Pending,
-    /// TCX create/update/verification failed; retried.
-    AttachFailed,
     /// Refused (type, vrf root, honk's own link): fixed by changing the configuration.
     Unsupported,
+    /// TCX create/update/verification failed; retried.
+    AttachFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,30 +104,31 @@ pub(crate) fn entry_states(
 
 /// The `interface_binding` reason: `attach_failed` > `unsupported_type` >
 /// `pending`; `None` when every configured entry is bound.
-pub(crate) fn degradation_reason(entries: &[Entry]) -> Option<&'static str> {
-    let has = |state| entries.iter().any(|entry| entry.state == state);
-    if has(EntryState::AttachFailed) {
-        Some("attach_failed")
-    } else if has(EntryState::Unsupported) {
-        Some("unsupported_type")
-    } else if has(EntryState::Pending) {
-        Some("pending")
-    } else {
-        None
-    }
+pub(crate) fn degradation_reason(entries: &[Entry]) -> Option<EntryState> {
+    entries
+        .iter()
+        .map(|entry| entry.state)
+        .filter(|state| *state != EntryState::Bound)
+        .max()
 }
 
-fn interface_issue(reason: &'static str) -> Issue {
-    Issue {
+fn interface_issue(state: EntryState) -> Option<Issue> {
+    let reason = match state {
+        EntryState::Bound => return None,
+        EntryState::Pending => "pending",
+        EntryState::Unsupported => "unsupported_type",
+        EntryState::AttachFailed => "attach_failed",
+    };
+    Some(Issue {
         code: "interface_binding_incomplete",
         message: "A configured network interface is not bound; its traffic is not intercepted until it is.",
         reason,
-    }
+    })
 }
 
-pub(crate) fn publish(degradations: &Degradations, reason: Option<&'static str>) {
-    match reason {
-        Some(reason) => degradations.set(Component::InterfaceBinding, interface_issue(reason)),
+pub(crate) fn publish(degradations: &Degradations, state: Option<EntryState>) {
+    match state.and_then(interface_issue) {
+        Some(issue) => degradations.set(Component::InterfaceBinding, issue),
         None => degradations.clear(Component::InterfaceBinding),
     }
 }
@@ -198,13 +199,13 @@ pub(crate) fn log_entry(entry: &Entry, transition: Transition) {
 /// The blocking stage of a reconcile that failed as a whole, which leaves the
 /// existing bindings (and the degradation) as they were.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Step {
+pub(crate) enum ReconcileStep {
     Topology,
     Snapshot,
     Join,
 }
 
-impl Step {
+impl ReconcileStep {
     pub(crate) fn what(self) -> &'static str {
         match self {
             Self::Topology => "read the network topology",
@@ -223,11 +224,11 @@ pub(crate) enum StepTransition {
 /// WARN once per failing step, DEBUG while it persists, INFO on recovery.
 #[derive(Debug, Default)]
 pub(crate) struct StepEpisode {
-    step: Option<Step>,
+    step: Option<ReconcileStep>,
 }
 
 impl StepEpisode {
-    pub(crate) fn failed(&mut self, step: Step) -> StepTransition {
+    pub(crate) fn failed(&mut self, step: ReconcileStep) -> StepTransition {
         if self.step.replace(step) == Some(step) {
             StepTransition::Continues
         } else {
@@ -235,7 +236,7 @@ impl StepEpisode {
         }
     }
 
-    pub(crate) fn recovered(&mut self) -> Option<Step> {
+    pub(crate) fn recovered(&mut self) -> Option<ReconcileStep> {
         self.step.take()
     }
 }

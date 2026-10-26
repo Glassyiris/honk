@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 
 use crate::degradations::Degradations;
 use crate::ebpf::interface::status::{
-    BindFailure, Episodes, Step, StepEpisode, StepTransition, degradation_reason, entry_states,
+    BindFailure, Episodes, ReconcileStep, StepEpisode, StepTransition, degradation_reason, entry_states,
     log_entry, publish,
 };
 use crate::ebpf::interface::{Direction, InterfacePlan, Topology};
@@ -172,7 +172,7 @@ impl InterfaceState {
     }
 
     /// A stage of the reconcile failed: bindings and degradation stay as they were.
-    pub(crate) fn step_failed(&mut self, step: Step, error: &anyhow::Error) {
+    pub(crate) fn step_failed(&mut self, step: ReconcileStep, error: &anyhow::Error) {
         match self.steps.failed(step) {
             StepTransition::Begins => {
                 warn!("failed to {}: {error:#}; retrying", step.what())

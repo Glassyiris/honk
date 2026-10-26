@@ -11,7 +11,7 @@ use std::path::Path;
 use super::RealEbpfBackend;
 use super::interface_state::{self, InterfaceState};
 use crate::degradations::Degradations;
-use crate::ebpf::interface::status::{BindFailure, Step};
+use crate::ebpf::interface::status::{BindFailure, ReconcileStep};
 use crate::ebpf::interface::{self, InterfacePlan, Topology};
 
 /// What startup hands the watcher: the subscription opened before the first
@@ -53,7 +53,7 @@ pub(crate) async fn start_interfaces(
                 write_sysctls(&mut state, &plan, &topology);
                 report = backend.bind_interfaces(&plan, &topology);
             }
-            Err(error) => state.step_failed(Step::Topology, &error),
+            Err(error) => state.step_failed(ReconcileStep::Topology, &error),
         }
     }
     let owned: Vec<_> = backend
