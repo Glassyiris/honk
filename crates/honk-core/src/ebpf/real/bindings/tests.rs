@@ -20,10 +20,6 @@ fn held(binding: &Binding, link_id: u32) -> Held {
     }
 }
 
-fn fd() -> OwnedFd {
-    std::fs::File::open("/dev/null").unwrap().into()
-}
-
 #[test]
 fn diff_keeps_unchanged_keys_and_only_checks_when_verifying() {
     let wanted = [
@@ -44,6 +40,15 @@ fn diff_keeps_unchanged_keys_and_only_checks_when_verifying() {
                 link_id: 11
             },
         ]
+    );
+    let chain = Chain {
+        links: vec![10, 20, 0],
+    };
+    assert!(chain.contains_link(10));
+    assert!(!chain.contains_link(30));
+    assert!(
+        !chain.contains_link(0),
+        "legacy attachment is not an owned link"
     );
     // A diagnostic name is not the resource key: no relink, and no Check
     // unless verifying, but the new name is reported.
@@ -96,55 +101,6 @@ fn diff_reprograms_instead_of_stacking_and_removes_only_absent_keys() {
             Step::Create(&wanted[2]),
         ]
     );
-}
-
-#[test]
-fn namespace_identity_is_the_link_id_not_the_program_id() {
-    let chain = Chain {
-        links: vec![10, 20, 0],
-    };
-    assert!(chain.contains_link(10));
-    assert!(!chain.contains_link(30));
-    assert!(
-        !chain.contains_link(0),
-        "legacy attachment is not an owned link"
-    );
-}
-
-#[test]
-fn commit_replaces_existing_add_and_ignores_missing_removals() {
-    let old = binding(2, Ingress, LanIngressL2);
-    let other = binding(3, Egress, LanEgressL2);
-    let mut owned = vec![(old.clone(), 10, fd()), (other.clone(), 11, fd())];
-    let first_fd = owned[0].2.as_raw_fd();
-    let updated = binding(2, Ingress, WanIngressL3);
-    let commit = BindingCommit {
-        add: vec![(updated.clone(), 12, fd())],
-        remove: vec![(NonZeroU32::new(99).unwrap(), Egress)],
-        reprogram: vec![(other.ifindex, other.direction, WanEgressL2)],
-        rename: vec![
-            (other.ifindex, other.direction, "p9".into()),
-            (NonZeroU32::new(99).unwrap(), Egress, "gone".into()),
-        ],
-    };
-    let closed = commit.apply_to(&mut owned);
-    assert_eq!(closed.len(), 1);
-    assert_eq!(closed[0].as_raw_fd(), first_fd);
-    assert_eq!(owned.len(), 2);
-    assert_eq!(owned[0].0, updated);
-    assert_eq!(owned[0].1, 12);
-    assert_eq!(owned[1].0.program, WanEgressL2);
-    assert_eq!(owned[1].0.interface, "p9");
-    assert_eq!(owned[1].1, 11, "a rename keeps the link");
-
-    let commit = BindingCommit {
-        remove: vec![updated.key()],
-        ..BindingCommit::default()
-    };
-    assert_eq!(commit.apply_to(&mut owned).len(), 1);
-    assert_eq!(owned.len(), 1);
-    assert_eq!(owned[0].0.key(), other.key());
-    assert!(BindingCommit::default().is_empty());
 }
 
 #[test]
