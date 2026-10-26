@@ -41,7 +41,7 @@ for real_test in \
   ebpf::real::tests::bindings::failure::rename_after_planning_is_not_confirmed_and_update_rolls_back \
   ebpf::real::tests::bindings::failure::device_deleted_before_attach_is_a_topology_change_not_an_attach_failure \
   ebpf::real::tests::bindings::lazy::absent_interfaces_start_pending_then_bind_release_and_rebind \
-  ebpf::real::tests::bindings::lazy::startup_plan_failure_stays_pending_until_a_successful_plan \
+  ebpf::real::tests::bindings::lazy::startup_refuses_nested_entry_while_binding_the_ordinary_lan \
   ebpf::real::tests::bindings::lazy::only_one_interface_missing_binds_the_down_one_at_startup \
   ebpf::real::tests::bindings::lazy::startup_attach_failure_degrades_and_recovers_without_stacking \
   ebpf::real::tests::bindings::lazy::bridge_member_leaving_releases_master_links_and_a_recreated_bridge_rebinds \
