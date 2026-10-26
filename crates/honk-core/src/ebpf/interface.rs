@@ -16,13 +16,12 @@ use std::io;
 use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use honk_config::config::{default_route_interface_from, is_auto_interface};
 
 use crate::netlink::{LinkSnapshot, NlSock};
 
 pub(crate) mod status;
-use status::{Step, StepError};
 
 const DUMP_ATTEMPTS: usize = 3;
 
@@ -110,6 +109,7 @@ pub(crate) enum UnboundReason {
 pub(crate) enum RefusedReason {
     /// The canonical root has no framing the programs can parse.
     UnsupportedType { arphrd: u16 },
+    UnsupportedNesting,
     /// A `vrf` device: members see the traffic, never the VRF itself.
     VrfRoot,
     /// `dae0` / `dae0peer`.
@@ -120,6 +120,7 @@ impl std::fmt::Display for RefusedReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedType { arphrd } => write!(f, "unsupported link type {arphrd}"),
+            Self::UnsupportedNesting => f.write_str("unsupported bond/bridge nesting or self-master"),
             Self::VrfRoot => f.write_str("a vrf device (configure a member instead)"),
             Self::OwnedLink => f.write_str("a link honk owns"),
         }
@@ -183,7 +184,7 @@ pub(crate) struct Topology {
     pub default_route: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterfacePlan {
     /// Unique `(ifindex, direction)`, sorted by that key.
     pub bindings: Vec<Binding>,
@@ -300,30 +301,13 @@ pub(crate) fn any_auto(lan: &[String], wan: &[String]) -> bool {
     lan.iter().chain(wan).any(|name| is_auto_interface(name))
 }
 
-/// One topology read through `read` and the plan derived from it; the error
-/// says which of the two stages failed.
-pub(crate) fn read_and_plan_with(
-    read: impl FnOnce(bool) -> anyhow::Result<Topology>,
-    lan: &[String],
-    wan: &[String],
-) -> Result<(Topology, InterfacePlan), StepError> {
-    let topology = read(any_auto(lan, wan)).map_err(|error| StepError {
-        step: Step::Topology,
-        error,
-    })?;
-    let plan = plan(lan, wan, &topology).map_err(|error| StepError {
-        step: Step::Plan,
-        error,
-    })?;
-    Ok((topology, plan))
-}
-
-/// [`read_and_plan_with`] over the live topology.
 pub(crate) fn read_and_plan(
     lan: &[String],
     wan: &[String],
 ) -> anyhow::Result<(Topology, InterfacePlan)> {
-    read_and_plan_with(read_topology, lan, wan).map_err(|failed| failed.error)
+    let topology = read_topology(any_auto(lan, wan))?;
+    let plan = plan(lan, wan, &topology);
+    Ok((topology, plan))
 }
 
 fn retry_interrupted<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
@@ -371,12 +355,12 @@ fn is_bond_or_bridge(link: &LinkSnapshot) -> bool {
 fn canonical_root<'a>(
     index: &Index<'a>,
     link: &'a LinkSnapshot,
-) -> anyhow::Result<&'a LinkSnapshot> {
+) -> Result<&'a LinkSnapshot, RefusedReason> {
     let Some(master) = index.master(link) else {
         return Ok(link);
     };
     if master.ifindex == link.ifindex {
-        bail!("interface '{}' is its own master", link.name);
+        return Err(RefusedReason::UnsupportedNesting);
     }
     match master.kind.as_deref() {
         Some("vrf" | "openvswitch") => Ok(link),
@@ -387,22 +371,11 @@ fn canonical_root<'a>(
             match (kind, upper.kind.as_deref()) {
                 ("bond", Some("bridge")) => {
                     if index.master(upper).is_some_and(is_bond_or_bridge) {
-                        bail!(
-                            "interface '{}' nests more than two bond/bridge levels ({} -> {} -> {})",
-                            link.name,
-                            master.name,
-                            upper.name,
-                            index.master(upper).map_or("?", |top| top.name.as_str())
-                        );
+                        return Err(RefusedReason::UnsupportedNesting);
                     }
                     Ok(upper)
                 }
-                (_, Some("bond" | "bridge")) => bail!(
-                    "interface '{}' has unsupported bond/bridge nesting ({} -> {})",
-                    link.name,
-                    master.name,
-                    upper.name
-                ),
+                (_, Some("bond" | "bridge")) => Err(RefusedReason::UnsupportedNesting),
                 _ => Ok(master),
             }
         }
@@ -459,7 +432,7 @@ fn mark_roots<'a>(
     lan: bool,
     roots: &mut Vec<Root<'a>>,
     unbound: &mut Vec<(String, UnboundReason)>,
-) -> anyhow::Result<Vec<Option<NonZeroU32>>> {
+) -> Vec<Option<NonZeroU32>> {
     let mut ids = Vec::with_capacity(names.len());
     for (name, entry) in names {
         // honk's own links are refused by configured name (`dae0peer` is in daens).
@@ -475,7 +448,14 @@ fn mark_roots<'a>(
             ids.push(None);
             continue;
         };
-        let root = canonical_root(index, link)?;
+        let root = match canonical_root(index, link) {
+            Ok(root) => root,
+            Err(reason) => {
+                note_unbound(unbound, entry, UnboundReason::Refused(reason));
+                ids.push(None);
+                continue;
+            }
+        };
         if let Some(reason) = refusal(root) {
             note_unbound(unbound, entry, UnboundReason::Refused(reason));
             ids.push(None);
@@ -500,7 +480,7 @@ fn mark_roots<'a>(
         }
         ids.push(Some(root.ifindex));
     }
-    Ok(ids)
+    ids
 }
 
 fn bind(
@@ -540,15 +520,15 @@ pub(crate) fn plan(
     lan: &[String],
     wan: &[String],
     topology: &Topology,
-) -> anyhow::Result<InterfacePlan> {
+) -> InterfacePlan {
     let index = Index::new(&topology.links);
     let mut unbound = Vec::new();
     let lan_names = resolve(lan, topology.default_route.as_deref(), &mut unbound);
     let wan_names = resolve(wan, topology.default_route.as_deref(), &mut unbound);
 
     let mut roots: Vec<Root> = Vec::new();
-    let lan_ids = mark_roots(&index, &lan_names, true, &mut roots, &mut unbound)?;
-    let wan_ids = mark_roots(&index, &wan_names, false, &mut roots, &mut unbound)?;
+    let lan_ids = mark_roots(&index, &lan_names, true, &mut roots, &mut unbound);
+    let wan_ids = mark_roots(&index, &wan_names, false, &mut roots, &mut unbound);
 
     // Roots first: a root's own role binding wins over any expansion.
     let mut bindings = BTreeMap::new();
@@ -614,7 +594,7 @@ pub(crate) fn plan(
         .map(|id| (id, root_named(id)))
         .collect();
 
-    Ok(InterfacePlan {
+    InterfacePlan {
         bindings: bindings.into_values().collect(),
         unbound,
         lan: lan_list,
@@ -622,7 +602,7 @@ pub(crate) fn plan(
         lan_roots,
         wan_roots,
         bound,
-    })
+    }
 }
 
 /// The canonical root the binding uses: first LAN root, else first WAN root

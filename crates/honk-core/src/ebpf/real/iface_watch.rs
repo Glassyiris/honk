@@ -23,9 +23,7 @@ use tracing::{debug, info, warn};
 
 use super::interface_startup::InterfaceHandoff;
 use crate::ebpf::EbpfBackend;
-use crate::ebpf::interface::status::{
-    self, BindFailure, InterfaceState, Step, StepError, SysctlWrite,
-};
+use crate::ebpf::interface::status::{self, BindFailure, InterfaceState, Step, SysctlWrite};
 use crate::ebpf::interface::{self, ApplyReport, BindingSnapshot, InterfacePlan, Topology};
 use crate::netlink::{RTM_DELLINK, RTM_NEWLINK};
 
@@ -440,12 +438,14 @@ impl Watch {
             let read = Arc::clone(&self.reconciler.read_topology);
             let (lan, wan) = (lan.clone(), wan.clone());
             let planned = tokio::task::spawn_blocking(move || {
-                interface::read_and_plan_with(|any_auto| read(any_auto), &lan, &wan)
+                let topology = read(interface::any_auto(&lan, &wan))?;
+                let plan = interface::plan(&lan, &wan, &topology);
+                Ok::<_, anyhow::Error>((topology, plan))
             })
             .await;
             let (topology, plan) = match planned {
                 Ok(Ok(planned)) => planned,
-                Ok(Err(StepError { step, error })) => return Err(self.step_failed(step, error)),
+                Ok(Err(error)) => return Err(self.step_failed(Step::Topology, error)),
                 Err(error) => return Err(self.step_failed(Step::Join, error.into())),
             };
 

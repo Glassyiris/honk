@@ -83,7 +83,7 @@ fn topology(groups: &[Vec<LinkSnapshot>]) -> Topology {
 }
 
 fn run(lan: &[&str], wan: &[&str], groups: &[Vec<LinkSnapshot>]) -> InterfacePlan {
-    plan(&strings(lan), &strings(wan), &topology(groups)).unwrap()
+    plan(&strings(lan), &strings(wan), &topology(groups))
 }
 
 /// `"<ifindex> in|eg <program>"`, in plan order.
@@ -388,12 +388,9 @@ fn unresolved_auto_is_pending_without_dropping_explicit_entries() {
 fn resolved_auto_follows_default_route_and_dedups() {
     let mut topo = topology(&[base()]);
     topo.default_route = Some("ens3".into());
-    let plan = plan(
-        &strings(&["auto", "ens3", "eth1"]),
-        &strings(&[" Auto "]),
-        &topo,
-    )
-    .unwrap();
+    let plan = plan(&strings(&["auto", "ens3", "eth1"]),
+    &strings(&[" Auto "]),
+    &topo,);
     assert_eq!(plan.lan, ["ens3", "eth1"]);
     assert_eq!(plan.wan, ["ens3"]);
     assert!(plan.unbound.is_empty());
@@ -415,7 +412,7 @@ fn resolved_auto_follows_default_route_and_dedups() {
 }
 
 fn plan_for(lan: &[&str], wan: &[&str], topology: &Topology) -> InterfacePlan {
-    plan(&strings(lan), &strings(wan), topology).unwrap()
+    plan(&strings(lan), &strings(wan), topology)
 }
 
 #[test]
@@ -443,7 +440,7 @@ fn bound_entries_cover_roots_ports_and_members() {
     assert_eq!(bound(&plan, "bond0"), ids(&[20, 21, 22]));
 }
 #[test]
-fn unsupported_nesting_is_an_error() {
+fn unsupported_nesting_refuses_only_the_affected_entry() {
     // bridge enslaved to a bond, bond enslaved to a bridge: loop.
     let looped = vec![
         link(10, "br0").kind("bridge").master(20),
@@ -451,15 +448,17 @@ fn unsupported_nesting_is_an_error() {
         link(21, "m1").master(20),
     ];
     for name in ["br0", "bond0", "m1"] {
-        assert!(
-            plan(
-                &strings(&[name]),
-                &[],
-                &topology(std::slice::from_ref(&looped)),
-            )
-            .is_err(),
+        let plan = plan(
+            &strings(&[name]),
+            &[],
+            &topology(std::slice::from_ref(&looped)),
+        );
+        assert_eq!(
+            plan.unbound,
+            [(name.into(), UnboundReason::Refused(RefusedReason::UnsupportedNesting))],
             "{name}"
         );
+        assert!(plan.bindings.is_empty());
     }
     // bridge under bridge, bond under bond, three levels, own master.
     let cases: Vec<Vec<LinkSnapshot>> = vec![
@@ -490,14 +489,16 @@ fn unsupported_nesting_is_an_error() {
             &[],
             &topology(std::slice::from_ref(links)),
         );
-        assert!(
-            result.is_err(),
-            "case {index}: {:?}",
-            result.map(|p| set(&p))
+        assert_eq!(
+            result.unbound,
+            [("c".into(), UnboundReason::Refused(RefusedReason::UnsupportedNesting))],
+            "case {index}"
         );
+        assert!(result.bindings.is_empty());
     }
-    // An error anywhere fails the whole plan, even for an otherwise valid entry.
-    assert!(plan(&strings(&["ens3", "m1"]), &[], &topology(&[base(), looped])).is_err());
+    let plan = plan(&strings(&["ens3", "m1"]), &[], &topology(&[base(), looped]));
+    assert_eq!(set(&plan), ["2 in lan_ingress_l2", "2 eg lan_egress_l2"]);
+    assert_eq!(plan.unbound, [("m1".into(), UnboundReason::Refused(RefusedReason::UnsupportedNesting))]);
 }
 
 #[test]

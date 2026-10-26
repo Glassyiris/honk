@@ -204,7 +204,6 @@ fn log_entry(entry: &Entry, transition: Transition) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     Topology,
-    Plan,
     Snapshot,
     Join,
 }
@@ -213,17 +212,10 @@ impl Step {
     fn what(self) -> &'static str {
         match self {
             Self::Topology => "read the network topology",
-            Self::Plan => "plan interface bindings",
             Self::Snapshot => "snapshot interface bindings",
             Self::Join => "run the interface reconcile task",
         }
     }
-}
-
-#[derive(Debug)]
-pub(crate) struct StepError {
-    pub step: Step,
-    pub error: anyhow::Error,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,7 +451,7 @@ mod tests {
             links,
             default_route: None,
         };
-        plan(&owned(lan), &owned(wan), &topology).unwrap()
+        plan(&owned(lan), &owned(wan), &topology)
     }
 
     fn keys(plan: &InterfacePlan) -> Vec<Key> {
@@ -619,8 +611,8 @@ mod tests {
     #[test]
     fn a_failing_step_warns_once_and_recovers_once() {
         let mut steps = StepEpisode::default();
-        assert_eq!(steps.failed(Step::Plan), StepTransition::Begins);
-        assert_eq!(steps.failed(Step::Plan), StepTransition::Continues);
+        assert_eq!(steps.failed(Step::Snapshot), StepTransition::Begins);
+        assert_eq!(steps.failed(Step::Snapshot), StepTransition::Continues);
         assert_eq!(steps.failed(Step::Topology), StepTransition::Begins);
         assert_eq!(steps.recovered(), Some(Step::Topology));
         assert_eq!(steps.recovered(), None);
@@ -744,7 +736,7 @@ mod tests {
 
     fn plan_of(lan: &[&str], wan: &[&str], topology: &Topology) -> InterfacePlan {
         let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
-        plan(&owned(lan), &owned(wan), topology).unwrap()
+        plan(&owned(lan), &owned(wan), topology)
     }
 
     #[test]

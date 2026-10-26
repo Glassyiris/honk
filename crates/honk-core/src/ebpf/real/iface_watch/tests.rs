@@ -460,7 +460,7 @@ async fn a_failed_stage_leaves_the_degradation_and_bindings_alone() {
     assert_eq!((reason(), f.owned().await), (pending, held.clone()));
     f.stub.fail_topology.store(false, Ordering::SeqCst);
 
-    // Unsupported nesting: the whole plan is rejected, nothing is half bound.
+    // Unsupported nesting refuses only that entry; the ordinary LAN stays bound.
     let mut a = link(10, "a");
     a.kind = Some("bond".into());
     a.master = NonZeroU32::new(11);
@@ -472,9 +472,8 @@ async fn a_failed_stage_leaves_the_degradation_and_bindings_alone() {
         default_route: None,
     });
     f.set_interfaces(&["eth0", "a"], &[]).await;
-    let error = watch.reconcile(true).await.unwrap_err();
-    assert!(format!("{error:#}").contains("nesting"), "{error:#}");
-    assert_eq!((reason(), f.owned().await), (pending, held));
+    watch.reconcile(true).await.unwrap();
+    assert_eq!((reason(), f.owned().await), (Some("unsupported_type"), held));
     *f.stub.links.lock() = None;
     f.set_interfaces(&["eth0", "gone"], &[]).await;
     watch.reconcile(true).await.unwrap();
@@ -482,7 +481,7 @@ async fn a_failed_stage_leaves_the_degradation_and_bindings_alone() {
 
 #[tokio::test]
 async fn a_failed_retry_keeps_the_committed_rounds_degradation() {
-    for failing_step in [Step::Topology, Step::Plan, Step::Join] {
+    for failing_step in [Step::Topology, Step::Join] {
         let f = fixture(&["eth0"], &[]);
         f.stub.fail_egress.store(true, Ordering::SeqCst);
         f.stub.moving.store(true, Ordering::SeqCst);
@@ -494,11 +493,6 @@ async fn a_failed_retry_keeps_the_committed_rounds_degradation() {
             }
             match failing_step {
                 Step::Topology => anyhow::bail!("retry dump failed"),
-                Step::Plan => {
-                    let mut topology = topology();
-                    topology.links[0].master = Some(topology.links[0].ifindex);
-                    Ok(topology)
-                }
                 Step::Join => panic!("retry task panicked"),
                 Step::Snapshot => unreachable!(),
             }

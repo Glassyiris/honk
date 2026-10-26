@@ -168,14 +168,14 @@ fn keys(kernel: &Kernel) -> Vec<(&str, Direction)> {
 
 #[test]
 #[ignore = "requires root; run via just test-netns"]
-fn startup_plan_failure_stays_pending_until_a_successful_plan() {
+fn startup_refuses_nested_entry_while_binding_the_ordinary_lan() {
     private_netns(|| {
         let rt = runtime();
         down_veth("hbl_lan", "hbl_lanp");
         down_veth("hbl_nested", "hbl_nestedp");
         let mut started = start_with_read(
             &rt,
-            "unplanned",
+            "nested",
             &["hbl_lan", "hbl_nested"],
             &[],
             |need_route| {
@@ -187,8 +187,7 @@ fn startup_plan_failure_stays_pending_until_a_successful_plan() {
                     .unwrap();
                 let mut master = nested.clone();
                 nested.master = std::num::NonZeroU32::new(1_000_000);
-                // Unsupported bond -> bridge -> bridge nesting prevents the
-                // whole startup plan, including the ordinary LAN, from binding.
+                // Inject an unsupported master path while keeping the real LAN topology.
                 for (index, name, kind, upper) in [
                     (1_000_000, "hbl_bond", "bond", Some(1_000_001)),
                     (1_000_001, "hbl_br", "bridge", Some(1_000_002)),
@@ -204,8 +203,9 @@ fn startup_plan_failure_stays_pending_until_a_successful_plan() {
             },
         );
         rt.block_on(async {
-            assert!(kernel_bound(&started).await.is_empty());
-            assert_eq!(started.reason(), Some("pending"));
+            let bound = kernel_bound(&started).await;
+            assert_eq!(keys(&bound), [("hbl_lan", Direction::Ingress), ("hbl_lan", Direction::Egress)]);
+            assert_eq!(started.reason(), Some("unsupported_type"));
         });
         let mut watch = started.watch();
         rt.block_on(async {
