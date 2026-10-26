@@ -102,7 +102,7 @@ deadline; ordinary resolution failures retain the existing default fallback.
 
 An empty `lan_interface` is literal: honk installs no LAN TC hooks and never substitutes `lo`. A WAN-only gateway therefore uses only `wan_interface`; host-originated TCP and UDP that traverse those WAN hooks are still proxied, while no synthetic LAN interception is added.
 
-On an Ethernet parent, frames with a non-zero VLAN ID belong to the VLAN device; list `eth1.20` (or `br0.N` on a VLAN-aware bridge) to manage that subnet. See [Interface hook sets](../design/datapath.md#interface-hook-sets).
+On an Ethernet parent, frames with a non-zero VLAN ID belong to the VLAN device; list `eth1.20` (or `br0.N` on a VLAN-aware bridge) to manage that subnet. The VLAN-aware bridge topology has not been verified by the real-traffic tests. See [Interface hook sets](../design/datapath.md#interface-hook-sets).
 
 `auto` resolves to the interface owning the lowest-metric IPv4 default route. If no such route exists, that entry is omitted from the desired hook set and remains pending. Traffic on the unresolved interface stays fail-open because no hook is attached; explicitly named interfaces in the same list continue to work.
 

@@ -96,7 +96,7 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 
 `lan_interface` 为空时，honk 不安装 LAN TC hook，也绝不会用 `lo` 替代。WAN-only 网关因此只使用 `wan_interface`；经过这些 WAN hook 的本机 TCP/UDP 流量仍会被代理，但不会额外安装 LAN 拦截。
 
-在以太网父设备上，VID 非零的 VLAN 标签帧属于 VLAN 设备；要管理该子网，请列出 `eth1.20`（VLAN-aware bridge 请列出 `br0.N`）。参见[接口挂钩集合](../design/datapath.md#接口挂钩集合)。
+在以太网父设备上，VID 非零的 VLAN 标签帧属于 VLAN 设备；要管理该子网，请列出 `eth1.20`（VLAN-aware bridge 请列出 `br0.N`）。VLAN-aware bridge 拓扑尚未经过真实流量测试验证。参见[接口挂钩集合](../design/datapath.md#接口挂钩集合)。
 
 `auto` 解析为拥有 metric 最低 IPv4 默认路由的网卡。如果不存在该路由，此项会从期望 hook 集合中省略并保持待定。由于没有挂载 hook，未解析网卡上的流量保持 fail-open；同一列表中显式命名的网卡继续工作。
 
