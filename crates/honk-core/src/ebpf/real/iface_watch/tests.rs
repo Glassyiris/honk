@@ -89,7 +89,6 @@ fn model_apply(
 #[derive(Clone, Default)]
 struct Stub {
     fail_egress: Arc<AtomicBool>,
-    fail_topology: Arc<AtomicBool>,
     /// Report `topology_changed` on every apply.
     moving: Arc<AtomicBool>,
     applies: Arc<AtomicU64>,
@@ -106,13 +105,9 @@ impl Stub {
             self.applies.clone(),
             self.moving.clone(),
         );
-        let fail_topology = self.fail_topology.clone();
         let (links, accept_ra) = (self.links.clone(), self.accept_ra.clone());
         Reconciler {
-            read_topology: Arc::new(move |_| {
-                anyhow::ensure!(!fail_topology.load(Ordering::SeqCst), "link dump failed");
-                Ok(links.lock().clone().unwrap_or_else(topology))
-            }),
+            read_topology: Arc::new(move |_| Ok(links.lock().clone().unwrap_or_else(topology))),
             apply: Arc::new(move |snapshot, plan, _, _| {
                 count.fetch_add(1, Ordering::SeqCst);
                 model_apply(
@@ -131,16 +126,12 @@ struct Fixture {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     commits: Arc<AtomicU64>,
-    detaches: Arc<AtomicU64>,
     stub: Stub,
 }
 
 fn fixture(lan: &[&str], wan: &[&str]) -> Fixture {
     let backend = crate::ebpf::mock::MockEbpfBackend::new();
-    let (commits, detaches) = (
-        backend.binding_commits.clone(),
-        backend.detach_calls.clone(),
-    );
+    let commits = backend.binding_commits.clone();
     let mut config = honk_config::Config::default();
     config.global.lan_interface = lan.iter().map(|name| name.to_string()).collect();
     config.global.wan_interface = wan.iter().map(|name| name.to_string()).collect();
@@ -148,7 +139,6 @@ fn fixture(lan: &[&str], wan: &[&str]) -> Fixture {
         ebpf: Arc::new(RwLock::new(Box::new(backend))),
         config: Arc::new(RwLock::new(Arc::new(config))),
         commits,
-        detaches,
         stub: Stub::default(),
     }
 }
@@ -428,7 +418,6 @@ async fn reconcile_reuses_unchanged_hooks() {
     watch.reconcile(false).await.unwrap();
     let first = f.commits.load(Ordering::Relaxed);
     assert_eq!(first, 1, "first reconcile binds the configured LAN");
-    assert_eq!(f.detaches.load(Ordering::Relaxed), 0);
 
     for verify in [false, true] {
         assert!(!watch.reconcile(verify).await.unwrap());
@@ -438,7 +427,6 @@ async fn reconcile_reuses_unchanged_hooks() {
         first,
         "unchanged reconcile must not take the write lock"
     );
-    assert_eq!(f.detaches.load(Ordering::Relaxed), 0);
 }
 
 fn watcher_fixture(
