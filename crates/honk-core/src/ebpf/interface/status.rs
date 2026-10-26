@@ -298,6 +298,15 @@ impl SysctlTracker {
             .iter()
             .find_map(|name| topology.links.iter().find(|link| &link.name == name))
             .map(|link| (link.ifindex, link.name.clone()));
+        for ((key, ifindex), first) in &mut self.attempted {
+            let targeted = match key {
+                SysctlKey::AcceptRa => plan.wan_roots.iter().any(|(root, _)| root == ifindex),
+                SysctlKey::RpFilter => lan.as_ref().is_some_and(|(lan, _)| lan == ifindex),
+            };
+            if !targeted {
+                *first = None;
+            }
+        }
         let targets = plan
             .wan_roots
             .iter()
@@ -679,6 +688,33 @@ mod tests {
         let plan = plan_of(&["br0"], &["wan.100"], &topology);
         assert!(tracker.claim(&plan, &topology, after(62_000)).is_empty());
         assert!(tracker.attempted.is_empty());
+        assert_eq!(tracker.due(), None);
+    }
+
+    #[test]
+    fn moving_sysctl_targets_cancel_the_old_deadlines_while_devices_remain() {
+        let t0 = tokio::time::Instant::now();
+        let mut topology = Topology {
+            links: vec![link(2, "eth1"), link(3, "wan0"), link(4, "wan1")],
+            default_route: Some("wan0".into()),
+        };
+        let mut tracker = SysctlTracker::default();
+        let plan = plan_of(&["br0", "eth1"], &["auto"], &topology);
+        assert_eq!(tracker.claim(&plan, &topology, t0).len(), 2);
+
+        topology.links.push(link(5, "br0"));
+        topology.default_route = Some("wan1".into());
+        let plan = plan_of(&["br0", "eth1"], &["auto"], &topology);
+        let moved = t0 + std::time::Duration::from_millis(500);
+        assert_eq!(
+            write_names(&tracker.claim(&plan, &topology, moved)),
+            [
+                (SysctlKey::AcceptRa, "wan1", false),
+                (SysctlKey::RpFilter, "br0", false),
+            ]
+        );
+        assert_eq!(tracker.due(), Some(moved + SYSCTL_REASSERT_AFTER));
+        assert_eq!(tracker.claim(&plan, &topology, moved + SYSCTL_REASSERT_AFTER).len(), 2);
         assert_eq!(tracker.due(), None);
     }
 
