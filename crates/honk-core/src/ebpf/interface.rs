@@ -90,6 +90,12 @@ pub(crate) struct Binding {
     pub interface: String,
 }
 
+impl Binding {
+    pub(crate) fn key(&self) -> (NonZeroU32, Direction) {
+        (self.ifindex, self.direction)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnboundReason {
     /// No link with that name in the snapshot.
@@ -161,16 +167,15 @@ impl BindingCommit {
     /// caller closes them outside any lock.
     pub(crate) fn apply_to(self, owned: &mut Vec<(Binding, u32, OwnedFd)>) -> Vec<OwnedFd> {
         let mut closed = Vec::new();
-        let key = |b: &Binding| (b.ifindex, b.direction);
         for gone in self.remove {
-            if let Some(at) = owned.iter().position(|(b, ..)| key(b) == gone) {
+            if let Some(at) = owned.iter().position(|(b, ..)| b.key() == gone) {
                 closed.push(owned.swap_remove(at).2);
             }
         }
         for (ifindex, direction, program) in self.reprogram {
             if let Some((b, ..)) = owned
                 .iter_mut()
-                .find(|(b, ..)| (b.ifindex, b.direction) == (ifindex, direction))
+                .find(|(b, ..)| b.key() == (ifindex, direction))
             {
                 b.program = program;
             }
@@ -178,13 +183,13 @@ impl BindingCommit {
         for (ifindex, direction, interface) in self.rename {
             if let Some((b, ..)) = owned
                 .iter_mut()
-                .find(|(b, ..)| key(b) == (ifindex, direction))
+                .find(|(b, ..)| b.key() == (ifindex, direction))
             {
                 b.interface = interface;
             }
         }
         for added in self.add {
-            if let Some(at) = owned.iter().position(|(b, ..)| key(b) == key(&added.0)) {
+            if let Some(at) = owned.iter().position(|(b, ..)| b.key() == added.0.key()) {
                 closed.push(std::mem::replace(&mut owned[at], added).2);
             } else {
                 owned.push(added);

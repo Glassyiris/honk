@@ -13,7 +13,7 @@ fn binding(index: u32, direction: Direction, program: TcProgram) -> Binding {
 
 fn held(binding: &Binding, link_id: u32) -> Held {
     Held {
-        key: key_of(binding),
+        key: binding.key(),
         program: binding.program,
         link_id,
         interface: binding.interface.clone(),
@@ -82,7 +82,7 @@ fn diff_reprograms_instead_of_stacking_and_removes_only_absent_keys() {
     assert_eq!(
         diff(&held, &wanted, false),
         [
-            Step::Remove(key_of(&old[2])),
+            Step::Remove(old[2].key()),
             Step::Reprogram {
                 to: &wanted[0],
                 from: LanIngressL2,
@@ -138,12 +138,12 @@ fn commit_replaces_existing_add_and_ignores_missing_removals() {
     assert_eq!(owned[1].1, 11, "a rename keeps the link");
 
     let commit = BindingCommit {
-        remove: vec![key_of(&updated)],
+        remove: vec![updated.key()],
         ..BindingCommit::default()
     };
     assert_eq!(commit.apply_to(&mut owned).len(), 1);
     assert_eq!(owned.len(), 1);
-    assert_eq!(key_of(&owned[0].0), key_of(&other));
+    assert_eq!(owned[0].0.key(), other.key());
     assert!(BindingCommit::default().is_empty());
 }
 
