@@ -1,4 +1,6 @@
-use super::support::netns::{add_address, build_lab, lab_config, pinned_map, run_isolated};
+use super::support::netns::{
+    add_address, build_lab, lab_config, pinned_map, run_isolated, tuples_key,
+};
 use super::support::shared_udp::{SharedUdpMode, SharedUdpPeer};
 use super::support::{QuicUdpMode, QuicUdpPeer};
 use super::{NETNS_TEST_TIMEOUT, configure_test_edge, in_test_netns, udp_test_forwarder};
@@ -10,7 +12,7 @@ use crate::routing::Router;
 use anyhow::{Context, ensure};
 use aya::maps::{Array, HashMap};
 use honk_ebpf_common::dae_ip::In6Addr;
-use honk_ebpf_common::{RedirectEntry, RedirectTuple, TuplesKey};
+use honk_ebpf_common::{RedirectEntry, RedirectTuple};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -209,8 +211,8 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                     );
                     ensure!(framing.ifindex == crate::netlink::ifindex_of("honk-lan0")?);
                     let c_key = redirect_key(client_addr, c);
-                    let forward = tuples_key(client_addr, c);
-                    let reverse = tuples_key(c, client_addr);
+                    let forward = tuples_key(client_addr, c, 17);
+                    let reverse = tuples_key(c, client_addr, 17);
                     for after_reply in [false, true] {
                         if after_reply {
                             foreign
@@ -256,8 +258,8 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                         ensure!(packet.association == first.association);
                         for destination in [a, b, c] {
                             for tuple in [
-                                tuples_key(client_addr, destination),
-                                tuples_key(destination, client_addr),
+                                tuples_key(client_addr, destination, 17),
+                                tuples_key(destination, client_addr, 17),
                             ] {
                                 ensure!(
                                     ebpf.read().await.conn_state_lookup(&tuple)?.is_none(),
@@ -280,8 +282,8 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                         .await??;
                         for destination in [a, b, c] {
                             for tuple in [
-                                tuples_key(client_addr, destination),
-                                tuples_key(destination, client_addr),
+                                tuples_key(client_addr, destination, 17),
+                                tuples_key(destination, client_addr, 17),
                             ] {
                                 ensure!(
                                     ebpf.read().await.conn_state_lookup(&tuple)?.is_none(),
@@ -322,18 +324,8 @@ fn run_child(case: &str) -> anyhow::Result<()> {
         .with_context(|| format!("full-cone scenario {case}"))
 }
 
-fn tuples_key(source: SocketAddr, destination: SocketAddr) -> TuplesKey {
-    crate::control::connection::build_tuples_key(
-        destination.ip(),
-        destination.port(),
-        source.ip(),
-        source.port(),
-        17,
-    )
-}
-
 fn redirect_key(source: SocketAddr, destination: SocketAddr) -> RedirectTuple {
-    RedirectTuple::from_tuples(&tuples_key(source, destination))
+    RedirectTuple::from_tuples(&tuples_key(source, destination, 17))
 }
 
 async fn receive(

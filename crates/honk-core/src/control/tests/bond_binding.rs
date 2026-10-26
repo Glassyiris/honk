@@ -2,7 +2,7 @@
 //! before bonding chooses the transmit member. All traffic uses the real control plane.
 
 use super::support::netns::{
-    KernelTcpDial, enter_lab_namespaces, lab_config, pinned_map, run_isolated,
+    KernelTcpDial, enter_lab_namespaces, lab_config, pinned_map, run_isolated, tuples_key,
 };
 use super::support::shared_udp::{SharedUdpMode, SharedUdpPeer};
 use super::{configure_test_edge, fresh_test_netns, in_test_netns, udp_test_forwarder};
@@ -87,18 +87,22 @@ bond_case!(
     ["lan/balance-rr", "lan/balance-xor", "lan/broadcast"]
 );
 
-fn ip(netns: Option<&OwnedFd>, args: &[&str]) -> anyhow::Result<()> {
-    let run = || std::process::Command::new("ip").args(args).output();
+fn command(program: &str, netns: Option<&OwnedFd>, args: &[&str]) -> anyhow::Result<()> {
+    let run = || std::process::Command::new(program).args(args).output();
     let output = match netns {
         Some(netns) => in_test_netns(netns, run),
         None => run(),
     }?;
     ensure!(
         output.status.success(),
-        "ip {args:?}: {}",
+        "{program} {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
+}
+
+fn ip(netns: Option<&OwnedFd>, args: &[&str]) -> anyhow::Result<()> {
+    command("ip", netns, args)
 }
 
 fn veth(host: &str, peer: &str, netns: &OwnedFd) -> anyhow::Result<()> {
@@ -486,12 +490,34 @@ async fn replies_follow(
     Ok(())
 }
 
+async fn binding_snapshot(ebpf: &Backend) -> anyhow::Result<BindingSnapshot> {
+    ebpf.read().await.interface_binding_snapshot()
+}
+
+fn hook_count(snapshot: &BindingSnapshot, device: &str) -> usize {
+    snapshot
+        .owned
+        .iter()
+        .filter(|(binding, ..)| binding.interface == device)
+        .count()
+}
+
+async fn master_link_ids(ebpf: &Backend) -> anyhow::Result<Vec<u32>> {
+    Ok(binding_snapshot(ebpf)
+        .await?
+        .owned
+        .into_iter()
+        .filter(|(binding, ..)| binding.interface == BOND)
+        .map(|(_, id, _)| id)
+        .collect())
+}
+
 async fn assert_hooks(
     ebpf: &Backend,
     device: &str,
     expected: [TcProgram; 2],
 ) -> anyhow::Result<()> {
-    let snapshot = ebpf.read().await.interface_binding_snapshot()?;
+    let snapshot = binding_snapshot(ebpf).await?;
     let index = crate::netlink::ifindex_of(device)?;
     for (direction, program) in [Direction::Ingress, Direction::Egress]
         .into_iter()
@@ -530,16 +556,6 @@ fn no_member_hooks() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn tuple(source: SocketAddr, destination: SocketAddr, proto: u8) -> honk_ebpf_common::TuplesKey {
-    crate::control::connection::build_tuples_key(
-        destination.ip(),
-        destination.port(),
-        source.ip(),
-        source.port(),
-        proto,
-    )
-}
-
 async fn redirected(
     ebpf: &Backend,
     source: SocketAddr,
@@ -551,7 +567,7 @@ async fn redirected(
     let entry = ebpf
         .read()
         .await
-        .redirect_track_lookup(&RedirectTuple::from_tuples(&tuple(
+        .redirect_track_lookup(&RedirectTuple::from_tuples(&tuples_key(
             source,
             destination,
             proto,
@@ -574,7 +590,7 @@ async fn wait_until(
 ) -> anyhow::Result<()> {
     tokio::time::timeout(TIMEOUT, async {
         loop {
-            if done(&ebpf.read().await.interface_binding_snapshot()?) {
+            if done(&binding_snapshot(ebpf).await?) {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -585,49 +601,23 @@ async fn wait_until(
 }
 
 async fn member_change(s: &Scenario, ebpf: &Backend) -> anyhow::Result<()> {
-    let before = ebpf
-        .read()
-        .await
-        .interface_binding_snapshot()?
-        .owned
-        .into_iter()
-        .filter(|(binding, ..)| binding.interface == BOND)
-        .map(|(_, id, _)| id)
-        .collect::<Vec<_>>();
+    let before = master_link_ids(ebpf).await?;
     add_member(&s.bond_peer, 2)?;
     // A visible new target fences the watcher's complete pass over the same topology.
     crate::netlink::NlSock::new()?.add_veth_pair("hcan0", "hcan1")?;
     wait_until(
         ebpf,
         "watcher did not process member addition",
-        |snapshot| {
-            snapshot
-                .owned
-                .iter()
-                .filter(|(binding, ..)| binding.interface == "hcan0")
-                .count()
-                == 2
-        },
+        |snapshot| hook_count(snapshot, "hcan0") == 2,
     )
     .await?;
     no_member_hooks()?;
-    let after = ebpf
-        .read()
-        .await
-        .interface_binding_snapshot()?
-        .owned
-        .into_iter()
-        .filter(|(binding, ..)| binding.interface == BOND)
-        .map(|(_, id, _)| id)
-        .collect::<Vec<_>>();
+    let after = master_link_ids(ebpf).await?;
     ensure!(before == after, "member addition replaced master hooks");
     ip(None, &["link", "del", "hm2"])?;
     ip(None, &["link", "del", "hcan0"])?;
     wait_until(ebpf, "watcher did not process member removal", |snapshot| {
-        snapshot
-            .owned
-            .iter()
-            .all(|(binding, ..)| binding.interface != "hcan0")
+        hook_count(snapshot, "hcan0") == 0
     })
     .await?;
     no_member_hooks()
@@ -695,7 +685,7 @@ async fn exercise(s: &Scenario, ebpf: &Backend, peer: &mut SharedUdpPeer) -> any
                 Path::new(ROOT),
                 "CLIENT_REPLY_TRACK",
             )?)?;
-            let mut key = RedirectTuple::from_tuples(&tuple(udp.local, udp_target, 17));
+            let mut key = RedirectTuple::from_tuples(&tuples_key(udp.local, udp_target, 17));
             key.dst_ip = In6Addr::zero();
             key.dst_port = 0;
             let framing = clients.get(&key, 0)?;
@@ -745,7 +735,7 @@ async fn exercise(s: &Scenario, ebpf: &Backend, peer: &mut SharedUdpPeer) -> any
         assert_hooks(ebpf, BOND, programs).await?;
         no_member_hooks()?;
         if from_wan == 1 {
-            let snapshot = ebpf.read().await.interface_binding_snapshot()?;
+            let snapshot = binding_snapshot(ebpf).await?;
             ensure!(
                 snapshot.owned.iter().all(|(binding, ..)| matches!(
                     binding.program,
@@ -783,33 +773,26 @@ async fn inactive(s: &Scenario, ebpf: &Backend, target: SocketAddr) -> anyhow::R
         ],
     )?;
     for port in ["hp0", "hp1"] {
-        let output = in_test_netns(netns, || {
-            std::process::Command::new("bridge")
-                .args(["link", "set", "dev", port, "learning", "off"])
-                .output()
-        })?;
-        ensure!(output.status.success(), "disable bridge learning");
+        command(
+            "bridge",
+            Some(netns),
+            &["link", "set", "dev", port, "learning", "off"],
+        )?;
     }
-    let pin = |port: &str| -> anyhow::Result<()> {
-        let output = in_test_netns(netns, || {
-            std::process::Command::new("bridge")
-                .args([
-                    "fdb",
-                    "replace",
-                    mac.trim(),
-                    "dev",
-                    port,
-                    "master",
-                    "static",
-                ])
-                .output()
-        })?;
-        ensure!(
-            output.status.success(),
-            "pin FDB: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(())
+    let pin = |port: &str| {
+        command(
+            "bridge",
+            Some(netns),
+            &[
+                "fdb",
+                "replace",
+                mac.trim(),
+                "dev",
+                port,
+                "master",
+                "static",
+            ],
+        )
     };
     pin("hp1")?;
     let before = stats("hm1", "rx_packets")?;
@@ -831,7 +814,7 @@ async fn inactive(s: &Scenario, ebpf: &Backend, target: SocketAddr) -> anyhow::R
     ensure!(
         ebpf.read()
             .await
-            .redirect_track_lookup(&RedirectTuple::from_tuples(&tuple(local, target, 6)))?
+            .redirect_track_lookup(&RedirectTuple::from_tuples(&tuples_key(local, target, 6)))?
             .is_none(),
         "inactive frame published a redirect"
     );
@@ -852,8 +835,8 @@ async fn bridge(
 ) -> anyhow::Result<()> {
     let mut udp = Client::start("udp", s.source, target, s.client_ns.as_ref()).await?;
     udp.rounds(4).await?;
-    let forward = tuple(udp.local, target, 17);
-    let reverse = tuple(target, udp.local, 17);
+    let forward = tuples_key(udp.local, target, 17);
+    let reverse = tuples_key(target, udp.local, 17);
     let backend = ebpf.read().await;
     let state = backend
         .conn_state_lookup(&reverse)?
@@ -899,14 +882,7 @@ async fn bridge(
     wait_until(
         ebpf,
         "watcher did not cover hotplugged sibling",
-        |snapshot| {
-            snapshot
-                .owned
-                .iter()
-                .filter(|(binding, ..)| binding.interface == "hsib0")
-                .count()
-                == 2
-        },
+        |snapshot| hook_count(snapshot, "hsib0") == 2,
     )
     .await?;
     let mut second =
@@ -915,7 +891,7 @@ async fn bridge(
     let state = ebpf
         .read()
         .await
-        .conn_state_lookup(&tuple(target, second.local, 17))?
+        .conn_state_lookup(&tuples_key(target, second.local, 17))?
         .context("hotplugged sibling reverse state")?;
     ensure!(state.is_wan_ingress_direction == 1);
     second.finish().await?;

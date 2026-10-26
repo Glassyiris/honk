@@ -211,6 +211,21 @@ pub(in crate::control::tests) fn pinned_map(root: &Path, name: &str) -> anyhow::
     Ok(Map::from_map_data(MapData::from_pin(root.join(name))?)?)
 }
 
+/// The kernel's key for `source -> destination`, as the control plane builds it.
+pub(in crate::control::tests) fn tuples_key(
+    source: SocketAddr,
+    destination: SocketAddr,
+    proto: u8,
+) -> honk_ebpf_common::TuplesKey {
+    crate::control::connection::build_tuples_key(
+        destination.ip(),
+        destination.port(),
+        source.ip(),
+        source.port(),
+        proto,
+    )
+}
+
 /// Bucket-protected copies for external readers that cannot exclude userspace tuple
 /// retirement. Never fall back to GET_NEXT_KEY plus singleton LOOKUP_ELEM, even for
 /// values that look immutable.
