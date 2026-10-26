@@ -264,12 +264,15 @@ fn unsupported_lan_ingress_frames_continue_tcx_without_marking() {
                     bytes[proto] = protocol;
                     bytes
                 };
-                let mut unsupported =
-                    vec![("ARP", with_ethertype(0x0806)), ("GRE", with_protocol(47))];
+                let mut unsupported = vec![
+                    ("ARP", with_ethertype(libc::ETH_P_ARP as u16)),
+                    ("MACsec", with_ethertype(libc::ETH_P_MACSEC as u16)),
+                    ("GRE", with_protocol(libc::IPPROTO_GRE as u8)),
+                ];
                 if v4 {
-                    unsupported.push(("ICMPv4 echo", with_protocol(1)));
+                    unsupported.push(("ICMPv4 echo", with_protocol(libc::IPPROTO_ICMP as u8)));
                 } else {
-                    let mut ns = with_protocol(58);
+                    let mut ns = with_protocol(libc::IPPROTO_ICMPV6 as u8);
                     ns[l4..l4 + 2].copy_from_slice(&[135, 0]);
                     unsupported.push(("ICMPv6 NS", ns));
                 }
@@ -287,7 +290,7 @@ fn unsupported_lan_ingress_frames_continue_tcx_without_marking() {
                     malformed[eth] = 0x40;
                     classified.push(("malformed IPv4", malformed));
                 } else {
-                    let mut redirect = with_protocol(58);
+                    let mut redirect = with_protocol(libc::IPPROTO_ICMPV6 as u8);
                     redirect[l4..l4 + 2].copy_from_slice(&[137, 0]);
                     classified.push(("NDP Redirect", redirect));
                 }
