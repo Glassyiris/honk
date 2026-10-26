@@ -108,7 +108,9 @@ pub(crate) enum UnboundReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefusedReason {
     /// The canonical root has no framing the programs can parse.
-    UnsupportedType { arphrd: u16 },
+    UnsupportedType {
+        arphrd: u16,
+    },
     UnsupportedNesting,
     /// A `vrf` device: members see the traffic, never the VRF itself.
     VrfRoot,
@@ -120,7 +122,9 @@ impl std::fmt::Display for RefusedReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedType { arphrd } => write!(f, "unsupported link type {arphrd}"),
-            Self::UnsupportedNesting => f.write_str("unsupported bond/bridge nesting or self-master"),
+            Self::UnsupportedNesting => {
+                f.write_str("unsupported bond/bridge nesting or self-master")
+            }
             Self::VrfRoot => f.write_str("a vrf device (configure a member instead)"),
             Self::OwnedLink => f.write_str("a link honk owns"),
         }
@@ -151,8 +155,8 @@ impl Framing {
             | libc::ARPHRD_TUNNEL
             | libc::ARPHRD_TUNNEL6
             | libc::ARPHRD_SIT => Self::L3,
-            // A GRE device with `header_ops` (multicast or no remote) prepends
-            // a tunnel header; only a point-to-point, non-broadcast one is bare IP.
+            // Flags conservatively classify GRE; ip6gre changelink can leave
+            // header_ops inconsistent with them and is unsupported.
             libc::ARPHRD_IPGRE | ARPHRD_IP6GRE
                 if flags & libc::IFF_POINTOPOINT as u32 != 0
                     && flags & libc::IFF_BROADCAST as u32 == 0 =>
@@ -229,7 +233,10 @@ impl BindingCommit {
             && self.rename.is_empty()
     }
 
-    pub(crate) fn keys_after(&self, held: &[(NonZeroU32, Direction)]) -> Vec<(NonZeroU32, Direction)> {
+    pub(crate) fn keys_after(
+        &self,
+        held: &[(NonZeroU32, Direction)],
+    ) -> Vec<(NonZeroU32, Direction)> {
         let mut owned: Vec<_> = held
             .iter()
             .copied()
@@ -524,11 +531,7 @@ fn dedup_roots(ids: &[Option<NonZeroU32>]) -> Vec<NonZeroU32> {
     out
 }
 
-pub(crate) fn plan(
-    lan: &[String],
-    wan: &[String],
-    topology: &Topology,
-) -> InterfacePlan {
+pub(crate) fn plan(lan: &[String], wan: &[String], topology: &Topology) -> InterfacePlan {
     let index = Index::new(&topology.links);
     let mut unbound = Vec::new();
     let lan_names = resolve(lan, topology.default_route.as_deref(), &mut unbound);

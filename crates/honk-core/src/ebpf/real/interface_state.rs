@@ -6,8 +6,8 @@ use tracing::{debug, info, warn};
 
 use crate::degradations::Degradations;
 use crate::ebpf::interface::status::{
-    BindFailure, Episodes, ReconcileStep, StepEpisode, StepTransition, degradation_reason, entry_states,
-    log_entry, publish,
+    BindFailure, Episodes, ReconcileStep, StepEpisode, StepTransition, degradation_reason,
+    entry_states, log_entry, publish,
 };
 use crate::ebpf::interface::{Direction, InterfacePlan, Topology};
 

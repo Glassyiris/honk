@@ -121,7 +121,7 @@ fn interface_issue(state: EntryState) -> Option<Issue> {
     };
     Some(Issue {
         code: "interface_binding_incomplete",
-        message: "A configured network interface is not bound; its traffic is not intercepted until it is.",
+        message: "A configured network interface is not fully bound; traffic interception may be incomplete.",
         reason,
     })
 }
@@ -240,8 +240,6 @@ impl StepEpisode {
         self.step.take()
     }
 }
-
-
 
 #[cfg(test)]
 mod tests;

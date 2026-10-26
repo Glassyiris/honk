@@ -46,6 +46,11 @@ impl LinkExt for LinkSnapshot {
 }
 
 pub(crate) fn planned(lan: &[&str], wan: &[&str], topology: &Topology) -> InterfacePlan {
-    let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+    let names = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>()
+    };
     interface::plan(&names(lan), &names(wan), topology)
 }

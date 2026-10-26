@@ -449,7 +449,8 @@ impl Watch {
             if !owed.is_empty() {
                 let write = Arc::clone(&self.reconciler.sysctl);
                 if let Err(error) =
-                    tokio::task::spawn_blocking(move || interface_state::perform(&owed, &*write)).await
+                    tokio::task::spawn_blocking(move || interface_state::perform(&owed, &*write))
+                        .await
                 {
                     return Err(self.step_failed(ReconcileStep::Join, error.into()));
                 }
@@ -471,7 +472,8 @@ impl Watch {
             // often than the ticker, so one stuck binding does not turn every
             // route event into a TCX query per binding.
             let retry_due = !self.state.unproven.is_empty()
-                && self.state
+                && self
+                    .state
                     .last_verify
                     .is_none_or(|at| now.duration_since(at) >= self.reconciler.interval);
             let verify = verify || retry_due || round != 0;
@@ -493,7 +495,8 @@ impl Watch {
                 failed,
                 topology_changed,
             } = report;
-            let touched: Vec<_> = commit.add
+            let touched: Vec<_> = commit
+                .add
                 .iter()
                 .map(|(binding, ..)| binding.key())
                 .chain(
@@ -519,7 +522,8 @@ impl Watch {
                 .collect();
             if !verify {
                 // Not looked at this pass: still as unproven as before.
-                let carried: Vec<_> = self.state
+                let carried: Vec<_> = self
+                    .state
                     .unproven
                     .iter()
                     .filter(|old| {

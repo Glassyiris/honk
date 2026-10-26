@@ -4,7 +4,6 @@ use crate::ebpf::test_support::{LinkExt, link, planned};
 const NONE: u16 = 0xfffe;
 const PPP: u16 = 512;
 
-
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| value.to_string()).collect()
 }
@@ -355,9 +354,11 @@ fn unresolved_auto_is_pending_without_dropping_explicit_entries() {
 fn resolved_auto_follows_default_route_and_dedups() {
     let mut topo = topology(&[base()]);
     topo.default_route = Some("ens3".into());
-    let plan = plan(&strings(&["auto", "ens3", "eth1"]),
-    &strings(&[" Auto "]),
-    &topo,);
+    let plan = plan(
+        &strings(&["auto", "ens3", "eth1"]),
+        &strings(&[" Auto "]),
+        &topo,
+    );
     assert_eq!(plan.lan, ["ens3", "eth1"]);
     assert_eq!(plan.wan, ["ens3"]);
     assert!(plan.unbound.is_empty());
@@ -377,7 +378,6 @@ fn resolved_auto_follows_default_route_and_dedups() {
     assert_eq!(plan.lan, ["gone0"]);
     assert_eq!(plan.unbound, [("auto".to_string(), UnboundReason::Absent)]);
 }
-
 
 #[test]
 fn absent_names_are_unbound_and_not_bound_entries() {
@@ -419,7 +419,10 @@ fn unsupported_nesting_refuses_only_the_affected_entry() {
         );
         assert_eq!(
             plan.unbound,
-            [(name.into(), UnboundReason::Refused(RefusedReason::UnsupportedNesting))],
+            [(
+                name.into(),
+                UnboundReason::Refused(RefusedReason::UnsupportedNesting)
+            )],
             "{name}"
         );
         assert!(plan.bindings.is_empty());
@@ -455,14 +458,23 @@ fn unsupported_nesting_refuses_only_the_affected_entry() {
         );
         assert_eq!(
             result.unbound,
-            [("c".into(), UnboundReason::Refused(RefusedReason::UnsupportedNesting))],
+            [(
+                "c".into(),
+                UnboundReason::Refused(RefusedReason::UnsupportedNesting)
+            )],
             "case {index}"
         );
         assert!(result.bindings.is_empty());
     }
     let plan = plan(&strings(&["ens3", "m1"]), &[], &topology(&[base(), looped]));
     assert_eq!(set(&plan), ["2 in lan_ingress_l2", "2 eg lan_egress_l2"]);
-    assert_eq!(plan.unbound, [("m1".into(), UnboundReason::Refused(RefusedReason::UnsupportedNesting))]);
+    assert_eq!(
+        plan.unbound,
+        [(
+            "m1".into(),
+            UnboundReason::Refused(RefusedReason::UnsupportedNesting)
+        )]
+    );
 }
 
 #[test]
@@ -563,7 +575,6 @@ const IPGRE: u16 = 778;
 const IP6GRE: u16 = 823;
 const P2P: u32 = libc::IFF_POINTOPOINT as u32;
 const BROADCAST: u32 = libc::IFF_BROADCAST as u32;
-
 
 #[test]
 fn framing_table() {
@@ -745,7 +756,10 @@ fn commit_replaces_existing_add_and_ignores_missing_removals() {
             (NonZeroU32::new(99).unwrap(), Egress, "gone".into()),
         ],
     };
-    assert_eq!(commit.keys_after(&[old.key(), other.key()]), [old.key(), other.key()]);
+    assert_eq!(
+        commit.keys_after(&[old.key(), other.key()]),
+        [old.key(), other.key()]
+    );
     let closed = commit.apply_to(&mut owned);
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].as_raw_fd(), first_fd);
@@ -760,7 +774,10 @@ fn commit_replaces_existing_add_and_ignores_missing_removals() {
         remove: vec![updated.key()],
         ..BindingCommit::default()
     };
-    assert_eq!(commit.keys_after(&[updated.key(), other.key()]), [other.key()]);
+    assert_eq!(
+        commit.keys_after(&[updated.key(), other.key()]),
+        [other.key()]
+    );
     assert_eq!(commit.apply_to(&mut owned).len(), 1);
     assert_eq!(owned.len(), 1);
     assert_eq!(owned[0].0.key(), other.key());

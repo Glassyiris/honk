@@ -62,7 +62,11 @@ fn gre_binds_l3_only_when_point_to_point() {
             let unsupported_flags = link.flags & libc::IFF_POINTOPOINT as u32 == 0
                 || link.flags & libc::IFF_BROADCAST as u32 != 0;
             if let Some(expected) = refused {
-                assert_eq!(expected, unsupported_flags, "{name}: flags {:#x}", link.flags);
+                assert_eq!(
+                    expected, unsupported_flags,
+                    "{name}: flags {:#x}",
+                    link.flags
+                );
             }
             if unsupported_flags {
                 assert_refused(&mut lab, &[name], &[], name, unsupported(link.arphrd));

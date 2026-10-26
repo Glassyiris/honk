@@ -33,8 +33,9 @@ pub(crate) async fn start_interfaces(
 ) -> anyhow::Result<(RealEbpfBackend, InterfaceHandoff)> {
     let subscription = super::iface_watch::subscribe(degradations);
     let mut state = InterfaceState::default();
-    let mut topology = read_topology(interface::any_auto(lan, wan))
-        .map_err(|error| error.context("read the network topology for the configured interfaces"))?;
+    let mut topology = read_topology(interface::any_auto(lan, wan)).map_err(|error| {
+        error.context("read the network topology for the configured interfaces")
+    })?;
     let mut plan = interface::plan(lan, wan, &topology);
     write_sysctls(&mut state, &plan, &topology);
     let mut backend =

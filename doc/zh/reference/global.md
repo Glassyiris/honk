@@ -111,6 +111,10 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 | GRE / IP6GRE | 仅当置位 `IFF_POINTOPOINT` 且未置位 `IFF_BROADCAST` 时为 `_l3`；否则拒绝 |
 | `lo`、`vcan`、InfiniBand、802.15.4、nlmon 及其他所有类型 | 拒绝 |
 
+此表描述分类器，而不是经过验证的设备支持矩阵。IPv4 GRE 与 `collect_md` GRE 的内核测试检查标志与 TCX hook，不验证隧道负载转发。本次变更未验证真实 IP6GRE、IPIP、SIT、IP6TNL、PPP、RAWIP、tun 与 wireguard 设备；GRE 与这些 L3/NONE 程序族也都缺少端到端流量覆盖。
+
+只有单播 remote、没有显式 local 地址的 IP6GRE 可能没有 `IFF_POINTOPOINT`，即使其数据包本可按裸 IP 处理也会被拒绝。不支持用 `ip link change` 原地修改已有 IP6GRE：内核可能改变点对点标志而不清除 `header_ops`，使分类器在隧道头仍存在时选择 `_l3`。请删除并重建设备，而非原地修改；IP6GRE 的创建与流量仍未经验证。
+
 被拒绝的项不绑定任何 hook，并按每个 episode 记录一次指明网卡与原因的错误日志：链路类型不受支持、不支持的 bond/bridge 嵌套或自身即 master、`vrf` 设备（请配置成员；VRF 成员绑定自身）或 `dae0`/`dae0peer`。降级以原因 `unsupported_type` 报告；即使它是第一个已解析的 LAN 或 WAN 项，也不会导致启动失败或阻止其他项绑定。类型不受支持的 bridge 端口或 bond 成员被静默跳过。bond 或 team master 的类型取自其当前第一个端口，因此 InfiniBand bond 会被拒绝。L3S 模式的 ipvlan 与 `reorder_hdr off` 的 VLAN 设备属于不支持的组合。
 
 `IfaceWatcher` 订阅 link、address 和 IPv4/IPv6 route 事件，并每 60 秒执行一次 reconciliation。若无法订阅或无法注册轮询，它仍每 60 秒协调一次、没有事件通知，并报告 `iface_watch` 降级。它会随网卡和默认路由变化创建、更新或释放所需的 LAN/WAN hook。拓扑变化仍用于 ECS 刷新，并立即唤醒受健康状态控制的出站探测，但不再生成网关地址 `direct(must)` 规则，也没有隐藏的内核地址白名单。网卡列表配置本身发生变化仍需重启；网关管理访问应使用[显式用户路由](./routing.md#显式本地路由)。启动顺序与导致启动失败的条件见[接口协调](../design/datapath.md#接口协调)。

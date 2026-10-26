@@ -204,7 +204,13 @@ fn startup_refuses_nested_entry_while_binding_the_ordinary_lan() {
         );
         rt.block_on(async {
             let bound = kernel_bound(&started).await;
-            assert_eq!(keys(&bound), [("hbl_lan", Direction::Ingress), ("hbl_lan", Direction::Egress)]);
+            assert_eq!(
+                keys(&bound),
+                [
+                    ("hbl_lan", Direction::Ingress),
+                    ("hbl_lan", Direction::Egress)
+                ]
+            );
             assert_eq!(started.reason(), Some("unsupported_type"));
         });
         let mut watch = started.watch();
