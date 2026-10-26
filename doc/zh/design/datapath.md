@@ -42,7 +42,7 @@ flowchart LR
 
 接口的 `(ifi_type, ifi_flags)` 决定 `Framing`：以太网（`ARPHRD_ETHER`）使用 `_l2` 程序；`ARPHRD_NONE`、PPP、RAWIP、IPIP、IP6TNL 与 SIT 使用 `_l3`；GRE 与 IP6GRE 仅当置位 `IFF_POINTOPOINT` 且未置位 `IFF_BROADCAST` 时使用 `_l3`（组播 remote 或缺少 remote 会使设备带 `header_ops`，TC 处出现隧道头）；其余类型，包括 `lo`、`vcan`、InfiniBand 与 PIMREG，均不受支持，不绑定到任何位置。每个 bridge 端口和 bond 成员各自套用该规则，不受支持的被跳过。配置项的规范根接口若不受支持、是 `vrf` 设备（成员的 TC ingress 先于 `l3mdev` 接收，VRF 自身看不到入站流量）或是 `dae0`/`dae0peer`，则被拒绝：不产生绑定，在 `interface_binding` 降级中以原因 `unsupported_type` 体现，并按每个 episode 记录一条错误日志；启动继续。bond 或 team master 报告其当前第一个端口的类型，帧格式随之变化；类型变化会在下一次协调中产生不同的计划。所有程序变体随 BPF 对象一并预加载，且早于 BPF logger 启动，因此运行期协调只创建 TCX link，从不加载程序。
 
-每个配置的名称先解析为规范根接口：bond 或 bridge 的成员解析为其 master；本身是 bridge 端口的 bond 解析为该 bridge；其他 master 的成员也解析为该 master，但 `vrf` 与 `openvswitch` 的成员保持自身。各根接口独立规划。只出现在 `lan_interface` 的根为 LAN，只出现在 `wan_interface` 的为 WAN，两者都出现的为 LAN/WAN 共用：
+每个配置的名称先解析为规范根接口：bond 或 bridge 的成员解析为其 master；本身是 bridge 端口的 bond 解析为该 bridge；其他 master 的成员也解析为该 master，但 `vrf` 与 `openvswitch` 的成员保持自身。受支持的嵌套为一层 bond/bridge，外加作为 bridge 端口的 bond；其他任何 bond/bridge 嵌套，或自身即 master 的接口，均不受支持，会使整个计划失败。各根接口独立规划。只出现在 `lan_interface` 的根为 LAN，只出现在 `wan_interface` 的为 WAN，两者都出现的为 LAN/WAN 共用：
 
 | 根接口角色 | 挂钩 |
 | --- | --- |

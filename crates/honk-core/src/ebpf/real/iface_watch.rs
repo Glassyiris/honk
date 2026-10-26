@@ -5,7 +5,7 @@
 //! owner (`bindings`). Every step that can wait on rtnl (link dump, TCX
 //! create/update/query, closing a link FD, sysctl) runs on a blocking thread
 //! with no backend lock held; the backend lock is taken only to snapshot
-//! (read) and to commit (write, O(1) transfers). Without a usable event
+//! (read) and to commit (write). Without a usable event
 //! subscription the same loop runs on the ticker alone.
 
 use nix::errno::Errno;
@@ -27,6 +27,7 @@ use crate::ebpf::interface::status::{
     self, BindFailure, InterfaceState, Step, StepError, SysctlWrite,
 };
 use crate::ebpf::interface::{self, ApplyReport, BindingSnapshot, InterfacePlan, Topology};
+use crate::netlink::{RTM_DELLINK, RTM_NEWLINK};
 
 // A captive-portal login may add only a default route to an already-up link.
 const RTMGRP_LINK_MASK: u32 = 1;
@@ -39,8 +40,6 @@ const RTMGRP_NETWORK_MASK: u32 = RTMGRP_LINK_MASK
     | RTMGRP_IPV4_ROUTE
     | RTMGRP_IPV6_IFADDR
     | RTMGRP_IPV6_ROUTE;
-const RTM_NEWLINK: u16 = 16;
-const RTM_DELLINK: u16 = 17;
 // Events are a wakeup hint only — reconcile re-reads ground truth — but a
 // dropped datagram would stall a pending interface forever, so a slow ticker
 // backstops the subscription (and is the only trigger without one).
@@ -168,11 +167,8 @@ fn subscribe_network_events() -> std::io::Result<OwnedFd> {
 /// What one bounded drain of the subscription saw.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Drained {
-    /// The socket ran dry (as opposed to hitting the 64-message bound).
     empty: bool,
-    /// A link was added, changed or removed: retained links need re-proving.
     link_event: bool,
-    /// The kernel dropped events: anything may have changed.
     overrun: bool,
 }
 
@@ -435,6 +431,7 @@ impl Watch {
                 config.global.wan_interface.clone(),
             )
         };
+
         let mut changed = false;
         let mut last = None;
         // A device that changed under the apply is retried once; the ticker
@@ -465,8 +462,7 @@ impl Watch {
 
             let snapshot = self.ebpf.read().await.interface_binding_snapshot();
             let snapshot = match snapshot {
-                Ok(Some(snapshot)) => snapshot,
-                Ok(None) => return Ok(false),
+                Ok(snapshot) => snapshot,
                 Err(error) => return Err(self.step_failed(Step::Snapshot, error)),
             };
             let held: Vec<_> = snapshot

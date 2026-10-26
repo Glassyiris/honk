@@ -69,7 +69,6 @@ impl TcProgram {
         }
     }
 
-    /// `lan` selects the LAN program family; `l2` the Ethernet framing.
     fn select(lan: bool, direction: Direction, l2: bool) -> Self {
         match (lan, direction, l2) {
             (true, Direction::Ingress, true) => Self::LanIngressL2,
@@ -93,11 +92,15 @@ pub(crate) struct Binding {
     pub interface: String,
 }
 
+impl Binding {
+    pub(crate) fn key(&self) -> (NonZeroU32, Direction) {
+        (self.ifindex, self.direction)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnboundReason {
-    /// No link with that name in the snapshot.
     Absent,
-    /// `auto` with no IPv4 default route.
     AutoUnresolved,
     /// Present but never bindable; fixed by changing the configuration.
     Refused(RefusedReason),
@@ -228,20 +231,18 @@ impl BindingCommit {
     /// Apply to an owner's `(binding, link id, link fd)` table: removals, then
     /// reprograms and renames, then adds. An add for an existing
     /// `(ifindex, direction)` replaces it; a removal, reprogram or rename of a
-    /// missing key is ignored. The replaced or removed FDs are returned so the
-    /// caller closes them outside any lock.
+    /// missing key is ignored. Returns the replaced or removed FDs.
     pub(crate) fn apply_to(self, owned: &mut Vec<(Binding, u32, OwnedFd)>) -> Vec<OwnedFd> {
         let mut closed = Vec::new();
-        let key = |b: &Binding| (b.ifindex, b.direction);
         for gone in self.remove {
-            if let Some(at) = owned.iter().position(|(b, ..)| key(b) == gone) {
+            if let Some(at) = owned.iter().position(|(b, ..)| b.key() == gone) {
                 closed.push(owned.swap_remove(at).2);
             }
         }
         for (ifindex, direction, program) in self.reprogram {
             if let Some((b, ..)) = owned
                 .iter_mut()
-                .find(|(b, ..)| (b.ifindex, b.direction) == (ifindex, direction))
+                .find(|(b, ..)| b.key() == (ifindex, direction))
             {
                 b.program = program;
             }
@@ -249,13 +250,13 @@ impl BindingCommit {
         for (ifindex, direction, interface) in self.rename {
             if let Some((b, ..)) = owned
                 .iter_mut()
-                .find(|(b, ..)| key(b) == (ifindex, direction))
+                .find(|(b, ..)| b.key() == (ifindex, direction))
             {
                 b.interface = interface;
             }
         }
         for added in self.add {
-            if let Some(at) = owned.iter().position(|(b, ..)| key(b) == key(&added.0)) {
+            if let Some(at) = owned.iter().position(|(b, ..)| b.key() == added.0.key()) {
                 closed.push(std::mem::replace(&mut owned[at], added).2);
             } else {
                 owned.push(added);
@@ -295,6 +296,10 @@ pub(crate) fn read_topology(need_default_route: bool) -> anyhow::Result<Topology
     })
 }
 
+pub(crate) fn any_auto(lan: &[String], wan: &[String]) -> bool {
+    lan.iter().chain(wan).any(|name| is_auto_interface(name))
+}
+
 /// One topology read through `read` and the plan derived from it; the error
 /// says which of the two stages failed.
 pub(crate) fn read_and_plan_with(
@@ -302,8 +307,7 @@ pub(crate) fn read_and_plan_with(
     lan: &[String],
     wan: &[String],
 ) -> Result<(Topology, InterfacePlan), StepError> {
-    let any_auto = lan.iter().chain(wan).any(|name| is_auto_interface(name));
-    let topology = read(any_auto).map_err(|error| StepError {
+    let topology = read(any_auto(lan, wan)).map_err(|error| StepError {
         step: Step::Topology,
         error,
     })?;
@@ -622,7 +626,7 @@ pub(crate) fn plan(
 }
 
 /// The canonical root the binding uses: first LAN root, else first WAN root
-/// (refused and absent names never reach either list).
+/// (absent names never reach either list).
 pub(crate) fn local_ip_interface(plan: &InterfacePlan) -> Option<&str> {
     plan.lan_roots
         .first()

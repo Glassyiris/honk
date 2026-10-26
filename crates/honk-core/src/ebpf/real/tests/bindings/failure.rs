@@ -5,14 +5,6 @@
 use super::*;
 use TcProgram::*;
 
-fn has_errno(error: &anyhow::Error, errno: i32) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|io| io.raw_os_error() == Some(errno))
-    })
-}
-
 /// The program the kernel says an owned link runs.
 fn kernel_program(lab: &Lab, ifindex: u32, direction: Direction) -> u32 {
     let held = lab.held();

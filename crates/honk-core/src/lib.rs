@@ -1021,18 +1021,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         config.routing.rules.len()
     );
 
+
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
     // a healthy restart into a permanently degraded process.
     prepare_nfqueue_startup(&mut config, mock_mode);
 
-    // Create the dae0 link pair before eBPF load so PARAM.dae0_ifindex is correct.
-    // dae0peer stays in the host namespace during the dae0 attach, then moves
-    // to the daens netns during namespace setup.
     #[cfg(feature = "ebpf")]
-    let _dae0_link: Option<(daens::Dae0Guard, daens::Dae0Setup)>;
-    #[cfg(not(feature = "ebpf"))]
-    let _dae0_link: Option<()>;
+    let _dae0_guard;
     if !mock_mode {
         // QUIC socket headroom: the default 208 KiB rmem/wmem caps a
         // ~1ms-RTT QUIC path at ~2 Gbps (setsockopt is clamped to 2×max).
@@ -1047,30 +1043,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 warn!("failed to set {}={}: {}", key, val, e);
             }
         }
-        #[cfg(feature = "ebpf")]
-        {
-            _dae0_link = Some(daens::create_dae0_link()?);
-            info!(
-                "dae0 link created before eBPF load (ifindex={})",
-                _dae0_link.as_ref().unwrap().1.ifindex()
-            );
-        }
-        #[cfg(not(feature = "ebpf"))]
-        {
-            _dae0_link = None;
-        }
-    } else {
-        _dae0_link = None;
     }
 
     #[cfg(feature = "ebpf")]
     let mut interface_handoff = None;
     let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
+        #[cfg(feature = "ebpf")]
+        {
+            _dae0_guard = None;
+        }
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
     } else {
         #[cfg(feature = "ebpf")]
         {
+            // PARAM.dae0_ifindex must describe the pair before eBPF load.
+            let (guard, dae0_setup) = daens::create_dae0_link()?;
+            info!(
+                "dae0 link created before eBPF load (ifindex={})",
+                dae0_setup.ifindex()
+            );
+            _dae0_guard = Some(guard);
             let bpf_object_bytes = match &cli.bpf_object {
                 Some(path) => {
                     info!("Loading real eBPF backend from {}", path.display());
@@ -1083,14 +1076,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     DEFAULT_BPF_OBJECT.to_vec()
                 }
             };
-            let (_, dae0_setup) = _dae0_link
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("dae0 link setup missing before eBPF load"))?;
             let (backend, handoff) = ebpf::real::start_interfaces(
                 &bpf_object_bytes,
                 &cli.bpf_pin_root,
                 config.global.tproxy_port,
-                dae0_setup,
+                &dae0_setup,
                 &config.global.lan_interface,
                 &config.global.wan_interface,
                 &degradations,

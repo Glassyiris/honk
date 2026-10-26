@@ -455,7 +455,7 @@ fn unsupported_nesting_is_an_error() {
             plan(
                 &strings(&[name]),
                 &[],
-                &topology(std::slice::from_ref(&looped))
+                &topology(std::slice::from_ref(&looped)),
             )
             .is_err(),
             "{name}"
@@ -560,18 +560,18 @@ fn default_route_read_error_is_an_error_not_no_route() {
 }
 
 #[test]
-fn dump_retry_stops_after_three_interrupts() {
+fn dump_retry_stops_at_the_attempt_limit() {
     let interrupted = || io::Error::from(io::ErrorKind::Interrupted);
     let mut calls = 0;
     let ok = retry_interrupted(|| {
         calls += 1;
-        if calls < 3 {
+        if calls < DUMP_ATTEMPTS {
             Err(interrupted())
         } else {
             Ok(calls)
         }
     });
-    assert_eq!(ok.unwrap(), 3);
+    assert_eq!(ok.unwrap(), DUMP_ATTEMPTS);
 
     let mut calls = 0;
     let err = retry_interrupted(|| -> io::Result<()> {
@@ -579,7 +579,10 @@ fn dump_retry_stops_after_three_interrupts() {
         Err(interrupted())
     })
     .unwrap_err();
-    assert_eq!((calls, err.kind()), (3, io::ErrorKind::Interrupted));
+    assert_eq!(
+        (calls, err.kind()),
+        (DUMP_ATTEMPTS, io::ErrorKind::Interrupted)
+    );
 
     let mut calls = 0;
     let err = retry_interrupted(|| -> io::Result<()> {
@@ -752,4 +755,53 @@ fn local_ip_interface_never_names_a_refused_root() {
     let plan = plan_for(&["lo", "vrf0"], &[], &topo);
     assert_eq!(local_ip_interface(&plan), None);
     assert_eq!(local_ip(&plan), 0);
+}
+
+#[test]
+fn commit_replaces_existing_add_and_ignores_missing_removals() {
+    use std::os::fd::AsRawFd;
+
+    use Direction::{Egress, Ingress};
+    use TcProgram::{LanEgressL2, LanIngressL2, WanEgressL2, WanIngressL3};
+
+    let binding = |index, direction, program| Binding {
+        ifindex: NonZeroU32::new(index).unwrap(),
+        direction,
+        program,
+        interface: format!("v{index}"),
+    };
+    let fd = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
+
+    let old = binding(2, Ingress, LanIngressL2);
+    let other = binding(3, Egress, LanEgressL2);
+    let mut owned = vec![(old.clone(), 10, fd()), (other.clone(), 11, fd())];
+    let first_fd = owned[0].2.as_raw_fd();
+    let updated = binding(2, Ingress, WanIngressL3);
+    let commit = BindingCommit {
+        add: vec![(updated.clone(), 12, fd())],
+        remove: vec![(NonZeroU32::new(99).unwrap(), Egress)],
+        reprogram: vec![(other.ifindex, other.direction, WanEgressL2)],
+        rename: vec![
+            (other.ifindex, other.direction, "p9".into()),
+            (NonZeroU32::new(99).unwrap(), Egress, "gone".into()),
+        ],
+    };
+    let closed = commit.apply_to(&mut owned);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].as_raw_fd(), first_fd);
+    assert_eq!(owned.len(), 2);
+    assert_eq!(owned[0].0, updated);
+    assert_eq!(owned[0].1, 12);
+    assert_eq!(owned[1].0.program, WanEgressL2);
+    assert_eq!(owned[1].0.interface, "p9");
+    assert_eq!(owned[1].1, 11, "a rename keeps the link");
+
+    let commit = BindingCommit {
+        remove: vec![updated.key()],
+        ..BindingCommit::default()
+    };
+    assert_eq!(commit.apply_to(&mut owned).len(), 1);
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].0.key(), other.key());
+    assert!(BindingCommit::default().is_empty());
 }
