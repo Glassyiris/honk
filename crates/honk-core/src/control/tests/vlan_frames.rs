@@ -60,28 +60,28 @@ macro_rules! vlan_case {
     };
 }
 
-// Ablate E1 in lan_ingress: the parent redirects the tagged SYN, daens drops it as OTHERHOST.
+// Without the lan_ingress VLAN skip the parent redirects the tagged SYN and daens drops it as OTHERHOST.
 vlan_case!(
     netns_vlan_client_on_parent_lan_is_forwarded_natively,
     "lan_parent"
 );
-// Ablate E1: the parent hook classifies first, so the VLAN device never gets the frame.
+// Without the skip the parent hook classifies first, so the VLAN device never gets the frame.
 vlan_case!(
     netns_vlan_device_lan_is_proxied_beside_its_parent,
     "lan_parent_and_vlan"
 );
-// An 802.1p priority tag (VID 0) is delivered by the parent: E1 must not skip it.
+// An 802.1p priority tag (VID 0) is delivered by the parent: the skip must not apply.
 vlan_case!(
     netns_vlan_priority_tagged_lan_client_is_still_proxied,
     "vid0"
 );
-// Ablate E2 in wan_egress: the tagged SYN is redirected into daens and dropped.
+// Without the wan_egress VLAN skip the tagged SYN is redirected into daens and dropped.
 vlan_case!(
     netns_vlan_host_connection_on_parent_wan_is_native,
     "wan_parent"
 );
 vlan_case!(netns_vlan_device_wan_intercepts_host_connection, "wan_vlan");
-// Ablate E3': the encrypted frame is marked classified, the decrypted upper flow skipped.
+// Without the unsupported-frame NEXT the encrypted frame is marked classified and the decrypted upper flow skipped.
 vlan_case!(netns_macsec_upper_device_lan_flow_is_classified, "macsec");
 
 /// One request/reply exchange from the host namespace, in its own process.
@@ -234,8 +234,8 @@ fn run_child(case: &str) -> anyhow::Result<()> {
         }
         "vid0" => {
             // VID 0 is an 802.1p priority tag (priority 3 here, so vlan_tci is non-zero)
-            // the parent delivers itself. The host
-            // replies untagged, so pin both neighbours instead of relying on ARP.
+            // that the parent delivers itself. The host replies untagged, so pin both
+            // neighbours instead of relying on ARP.
             let client = Ipv4Addr::new(10, 74, 0, 2);
             upper(
                 Some(&client_ns),
