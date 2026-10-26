@@ -54,7 +54,7 @@ flowchart LR
 
 bond 拦截覆盖经过逻辑 master TC hook 的正常软件 skb 路径。bonding 先决定哪些接收帧会进入 master，honk 随后才分类，不会抢在 bonding 接收决策之前接管 inactive 成员上的帧。直接向成员注入的原始 `AF_PACKET` 帧，以及绕过这些 TC hook 的路径（包括此类硬件卸载）不在覆盖范围内。
 
-对于在 bond 上拦截的 LAN TCP 与非 DNS UDP，`REDIRECT_TRACK` 捕获 master ifindex；符合条件的 LAN UDP `CLIENT_REPLY_TRACK` 条目也保留该 index。回复走 master TX（`dev_queue_xmit`），由 bonding 选择当前出端口。WAN 本机流量拦截保存 master ifindex 与 `from_wan=1`，回复经 master RX（`BPF_F_INGRESS`）回到主机套接字，不依赖 `CLIENT_REPLY_TRACK`。切换 active 成员与成员热插拔都不需要 honk 成员 hook。
+对于在 bond 上拦截的 LAN TCP 与非 DNS UDP，`REDIRECT_TRACK` 捕获 master ifindex；符合条件的 LAN UDP `CLIENT_REPLY_TRACK` 条目也保留该 index。回复走 master TX（`dev_queue_xmit`），由 bonding 选择当前出端口。WAN 本机流量拦截保存 master ifindex 与 `from_wan=1`，回复经 master RX（`BPF_F_INGRESS`）回到主机套接字，不依赖 `CLIENT_REPLY_TRACK`。切换 active 成员与成员热插拔都不需要 honk 成员 hook。WAN 本机回复的目的 MAC 取自捕获时读到的 bond MAC，因此 `fail_over_mac=active`（成员无法设置 MAC 时内核会强制使用）不受支持且未经验证：若故障切换改变了 bond MAC，已有流上的后续回复将不再作为本机报文递交给主机套接字。
 
 `lan_ingress` 对转发的客户端流量分类。`wan_egress` 独立地对主机创建的流量分类。拓扑提供独立方向时，反向 ingress/egress 挂钩刷新已有连接状态。只有正向 TCP SYN 发布 TCP 状态：反向的纯 SYN 既不创建也不刷新它。
 
