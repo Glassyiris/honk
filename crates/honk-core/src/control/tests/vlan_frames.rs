@@ -10,7 +10,7 @@ use super::{
 use crate::control::{ControlCommand, ControlPlane};
 use crate::daens;
 use crate::dns::DnsResolver;
-use crate::ebpf::{EbpfBackend, real::RealEbpfBackend};
+use crate::ebpf::{EbpfBackend, real::start_interfaces};
 use crate::routing::Router;
 use anyhow::{Context, ensure};
 use aya::maps::Array;
@@ -408,17 +408,17 @@ fn run_child(case: Case) -> anyhow::Result<()> {
             }
         }
     };
-    let _dae0 = daens::create_dae0_link()?;
+    let (_dae0, setup) = daens::create_dae0_link()?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(with_datapath(scenario))
+        .block_on(with_datapath(scenario, &setup))
         .with_context(|| format!("VLAN frames {case:?}"))
 }
 
 /// Boots the production control plane over the real hooks, drives one TCP exchange and
 /// checks whether honk intercepted it.
-async fn with_datapath(scenario: Scenario) -> anyhow::Result<()> {
+async fn with_datapath(scenario: Scenario, dae0: &daens::Dae0Setup) -> anyhow::Result<()> {
     let object = std::env::var_os("HONK_TEST_BPF_OBJECT")
         .map(std::fs::read)
         .transpose()?;
@@ -428,18 +428,18 @@ async fn with_datapath(scenario: Scenario) -> anyhow::Result<()> {
         .map(str::to_owned)
         .collect();
     config.global.wan_interface = vec![scenario.wan.to_owned()];
-    let mut backend = RealEbpfBackend::load(
+    let degradations = crate::degradations::Degradations::default();
+    let (mut backend, _handoff) = start_interfaces(
         object.as_deref().unwrap_or(crate::DEFAULT_BPF_OBJECT),
         Path::new(ROOT),
         config.global.tproxy_port,
-        Some(&config.global.lan_interface[0]),
-        &config.global.wan_interface[0],
-        false,
+        dae0,
+        &config.global.lan_interface,
+        &config.global.wan_interface,
+        &degradations,
+        crate::ebpf::interface::read_topology,
     )
     .await?;
-    for lan in &config.global.lan_interface[1..] {
-        backend.attach_lan(lan, false)?;
-    }
     backend.attach_dae0_programs()?;
     daens::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
     backend.attach_sk_lookup()?;

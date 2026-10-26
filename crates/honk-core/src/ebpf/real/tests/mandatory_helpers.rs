@@ -33,6 +33,7 @@ fn program_info(fd: RawFd, info: &mut bpf_prog_info) -> anyhow::Result<()> {
     attr.info.info_len = core::mem::size_of::<bpf_prog_info>() as u32;
     attr.info.info = info as *mut bpf_prog_info as u64;
     unsafe { syscall::bpf_syscall(BPF_OBJ_GET_INFO_BY_FD as _, &mut attr) }
+        .map(|_| ())
         .map_err(|errno| anyhow::anyhow!("BPF_OBJ_GET_INFO_BY_FD failed with errno {errno}"))
 }
 

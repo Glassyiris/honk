@@ -122,7 +122,7 @@ flowchart TB
 - **Token 校验终态：** 暂存 UDP token 必须在 skb mark、内核状态、handoff、redirect track、用户态 verdict 状态、lease/endpoint 和后端转换间一致。Direct 遵循 Arm → 全部带标记 verdict → Activate；proxy 在唯一的规范拨号/发送路径之前发布最终状态。
 - **`must`/`block` 终结性：** Clash 模式覆盖永远不会替换 `block` 结果或 dae `(must)` 结果。
 - **失活出站 fail-closed：** `lan_ingress` 丢弃路由到失活出站的新流。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为用户态最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。TCP 与 UDP 端口 `53` 豁免该健康检查丢包，但仍遵循用户的终局 `must` 结果。
-- **显式本地路由：** 网关管理访问由用户[显式配置](../reference/routing.md#显式本地路由)，不会自动生成接口规则。WAN egress 仍旁路目的地址匹配 `PARAM.local_ip` 的流量，但不保证一般管理访问可达；接口观察仍用于拓扑/ECS/健康，非 DNS TCP 纯 SYN 的现有本地探测跳过策略不变。
+- **显式本地路由：** 网关管理访问由用户[显式配置](../reference/routing.md#显式本地路由)，不会自动生成接口规则。WAN egress 仍旁路目的地址匹配 `PARAM.local_ip` 的流量，但不保证一般管理访问可达。`PARAM.local_ip` 是启动时的快照：选择第一个已解析、存在且具有可绑定规范根接口的 LAN 项（否则 WAN），跳过被拒绝的根接口，再取该根接口的第一个 IPv4 地址。规范化遵循接口计划器：bond/bridge 成员使用其规范 master，`vrf`/`openvswitch` 成员保持自身。无可选根接口或所选根接口没有 IPv4 地址时，该值为 0，该旁路保持关闭。之后的接口或地址变化不会更新快照；LAN 缺席时选中的 WAN 地址也会在整个进程生命周期内保持不变。接口观察仍用于拓扑/ECS/健康，非 DNS TCP 纯 SYN 的现有本地探测跳过策略不变。
 - **组 OR 连通性：** 一个组的 eBPF alive slot 是全部叶子成员状态的 OR，并包含上述单叶 TCP 最后尝试例外。多叶节点组中的单个成员失活不得使整个组 fail-closed。
 - **Score 隔离与原因：** 健康过滤与业务目标地址族保持独立。首次选择的 utility 仍为启发式；健康晋升比较有界、按需求确定大小的评估集内所有合格挑战者与固定现任，依据共同目标／时间证据，而非无关聚合／setup 均值。可选试用共享保留的组／网络／地址族预算，由原始业务开始赚取，时间流逝不产生额度；试用不取得已提交现任身份。真实连败保留退避和三连败排除。精确与聚合证据各有 4,096 项 LRU；比较存储最多 512 个 cell、1 MiB 逻辑分配，不是进程 RSS。重叠计数不相加。reload 保留已准入业务结果，同时撤销近期可用性与探测基线。公开摘要和计数始终限定范围，不导出原始目标键，详见[组设计](./groups.md#score-评分与生命周期)。
 - **Score 按需反馈：** setup/首响应与有界分方向进展可在终态前发布，不增加 Beta 完成。业务、配置健康与预热分别承担不同作用；任意手动 delay 测量不变成业务可靠性或配置基线。Score TCP 建立失败可在原 deadline 内通过不同的合格叶节点恢复一次，不打开新 final、不越过 Selector、不重放负载。

@@ -207,7 +207,7 @@ experimental {
 
 ## 选择接口
 
-将 `lan_interface` 设为接收 LAN 转发流量的接口，多个接口用逗号分隔。将 `wan_interface` 设为承载本机发起流量的接口。`auto` 跟随 IPv4 默认路由接口；没有默认路由时保持待定，不会回退到 loopback，之后在链路、地址或路由变化时自动协调。仅代理本机流量时省略 `lan_interface`：已配置的 WAN hook 仍处理本机发起的 TCP 与 UDP。不得把 `lo` 作为虚构的 LAN 接口加入配置。
+将 `lan_interface` 设为接收 LAN 转发流量的接口，多个接口用逗号分隔。将 `wan_interface` 设为承载本机发起流量的接口。`auto` 跟随 IPv4 默认路由接口；没有默认路由时保持待定，不会回退到 loopback，之后在链路、地址或路由变化时自动协调。不存在、被拒绝（`lo`、VRF 设备、`dae0`）或无法挂载的接口不会阻止启动，见[网卡语义](./reference/global.md#网卡语义)。仅代理本机流量时省略 `lan_interface`：已配置的 WAN hook 仍处理本机发起的 TCP 与 UDP。不得把 `lo` 作为虚构的 LAN 接口加入配置。
 
 接口设置详见 [Global 参考](./reference/global.md)。
 

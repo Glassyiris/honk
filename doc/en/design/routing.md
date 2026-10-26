@@ -269,8 +269,8 @@ It preserves the real function prototype and uses instruction-slot offsets for
 Every relevant, loaded TC program exposes two non-inlined, distinct BTF-global
 functions, `honk_route_slot0` and `honk_route_slot1`. Uninstalled functions return
 an error and contain no fallback rule engine. The backend loads the LAN/WAN L2/L3
-routing targets before admitting traffic, including variants that may be attached
-to an interface later.
+routing targets before admitting traffic; all eight TC variants are already preloaded at
+`load`, so the targets reuse them and cover variants bound to an interface later.
 
 `ROUTING_POLICY_ROOT` is a one-entry map-in-map pointing at an immutable
 `RoutingPolicyDescriptor`. The descriptor identifies the slot, policy generation,

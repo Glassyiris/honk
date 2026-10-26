@@ -207,7 +207,7 @@ experimental {
 
 ## Choosing interfaces
 
-Set `lan_interface` to the interface or comma-separated interfaces receiving forwarded LAN traffic, and `wan_interface` to the interface carrying host-originated traffic. `auto` follows the IPv4 default-route interface; it stays pending rather than falling back to loopback when no default route exists, then reconciles on link, address, or route changes. For a WAN-only host proxy, omit `lan_interface`: configured WAN hooks still process host-originated TCP and UDP. Never add `lo` as a synthetic LAN interface.
+Set `lan_interface` to the interface or comma-separated interfaces receiving forwarded LAN traffic, and `wan_interface` to the interface carrying host-originated traffic. `auto` follows the IPv4 default-route interface; it stays pending rather than falling back to loopback when no default route exists, then reconciles on link, address, or route changes. An absent, refused (`lo`, a VRF device, `dae0`) or unattachable interface never stops startup; see [interface semantics](./reference/global.md#interface-semantics). For a WAN-only host proxy, omit `lan_interface`: configured WAN hooks still process host-originated TCP and UDP. Never add `lo` as a synthetic LAN interface.
 
 See the [global reference](./reference/global.md).
 

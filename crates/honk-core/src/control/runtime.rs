@@ -283,8 +283,25 @@ impl ControlPlane {
         }
         // The caller holds reload_lock; never retain Config's guard while awaiting Router.
         let config = self.config.read().await.clone();
-        let mut interfaces = crate::configured_interfaces(&config).lan;
-        interfaces.retain(|name| crate::netlink::ifindex_of(name).is_ok());
+        let planned_config = Arc::clone(&config);
+        let interfaces = match tokio::task::spawn_blocking(move || {
+            crate::ebpf::interface::read_and_plan(
+                &planned_config.global.lan_interface,
+                &planned_config.global.wan_interface,
+            )
+            .map(|(_, plan)| plan.lan_roots)
+        })
+        .await
+        {
+            Ok(Ok(interfaces)) => interfaces,
+            result => {
+                debug!(
+                    ?result,
+                    "skip LAN self-protection warning: interface plan unavailable"
+                );
+                return;
+            }
+        };
         if interfaces.is_empty() {
             return;
         }
