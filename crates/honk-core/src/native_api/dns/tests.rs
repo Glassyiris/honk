@@ -416,6 +416,91 @@ fn query_request(query: &str, body: Value) -> Request {
 }
 
 #[tokio::test]
+async fn query_asis_uses_default_and_preserves_route_source() {
+    use honk_config::{
+        dns::{
+            DnsCond, DnsDomainMatcher, DnsRequestAction, DnsRequestRule, DnsStrategy, DnsUpstream,
+        },
+        types::DnsProtocol,
+    };
+
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+    let (calls, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let upstream = tokio::spawn(async move {
+        let mut wire = [0; 512];
+        while let Ok((length, peer)) = socket.recv_from(&mut wire).await {
+            let query = &wire[..length];
+            let (_, qtype) = crate::dns::forwarder::parse_dns_question(query).unwrap();
+            calls.send(qtype).unwrap();
+            let mut response = query.to_vec();
+            response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+            response[6..8].copy_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&[0xc0, 0x0c]);
+            response.extend_from_slice(&qtype.to_be_bytes());
+            response.extend_from_slice(&1u16.to_be_bytes());
+            response.extend_from_slice(&300u32.to_be_bytes());
+            if qtype == 1 {
+                response.extend_from_slice(&4u16.to_be_bytes());
+                response.extend_from_slice(&[192, 0, 2, 20]);
+            } else {
+                response.extend_from_slice(&16u16.to_be_bytes());
+                response.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+            }
+            socket.send_to(&response, peer).await.unwrap();
+        }
+    });
+    let mut config = honk_config::Config::default();
+    config.dns.strategy = DnsStrategy::PreferIpv4;
+    config.dns.routing.request.rules = vec![DnsRequestRule {
+        conditions: vec![DnsCond::Qname {
+            not: false,
+            matchers: vec![DnsDomainMatcher::Full("routed.example".into())],
+        }],
+        action: DnsRequestAction::AsIs,
+    }];
+    config.dns.routing.request.fallback = DnsRequestAction::AsIs;
+    config.dns.upstream = vec![DnsUpstream {
+        name: "default".into(),
+        address: address.to_string(),
+        protocol: DnsProtocol::Udp,
+        tls_server_name: None,
+        outbound: None,
+    }];
+    let state = dns_state(config).await;
+    let id = RequestId("asis-diagnostic".into());
+    let mut responses = Vec::new();
+    for (domain, qtype) in [("example.com", "AAAA"), ("routed.example", "A")] {
+        let request = query_request("?detail=full", json!({"domain": domain, "type": [qtype]}));
+        let response = query(&state, request, &id).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        responses.push(serde_json::from_slice::<Value>(&body).unwrap());
+    }
+    let mut qtypes = Vec::new();
+    while let Ok(qtype) = received.try_recv() {
+        qtypes.push(qtype);
+    }
+    upstream.abort();
+    let _ = upstream.await;
+    state.dns.provider().unwrap().shutdown().await;
+
+    let fallback = &responses[0]["results"][0];
+    assert_eq!(fallback["status"], "NOERROR");
+    assert_eq!(fallback["upstream"], "default");
+    assert_eq!(fallback["route"]["source"], "default");
+    assert_eq!(fallback["answers"], json!([]));
+    let rule = &responses[1]["results"][0];
+    assert_eq!(rule["status"], "NOERROR");
+    assert_eq!(rule["upstream"], "default");
+    assert_eq!(rule["route"]["source"], "dns.routing");
+    assert_eq!(rule["answers"][0]["data"], "192.0.2.20");
+    assert_eq!(qtypes, [28, 1, 1]);
+}
+
+#[tokio::test]
 async fn query_takes_a_json_body_with_bounded_types() {
     let state = crate::native_api::tests::state().await;
     let status = |request| {

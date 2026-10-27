@@ -72,6 +72,7 @@ async fn diagnostic_force_precedes_reject_and_bypass_preserves_cached_answer() {
     let normal = ResolveOptions {
         cache: CacheAccess::Normal,
         forced_upstream: Some(UpstreamTag::new("unreferenced").unwrap()),
+        ..Default::default()
     };
     let deadline = || tokio::time::Instant::now() + Duration::from_secs(2);
     let first = service
@@ -118,6 +119,7 @@ async fn diagnostic_force_precedes_reject_and_bypass_preserves_cached_answer() {
     let bad = ResolveOptions {
         cache: CacheAccess::Normal,
         forced_upstream: Some(UpstreamTag::new("missing").unwrap()),
+        ..Default::default()
     };
     assert!(matches!(
         service
@@ -146,6 +148,7 @@ async fn diagnostic_bypass_and_force_propagate_to_preferred_sibling() {
     let options = ResolveOptions {
         cache: CacheAccess::Bypass,
         forced_upstream: Some(UpstreamTag::new("unreferenced").unwrap()),
+        ..Default::default()
     };
     let answer = service
         .diagnostic(
@@ -264,6 +267,7 @@ async fn diagnostic_bypass_ignores_negative_without_replacing_it_or_joining_flig
     let bypass = ResolveOptions {
         cache: CacheAccess::Bypass,
         forced_upstream: Some(tag),
+        ..Default::default()
     };
     let answer = service
         .diagnostic(
@@ -293,6 +297,53 @@ async fn diagnostic_bypass_ignores_negative_without_replacing_it_or_joining_flig
         1,
         "bypass did not join or supersede held writing flight"
     );
+    worker.abort();
+    let _ = worker.await;
+    forwarder.shutdown_background_tasks().await;
+}
+
+#[tokio::test]
+async fn diagnostic_asis_default_scope_refreshes_near_expiry() {
+    let (address, worker, mut calls) = loopback_dns().await;
+    let mut config = config_for(address);
+    config.upstream[0].name = "default".into();
+    config.routing.request.fallback = DnsRequestAction::AsIs;
+    let router = Arc::new(DnsRouter::new_from_dns_config(&config).unwrap());
+    let pool = Arc::new(UpstreamPool::new(&config.upstream, router.clone()).unwrap());
+    let forwarder = Arc::new(
+        DnsForwarder::new(pool, test_cache(), router)
+            .with_cache_ttl(2)
+            .with_configured_upstreams(&config),
+    );
+    let service = crate::dns::DnsService::with_forwarder(forwarder.clone());
+    let options = ResolveOptions::default();
+    let deadline = || tokio::time::Instant::now() + Duration::from_secs(2);
+    service
+        .diagnostic("example.com.", &[1], &options, deadline())
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .outcome
+        .unwrap();
+    assert_eq!(calls.try_recv().unwrap(), 1);
+
+    tokio::time::sleep(Duration::from_millis(1900)).await;
+    let cached = service
+        .diagnostic("example.com.", &[1], &options, deadline())
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .outcome
+        .unwrap();
+    assert_eq!(cached.provenance(), Provenance::Cache);
+    let refreshed = tokio::time::timeout(Duration::from_millis(500), calls.recv())
+        .await
+        .expect("diagnostic refresh retains default fallback")
+        .unwrap();
+    assert_eq!(refreshed, 1);
+
     worker.abort();
     let _ = worker.await;
     forwarder.shutdown_background_tasks().await;

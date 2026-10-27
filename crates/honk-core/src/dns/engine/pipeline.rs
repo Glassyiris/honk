@@ -195,7 +195,7 @@ pub(crate) async fn resolve_with_owner(
     let prepared = engine.prepare_parsed(
         parsed,
         metadata,
-        matches!(mode, ResolveMode::Compatibility),
+        matches!(mode, ResolveMode::Compatibility) || options.allow_asis_fallback,
         options.forced_upstream.as_ref(),
         evidence,
     )?;

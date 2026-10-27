@@ -213,6 +213,7 @@ impl DnsForwarder {
         let options = ResolveOptions {
             cache: CacheAccess::Refresh,
             forced_upstream: options.forced_upstream.clone(),
+            allow_asis_fallback: options.allow_asis_fallback,
         };
         let spawned = self.refresh_tasks.spawn(async move {
             let result = crate::dns::engine::pipeline::resolve_with_owner(

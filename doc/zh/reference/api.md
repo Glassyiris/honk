@@ -275,6 +275,9 @@ PUT 仅在耐久写入并进入真实 reload 队列后返回 `202`；显式 POST
 ### DNS 查询、缓存与结果历史
 
 `POST /dns/query` 接受严格的 JSON 请求体（`Content-Type` 须为 `application/json`，否则返回 `415`）：必填 `domain`；`type` 为可选数组，默认 `["A"]`，最多 8 个不同类型，超过时返回 `413 request_too_large`；`detail=summary|full` 仍放在查询字符串；支持 A、AAAA、NS、CNAME、SOA、PTR、MX、TXT、SRV、SVCB、HTTPS 和 CAA。可选字段 `cache_mode` 接受 `normal` 或 `bypass`。一次请求的所有类型固定同一 DNS generation，共享 10 秒期限；唯一认证主体和全局各限每分钟 30 次。可选字段 `upstream` 只接受已配置名称，包括未被规则引用的名称；它替换请求阶段的路由选择，不绕过 hosts/strategy 的优先级或响应侧 requery。Hosts 命中报告默认路由，且无上游。`cache_mode=bypass` 不读取或写入正缓存、负缓存及过期缓存，不加入会写入缓存的 singleflight、不替换缓存条目，也不启动刷新；不提供该选项时保留正常生产语义。完整详情展示经过校验的答案记录，各类型的超时、拒绝或错误仍按实际结果报告。
+
+未强制 `upstream` 的诊断请求若选择 `asis`，因为没有被拦截的原始目的地址，会使用名为 `default` 的已配置上游。`route.source` 仍分别用 `dns.routing` 或 `default` 表示规则或 fallback 来源，`upstream` 则报告实际替代的上游。若未声明 `default`，该类型返回 `ERROR`；此时应显式指定请求体 `upstream`，不会任意选择其他上游。
+
 DNS 查询与缓存响应及 DNS 日志分页会遮蔽监听凭据展示值，不改变不透明 ID 或游标绑定。
 
 字面值 `.` 表示 DNS 根，支持实际查询、精确缓存列表和按名称删除。普通输入名称不区分大小写，末尾点可省略；展示名称保留规范化末尾点。合法根域 wire 问题也进入普通严格 DNS 路径；非 UTF-8 label 仍不属于该消费者契约。

@@ -322,7 +322,7 @@ DNS 诊断使用相互独立、单调递增的 atomic counter。类别覆盖缓�
 
 ### 原生诊断、精确失效与客户端历史
 
-`/api/v1/dns/query` 把 cache access 与可选强制配置 upstream 作为同一个请求局部 options 贯穿 planning、preferred-family sibling 和 exchange；一次请求固定同一 DNS generation。强制 upstream 替换普通请求路由，但保留 hosts/strategy 与响应侧 requery，hosts 命中不虚构 upstream exchange。`bypass` 不读正/负/stale 答案、不写缓存、不加入普通 singleflight/refresh，也不启动后台 refresher；普通生产请求不带 override 时语义不变。最多 8 个不同 type，共享 10 秒请求期限、262144 字节完整 JSON 预算与每分钟 30 次 principal/global 限额。
+`/api/v1/dns/query` 把 cache access 与可选强制配置 upstream 作为同一个请求局部 options 贯穿 planning、preferred-family sibling 和 exchange；一次请求固定同一 DNS generation。强制 upstream 替换普通请求路由，但保留 hosts/strategy 与响应侧 requery，hosts 命中不虚构 upstream exchange。未强制 upstream 时，`asis` 选择因没有拦截所得目的地址而使用 `default`，同一请求局部回退也贯穿 preferred-family sibling 与 refresh。`bypass` 不读正/负/stale 答案、不写缓存、不加入普通 singleflight/refresh，也不启动后台 refresher；普通生产请求不带 override 时语义不变。最多 8 个不同 type，共享 10 秒请求期限、262144 字节完整 JSON 预算与每分钟 30 次 principal/global 限额。
 
 Cache list 的 opaque ID 对应 exact-key incarnation，检查不触发 LRU promotion 或 hit 统计；`persistent:false` 明确只覆盖运行时记录。分页固定 filters/instance，最多 8 个 snapshot、30 秒和合计 8 MiB，底层淘汰不释放仍由 snapshot 持有的预算。按 ID 删除只影响该 incarnation，按完整 name/type 删除可覆盖不同 exact 变体。原生与 Clash 失效共用 DNS/cache owner 的 publication→shard 屏障，等待持久化删除及此前 queued put 的确认；旧 foreground/refresh 不能复活已经确认失效的记录。Flush 仅清答案缓存，不清域名路由投影，持久化失败不能假报成功。
 

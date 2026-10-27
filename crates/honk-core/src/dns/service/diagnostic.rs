@@ -81,6 +81,10 @@ async fn run(
     {
         return Err(DiagnosticError::UnknownUpstream);
     }
+    let options = ResolveOptions {
+        allow_asis_fallback: true,
+        ..options.clone()
+    };
     operation
         .run(async {
             let mut results = Vec::with_capacity(types.len());
@@ -97,7 +101,7 @@ async fn run(
                             &query,
                             DnsRequestMeta::EMPTY,
                             IngressProfile::Api,
-                            options,
+                            &options,
                             ResolveMode::Strict,
                             Some(&mut route),
                         ),

@@ -167,15 +167,18 @@ impl DnsEngine {
             qtype,
             metadata,
         };
-        let (plan, source) = match self
+        let mut source = super::outcome::RouteSource::Default;
+        let planned = self
             .planner
-            .plan_request_with_source(context, forced, evidence)
-        {
-            Err(PlanError::MissingOriginalDestination) if compatibility => (
-                RequestPlan::Exchange(RequestScope::Upstream(UpstreamTag::new("default")?)),
-                super::outcome::RouteSource::Default,
-            ),
-            result => result?,
+            .plan_request_with_source(context, forced, Some(&mut source));
+        if let Some(evidence) = evidence {
+            *evidence = source;
+        }
+        let plan = match planned {
+            Err(PlanError::MissingOriginalDestination) if compatibility => {
+                RequestPlan::Exchange(RequestScope::Upstream(UpstreamTag::new("default")?))
+            }
+            result => result?.0,
         };
         #[cfg(not(feature = "native-api"))]
         let _ = source;

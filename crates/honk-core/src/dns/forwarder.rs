@@ -106,6 +106,7 @@ pub(crate) enum CacheAccess {
 pub(crate) struct ResolveOptions {
     pub(crate) cache: CacheAccess,
     pub(crate) forced_upstream: Option<super::planner::UpstreamTag>,
+    pub(crate) allow_asis_fallback: bool,
 }
 
 impl ResolveOptions {
@@ -117,6 +118,7 @@ impl ResolveOptions {
                 self.cache
             },
             forced_upstream: self.forced_upstream.clone(),
+            allow_asis_fallback: self.allow_asis_fallback,
         }
     }
 }
