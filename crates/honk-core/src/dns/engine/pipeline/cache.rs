@@ -8,6 +8,14 @@ use crate::dns::forwarder::{
     extract_soa_negative_ttl, rewrite_answer_ttls,
 };
 use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance, ResponseClass};
+#[cfg(feature = "native-api")]
+use crate::dns::query::IngressProfile;
+
+#[cfg(feature = "native-api")]
+pub(super) fn entry_id_demanded(context: &ExecutionContext<'_>) -> bool {
+    matches!(context.prepared.query().ingress(), IngressProfile::Api)
+        || crate::observe::flows::dns::cache_entry_demanded()
+}
 
 pub(super) async fn lookup(
     context: &ExecutionContext<'_>,
@@ -28,7 +36,11 @@ pub(super) async fn lookup(
         } => {
             crate::observe::flows::dns::cache_state("hit");
             #[cfg(feature = "native-api")]
-            let entry_id = cache.entry_id_for_revision(&context.cache_key, _revision);
+            let entry_id = if entry_id_demanded(context) {
+                cache.entry_id_for_revision(&context.cache_key, _revision)
+            } else {
+                None
+            };
             #[cfg(feature = "native-api")]
             crate::observe::flows::dns::cache_entry(entry_id.as_deref());
             let response =
@@ -73,7 +85,11 @@ pub(super) async fn lookup(
         ExactLookup::Miss => return Ok(None),
     };
     #[cfg(feature = "native-api")]
-    let entry_id = cache.entry_id_for_revision(&context.cache_key, revision);
+    let entry_id = if entry_id_demanded(context) {
+        cache.entry_id_for_revision(&context.cache_key, revision)
+    } else {
+        None
+    };
     #[cfg(feature = "native-api")]
     crate::observe::flows::dns::cache_entry(entry_id.as_deref());
     let remaining = entry.remaining_ttl_secs();
