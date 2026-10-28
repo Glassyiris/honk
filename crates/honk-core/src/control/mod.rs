@@ -177,6 +177,7 @@ pub struct ControlPlane {
     /// shared with the alive set's outbound resolver; rebuilt on reload.
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     resource_budget: ResourceBudget,
+    dns_socket_budget: crate::dns::transport::DnsSocketBudget,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     tcp_admission_target: Arc<std::sync::atomic::AtomicUsize>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.

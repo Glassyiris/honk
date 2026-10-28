@@ -169,10 +169,10 @@ For NFQUEUE ingress, `PendingUdpVerdicts` owns token/generation, phase, FIFO ver
 Each UDP flow retains at most 64 datagrams including its first packet. All flows share an exact 8 MiB payload-permit budget. Admission obtains per-flow slots and global byte permits before copying; FIFO saturation drops the newest datagram. NFQUEUE has a separate ingest actor bounded to 256 entries and 8 MiB of queued payload.
 
 At startup, `honk-core` tries to raise the soft `RLIMIT_NOFILE`, snapshots the
-active value once, and caps the budgeting input at 1,048,576. VLESS carrier
-capacity is carved out as `min(after_dials / 8, 8192)` before the remaining
-descriptor budget determines UDP endpoint count. At the cap the fixed partition
-is:
+active value once, and caps the budgeting input at 1,048,576. DNS sockets receive
+a separate `min(transient_dials, 256)` partition, also bounded by the remaining
+descriptors. VLESS capacity then uses `min(after_dns / 8, 8192)` before the
+remaining budget determines UDP endpoint count. At the cap the fixed partition is:
 
 | Owner | Capacity | Descriptor accounting |
 | --- | ---: | ---: |
@@ -180,9 +180,10 @@ is:
 | Accepted TCP flows | 16,384 | 6 each = 98,304 |
 | Retained TCP pool | 2048 | 1 each = 2048 |
 | Transient outbound dials | 1024 | 1 each = 1024 |
+| DNS-owned sockets | 256 | 1 credit per socket; network bootstrap reserves 2 |
 | VLESS physical carriers | 8192 | 1 each = 8192 |
 | UDP endpoints | 32,768 | 10 each = 327,680 |
-| **Total** |  | **437,504** |
+| **Total** |  | **437,760** |
 
 One UDP endpoint budgets a relay socket, a possible SOCKS5 control stream, and
 its eager anyfrom reply socket plus a share of the process-wide foreign pool,
@@ -215,10 +216,18 @@ Admission ceilings are distinct:
 | Admission | Ceiling |
 | --- | ---: |
 | TCP flow permits | Descriptor-derived floor plus bounded borrowing of observed idle non-TCP headroom |
-| VLESS physical carriers | Startup `min(after_dials / 8, 8192)` process gate |
+| VLESS physical carriers | Startup `min(after_dns / 8, 8192)` process gate |
 | Cold non-DNS UDP slow path | `min(udp_endpoints, 256)` |
-| Port-53 ingress slow path | `min(transient_dials, 256)` |
+| UDP DNS client lifecycles | `min(1536, MemTotal / 4 / 256 KiB)` per generation |
+| All controller DNS query lifecycles | 2,048 per generation, shared by TCP and UDP |
+| DNS-owned sockets / endpoint network bootstrap | Separately backed process gate, at most 256 credits, shared across reload |
+| DNS proxy stream / non-raw packet preparation | Conservative process-wide logical leases, at most the DNS socket limit; not an aggregate proxy FD bound |
 | NFQUEUE ingest actor | 256 entries and 8 MiB |
+
+DNS query memory is a sizing allowance rather than a hard RSS limit. Its socket
+gate retains credits through idle pools and actual driver teardown; pressure
+reclaims unborrowed cached transports instead of permanently starving another
+upstream. Proxy carrier ownership remains separate; see [DNS admission](./dns.md#resolution-pipeline).
 
 TCP accepts use the descriptor-derived flow budget, not a separate 256-entry ceiling. The [joined removal worker](./datapath.md#userspace-maintenance-and-accounting) serves TCP, UDP and expiry hints; UDP retains its 1024-message channel and deduplicating `removal_dirty` compensation. Exact tombstones are acknowledged only after owned I/O and backend retirement finish.
 

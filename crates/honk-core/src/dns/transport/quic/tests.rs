@@ -15,6 +15,7 @@ fn direct(address: SocketAddr, protocol: DnsProtocol) -> DialContext {
         endpoint: DnsEndpoint::parse(&address.to_string(), protocol, Some("localhost")).unwrap(),
         query_timeout: Duration::from_secs(2),
         dial_timeout: Duration::from_secs(2),
+        socket_budget: Default::default(),
         proxy: None,
     }
 }
@@ -113,7 +114,7 @@ async fn literal_doq_and_doh3_handshakes_record_actual_success_and_failure() {
             if succeeds {
                 let (connection, owner) = client.unwrap();
                 let accepted = accepted.unwrap();
-                assert!(owner.is_none());
+                assert!(owner.packet().is_none());
                 connection.close(0_u32.into(), b"done");
                 accepted.close(0_u32.into(), b"done");
             } else {

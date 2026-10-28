@@ -143,6 +143,28 @@ fn runtime_with_bootstrap_pool(generation: u64, pool: Arc<LazyBootstrapPool>) ->
     })
 }
 
+#[test]
+fn udp_client_limit_cannot_consume_the_combined_query_ceiling() {
+    let (template, _) = runtime(0, 0);
+    let runtime = DnsRuntime::new(DnsRuntimeParts {
+        generation: RuntimeGeneration::new(1),
+        udp_query_limit: usize::MAX,
+        forwarder: Arc::clone(template.forwarder()),
+        routing_projection: Arc::clone(template.routing_projection()),
+        outbound_runtime: None,
+        transport: Arc::new(ObservedTransport::default()),
+    });
+    let udp: Vec<_> = (0..super::MAX_UDP_CLIENT_QUERIES)
+        .map(|_| runtime.try_acquire_udp_query().unwrap())
+        .collect();
+    assert!(runtime.try_acquire_udp_query().is_err());
+    let combined: Vec<_> = (0..super::MAX_CONCURRENT_QUERIES)
+        .map(|_| runtime.try_acquire_query().unwrap())
+        .collect();
+    assert!(runtime.try_acquire_query().is_err());
+    drop((udp, combined));
+}
+
 #[tokio::test]
 async fn lazy_bootstrap_resolution_stays_pinned_to_the_runtime_lease() {
     // Given

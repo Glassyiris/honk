@@ -198,6 +198,7 @@ impl Drop for PacketWorkerTeardown {
 struct TestPacketHandler {
     active: Arc<AtomicUsize>,
     runtime_dials: Arc<AtomicUsize>,
+    protocol: NodeProtocol,
     fault: Option<Arc<PacketWorkerFault>>,
 }
 
@@ -252,7 +253,7 @@ impl PacketOutbound for TestPacketHandler {
         _target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        assert_eq!(runtime.node.protocol(), NodeProtocol::Socks5);
+        assert_eq!(runtime.node.protocol(), self.protocol);
         self.runtime_dials.fetch_add(1, Ordering::SeqCst);
         self.open(target).await
     }
@@ -265,11 +266,12 @@ pub(super) struct ProxiedQuicFixture {
 }
 
 pub(super) fn proxied_quic_fixture(endpoint: DnsEndpoint) -> ProxiedQuicFixture {
-    proxied_quic_fixture_with_fault(endpoint, None)
+    proxied_quic_fixture_for_protocol(endpoint, NodeProtocol::Socks5, None)
 }
 
-fn proxied_quic_fixture_with_fault(
+fn proxied_quic_fixture_for_protocol(
     endpoint: DnsEndpoint,
+    protocol: NodeProtocol,
     fault: Option<Arc<PacketWorkerFault>>,
 ) -> ProxiedQuicFixture {
     let active = Arc::new(AtomicUsize::new(0));
@@ -277,16 +279,16 @@ fn proxied_quic_fixture_with_fault(
     let handler = Arc::new(TestPacketHandler {
         active: Arc::clone(&active),
         runtime_dials: Arc::clone(&runtime_dials),
+        protocol,
         fault,
     });
     let mut registry = crate::proxy::ProxyRegistry::new();
     registry.register(
-        ProtocolEntry::new(NodeProtocol::Socks5, Arc::clone(&handler))
-            .with_packet(Arc::clone(&handler)),
+        ProtocolEntry::new(protocol, Arc::clone(&handler)).with_packet(Arc::clone(&handler)),
     );
     let mut node = Node {
         name: "packet-proxy".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
+        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
         address: "127.0.0.1:1".into(),
         host: "127.0.0.1".into(),
         port: 1,
@@ -302,6 +304,7 @@ fn proxied_quic_fixture_with_fault(
             endpoint,
             query_timeout: Duration::from_secs(2),
             dial_timeout: Duration::from_secs(2),
+            socket_budget: Default::default(),
             proxy: Some(ProxyDial {
                 registry: Arc::new(registry),
                 generation: Some(generation),
@@ -467,6 +470,7 @@ async fn tcp_pool_reuses_connection() {
         endpoint: ep,
         query_timeout: Duration::from_secs(2),
         dial_timeout: Duration::from_secs(2),
+        socket_budget: Default::default(),
         proxy: None,
     });
     let q = build_dns_query("example.com", 1);
@@ -527,6 +531,7 @@ async fn dot_pool_roundtrip() {
                 .unwrap(),
             query_timeout: Duration::from_secs(1),
             dial_timeout: Duration::from_secs(1),
+            socket_budget: Default::default(),
             proxy: None,
         }),
     );
@@ -630,6 +635,7 @@ async fn doh_post_over_h2_roundtrip() {
             .unwrap(),
             query_timeout: Duration::from_secs(1),
             dial_timeout: Duration::from_secs(1),
+            socket_budget: Default::default(),
             proxy: None,
         }),
     );
@@ -911,6 +917,7 @@ async fn doq_doh3_clients_construct() {
             endpoint: ep,
             query_timeout: Duration::from_secs(1),
             dial_timeout: Duration::from_secs(2),
+            socket_budget: Default::default(),
             proxy: None,
         })
         .await
@@ -923,6 +930,7 @@ async fn doq_doh3_clients_construct() {
             endpoint: ep3,
             query_timeout: Duration::from_secs(1),
             dial_timeout: Duration::from_secs(2),
+            socket_budget: Default::default(),
             proxy: None,
         })
         .await

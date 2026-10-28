@@ -9,6 +9,7 @@ use super::forwarder::DnsForwarder;
 pub(crate) const RETIREMENT_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const MAX_RETIRED_RUNTIMES: usize = 4;
 const MAX_CONCURRENT_QUERIES: usize = 2048;
+pub(crate) const MAX_UDP_CLIENT_QUERIES: usize = 1536;
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("DNS network admission is unavailable")]
@@ -135,7 +136,9 @@ impl DnsRuntime {
     pub(crate) fn new(parts: DnsRuntimeParts) -> Arc<Self> {
         Arc::new(Self {
             query_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
-            udp_query_limit: Arc::new(Semaphore::new(parts.udp_query_limit)),
+            udp_query_limit: Arc::new(Semaphore::new(
+                parts.udp_query_limit.min(MAX_UDP_CLIENT_QUERIES),
+            )),
             parts,
             state: AtomicU8::new(RuntimeState::Active as u8),
             leases: AtomicUsize::new(0),

@@ -942,8 +942,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let mut resource_budget = control::ResourceBudget::for_nofile(effective_nofile);
     match total_memory_bytes() {
         Some(memory) => resource_budget = resource_budget.with_memory(memory),
-        None => warn!("Failed to read MemTotal; UDP endpoints are sized by descriptors only"),
+        None => warn!(
+            "Failed to read MemTotal; using descriptor-only UDP endpoints and the default DNS query ceiling"
+        ),
     }
+    let dns_socket_budget = dns::transport::DnsSocketBudget::new(resource_budget.dns_sockets);
     let tcp_flow_max = resource_budget.active_tcp_flows.saturating_mul(2);
     if tcp_flow_max < 256 {
         warn!(
@@ -1196,6 +1199,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             honk_outbound::bootstrap::BootstrapResolver::parse(&config.global.bootstrap_resolver),
             config.dns.strategy,
         )?
+        .with_socket_budget(dns_socket_budget.clone())
         .with_client_subnet(dns_client_subnet)
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
@@ -1221,6 +1225,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             dns_cache,
             dns_router,
         )
+        .with_socket_budget(dns_socket_budget)
         .with_configured_upstreams(&config.dns)
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),

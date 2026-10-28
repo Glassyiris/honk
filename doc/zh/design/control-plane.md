@@ -161,8 +161,9 @@ Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获�
 每个 UDP 流最多保留 64 个 datagram，包括首包。所有流共享精确的 8 MiB payload permit 预算。准入在复制前取得每流 slot 和全局 byte permit；FIFO 饱和时丢弃最新 datagram。NFQUEUE 有独立 ingest actor，限制为 256 个条目和 8 MiB 排队 payload。
 
 启动时，`honk-core` 尝试提升软 `RLIMIT_NOFILE`，只快照一次活动值，并把预算
-输入上限设为 1,048,576。在剩余描述符决定 UDP endpoint 数量之前，先按
-`min(after_dials / 8, 8192)` 分出 VLESS carrier 容量。在上限处固定分区为：
+输入上限设为 1,048,576。DNS socket 先独立分出 `min(transient_dials, 256)`，
+同时受剩余描述符约束。随后按 `min(after_dns / 8, 8192)` 分配 VLESS carrier，
+再以剩余预算决定 UDP endpoint 数量。在上限处固定分区为：
 
 | 所有者 | 容量 | 描述符记账 |
 | --- | ---: | ---: |
@@ -170,9 +171,10 @@ Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获�
 | 已接受 TCP 流 | 16,384 | 每个 6 = 98,304 |
 | 保留 TCP pool | 2048 | 每个 1 = 2048 |
 | 临时出站 dial | 1024 | 每个 1 = 1024 |
+| DNS 自有 socket | 256 | 每 socket 一个额度；网络 bootstrap 预留两个 |
 | VLESS 物理 carrier | 8192 | 每个 1 = 8192 |
 | UDP endpoint | 32,768 | 每个 10 = 327,680 |
-| **合计** |  | **437,504** |
+| **合计** |  | **437,760** |
 
 一个 UDP endpoint 为 relay socket、可能存在的 SOCKS5 控制流，以及它自己的
 anyfrom reply socket 加进程级外来池的一份记账；每个 endpoint 容量共八个回复
@@ -200,10 +202,17 @@ memory 或 scheduler capacity。TCP 从描述符导出的 floor 开始，封顶 
 | 准入 | 上限 |
 | --- | ---: |
 | TCP 流 permit | 描述符导出的 floor，加上对观测到的 idle non-TCP headroom 的有界借用 |
-| VLESS 物理 carrier | 启动时固定的 `min(after_dials / 8, 8192)` 进程 gate |
+| VLESS 物理 carrier | 启动时固定的 `min(after_dns / 8, 8192)` 进程 gate |
 | 冷 non-DNS UDP slow path | `min(udp_endpoints, 256)` |
-| 端口 53 入口 slow path | `min(transient_dials, 256)` |
+| UDP DNS 客户端生命周期 | 每代 `min(1536, MemTotal / 4 / 256 KiB)` |
+| 所有 controller DNS 查询生命周期 | 每代 2,048，TCP 与 UDP 共用 |
+| DNS 自有 socket / endpoint 网络 bootstrap | 独立描述符分区支持的进程 gate，最多 256 个额度，跨 reload 共享 |
+| DNS 代理 stream / 非原始 UDP 的 packet 准备 | 不超过 DNS socket 上限的进程级保守逻辑 lease；不是所有代理 FD 的总上限 |
 | NFQUEUE ingest actor | 256 个条目和 8 MiB |
+
+DNS 查询内存值用于容量估算，不是硬 RSS 上限。Socket gate 的额度保留到空闲池及
+实际 driver teardown 完成；压力下回收未被借用的缓存 transport，避免其他上游永久
+饥饿。代理 carrier 的所有权仍独立管理，见 [DNS 准入](./dns.md#解析管线)。
 
 TCP accept 使用描述符导出的流预算，没有独立的 256 项上限。[Joined removal worker](./datapath.md#用户空间维护与计数) 处理 TCP、UDP 与 expiry hint；UDP 保留 1024 条消息的 channel 和去重 `removal_dirty` 补偿。只有自有 I/O 和后端退役完成后才确认精确 tombstone。
 

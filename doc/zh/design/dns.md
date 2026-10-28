@@ -119,7 +119,11 @@ Honk 的独立 bind 可以是 `:53530`、其他空闲端口或关闭；它不是
 | 8. 发布与渲染 | 只有严格校验后的最终 wire 响应才能进入缓存或发布给 singleflight waiter。偏好地址族压制在保存已校验、可复用的应答后，才应用于调用方渲染。 |
 | 9. 结果与投影 | forwarder 返回类型化结果。`DnsController` 使用固定 generation 的投影快照提交该结果，随后入口 adapter 写应答。 |
 
-每代有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。UDP 入口另用该代按启动预算确定的 slow-path 配额（最多 256），与普通 UDP 初始化隔离。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。发布结果时，删除 flight 与向已加入 follower 广播结果原子完成；后续缓存未命中的请求可以开启新 flight。已完成的失败保留原始原因但不进入缓存，因此已加入的 follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
+每代有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。UDP 客户端准入与普通 UDP 初始化分开，启动时封顶为 `min(1536, MemTotal / 4 / 256 KiB)`。每查询 256 KiB 是容量估算，不是强制 RSS 上限；共享的 2,048 查询上限也不是 TCP 专用预留。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。发布结果时，删除 flight 与向已加入 follower 广播结果原子完成；后续缓存未命中的请求可以开启新 flight。已完成的失败保留原始原因但不进入缓存，因此已加入的 follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
+
+DNS 自有 socket 使用独立扣除、由活跃与退役 generation 共同持有的进程级描述符分区。额度随实际 socket、空闲 stream、endpoint poller 或 packet-adapter worker 保留到 teardown。Endpoint 网络 bootstrap 为并发 A/AAAA 一次预留两个额度；本地解析结果不占网络额度。代理 TCP stream 与非原始 UDP 的 packet 准备则共用不超过 DNS socket 分区大小的保守逻辑 lease 上限，并在代理节点 bootstrap 前取得 lease。Direct/Shadowsocks/SOCKS5 的原始 UDP 部分使用物理额度；SOCKS5 控制 TCP 和其他代理 carrier 保留既有 outbound 所有权。这不等于所有代理 carrier 的总 FD 上限。
+
+必要准入阻塞时，按 generation 注册的弱 owner 通过保留的 close/join 路径回收未被借用的缓存 UDP socket 及空闲 TCP/TLS/H2/QUIC 资源。完成与取消在释放借用后重新检查压力，等待中的其他上游不必依赖维护定时器；已开始的交换不会被淘汰。Socket 准入失败在重试及 resolver hook 中保留类型化 `Capacity`，可能渲染为 `SERVFAIL`，不同于 singleflight 的 `REFUSED`。入口饱和时独立监听器回拒绝、透明 UDP 丢弃的既有行为不变。
 
 初始化与 flight fan-out 使用 `SharedError`。该 Arc-backed error 为 builder 与
 waiter clone 原始 causal chain，而不是从 display 文本重建。完成的 failure 不
@@ -251,7 +255,9 @@ DoH、DoH3 和 DoQ 的失败只通过弱引用关联会话，错误对象本身�
 重建。Shutdown 仍会关闭当前资源，不依赖最后使用它的是哪个查询。
 销毁最后一个 owner 仍会中止其 driver；任务计数也覆盖首次 poll 之前的取消。
 
-直连 UDP 为每个查询分配由 CSPRNG 选择的新 16-bit ID，接收时同时校验 ID 与 question，恢复调用方 ID，并将退役 ID 隔离三秒。因此延迟报文无法在 ID 复用后满足另一个问题。
+直连 UDP 从 CSPRNG 随机起点搜索占用 bitmap，分配新的 16-bit ID，接收时同时校验 ID 与 question，再恢复调用方 ID。已回答 ID 隔离 500 ms；取消、超时、发送失败及已归属的 ICMP 错误使用独立队列隔离三秒。交换期间 pending ID 始终占用。因此延迟报文无法在 ID 复用后满足另一个问题；有限隔离窗口不是对相同问题重复报文的真实性保证。
+
+每个上游/地址族为当前地址保留最多四个可复用 socket，每个 socket 最多 1,024 个 pending 交换。Pending 超过 768 或发送前 ID/容量耗尽时可增加分片；整个进程含退役 generation 在内最多持有 16 个额外 socket，每个分片还必须持有物理 socket 额度。切换分片不会重放已接受的发送。失败分片仅局部替换，空闲额外分片由既有维护过程回收；压力下也可回收未被借用的主 socket。已准入工作完成期间，旧 socket 可与替换项重叠，其额度和接收任务一直保留到 join teardown。
 
 UDP 冷路径和 cached-current 快捷路径使用同一取池入口，在交换前替换已关闭
 或已停止的 socket，不把地址尝试浪费在旧池上。Linux 下由
