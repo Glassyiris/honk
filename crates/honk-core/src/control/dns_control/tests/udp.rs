@@ -126,7 +126,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
             domain: "example.com",
             family: honk_outbound::alive::IpVersion::V4,
             ips: &[learned_ip],
-            advertised_ttl: Duration::from_secs(30),
+            expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
         },
     );
     let projected = controller.project_routes(&snapshot);
@@ -147,7 +147,11 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         .expect("truncated outcome");
     assert!(outcome.answer_ips().is_empty());
     assert!(!outcome.expiry().is_cacheable());
-    controller.submit_projection(runtime.runtime(), &outcome);
+    assert!(controller.try_submit_projection(
+        runtime.runtime(),
+        &outcome,
+        tokio::time::Instant::now()
+    ));
     drop(runtime);
 
     assert!(cache.lock().await.is_empty());
@@ -204,7 +208,7 @@ async fn projection_follows_query_family_until_nxdomain() {
             domain: "example.com",
             family: honk_outbound::alive::IpVersion::V6,
             ips: &[v6],
-            advertised_ttl: Duration::from_secs(30),
+            expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
         },
     );
     // The A answer, HTTPS NODATA and AAAA NODATA a dual-stack browser sees,

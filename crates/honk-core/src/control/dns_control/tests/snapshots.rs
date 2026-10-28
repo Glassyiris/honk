@@ -234,3 +234,153 @@ async fn resolve_domain_keeps_old_snapshot_without_blocking_publication() {
         ["198.51.100.4".parse::<std::net::IpAddr>().expect("new IP")]
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn projection_rollback_preserves_cached_deadline() {
+    for expire_while_waiting in [false, true] {
+        let upstream = Arc::new(SnapshotUpstream {
+            ip: [192, 0, 2, 10],
+            calls: AtomicUsize::new(0),
+            entered: None,
+            release: None,
+        });
+        let forwarder = Arc::new(DnsForwarder::new(
+            upstream.clone(),
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(
+                16,
+            ))),
+            Arc::new(
+                crate::dns::routing::DnsRouter::new_from_dns_config(
+                    &honk_config::dns::DnsConfig::default(),
+                )
+                .unwrap(),
+            ),
+        ));
+        let (controller, _) = projection_controller(forwarder);
+        let admission = controller.try_admit_query(true).unwrap();
+        let runtime = admission.runtime.runtime();
+        let snapshot = Arc::clone(runtime.routing_projection());
+        let query = query_with_txid("example.com", 0x3141);
+        let ingress = IngressProfile::Udp {
+            advertised_size: 512,
+        };
+        let warm = controller
+            .dns_service
+            .resolve_client_outcome_with_runtime(
+                &admission.runtime,
+                &query,
+                DnsRequestMeta::EMPTY,
+                ingress,
+                None,
+            )
+            .await
+            .unwrap();
+        let lifetime = warm.expiry().ttl();
+        assert!(lifetime > Duration::from_secs(2));
+        let original_deadline = tokio::time::Instant::now() + lifetime;
+        let publication = controller.prepare_projection_publication();
+        let mut answer =
+            Box::pin(controller.answer_query(&admission, &query, DnsRequestMeta::EMPTY, ingress));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(answer.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(if expire_while_waiting {
+            lifetime + Duration::from_secs(1)
+        } else {
+            lifetime / 2
+        })
+        .await;
+        // A rejected publication retains the generation instead of fencing this answer out.
+        drop(publication);
+        let answer = tokio::time::timeout(Duration::from_secs(1), answer)
+            .await
+            .unwrap();
+        let outcome = answer.0.unwrap();
+        assert_eq!(outcome.provenance(), crate::dns::outcome::Provenance::Cache);
+        if expire_while_waiting {
+            assert!(
+                controller.project_routes(&snapshot).is_empty(),
+                "an expired answer must not be available for a reload prefill"
+            );
+        } else {
+            assert_eq!(
+                controller.project_routes(&snapshot)[0].0,
+                "192.0.2.10".parse::<std::net::IpAddr>().unwrap()
+            );
+            tokio::time::advance(
+                original_deadline.saturating_duration_since(tokio::time::Instant::now())
+                    + Duration::from_secs(1),
+            )
+            .await;
+            controller.routing_projection.submit(
+                Arc::clone(&snapshot),
+                crate::dns::projection::ProjectionObservation::Retain,
+            );
+            assert!(
+                controller.project_routes(&snapshot).is_empty(),
+                "publication waiting must not restart the cached routing lifetime"
+            );
+        }
+        drop(admission);
+        controller.shutdown(Duration::from_secs(1)).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn projection_wait_cancellation_releases_lease_without_publishing() {
+    for release_with_cancellation in [false, true] {
+        let upstream = Arc::new(SnapshotUpstream {
+            ip: [192, 0, 2, 11],
+            calls: AtomicUsize::new(0),
+            entered: None,
+            release: None,
+        });
+        let (controller, _) = projection_controller(snapshot_forwarder(upstream.clone()));
+        let provider = controller.runtime_provider();
+        let snapshot = Arc::clone(provider.current().routing_projection());
+        let admission = controller.try_admit_query(true).unwrap();
+        let query = query_with_txid("example.com", 0x2718);
+        let mut publication = Some(controller.prepare_projection_publication());
+        let mut answer = Box::pin(async {
+            let answer = controller
+                .answer_query(
+                    &admission,
+                    &query,
+                    DnsRequestMeta::EMPTY,
+                    IngressProfile::Udp {
+                        advertised_size: 512,
+                    },
+                )
+                .await;
+            drop(admission);
+            answer
+        });
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(answer.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+        provider.begin_pause();
+        if release_with_cancellation {
+            drop(publication.take());
+        }
+        let answer = tokio::time::timeout(Duration::from_secs(1), answer)
+            .await
+            .expect("runtime cancellation must stop the projection waiter");
+        assert_eq!(answer.wire()[3] & 0x0f, 2);
+        assert_eq!(provider.current().lease_count(), 0);
+        assert!(controller.project_routes(&snapshot).is_empty());
+        tokio::time::timeout(Duration::from_secs(1), provider.finish_pause())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(publication);
+        controller.shutdown(Duration::from_secs(1)).await;
+    }
+}

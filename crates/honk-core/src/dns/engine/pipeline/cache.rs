@@ -93,6 +93,7 @@ pub(super) async fn lookup(
     #[cfg(feature = "native-api")]
     crate::observe::flows::dns::cache_entry(entry_id.as_deref());
     let remaining = entry.remaining_ttl_secs();
+    let lifetime = entry.remaining_ttl();
     debug!(remaining, "DNS forwarder: positive cache hit");
     let refresh_after = (entry.min_ttl as u64 / 10).max(1);
     if allow_refresh && remaining <= refresh_after {
@@ -129,7 +130,9 @@ pub(super) async fn lookup(
             None,
             OutcomeStatus::Accepted,
             Provenance::Cache,
-            EffectiveExpiry::cacheable(std::time::Duration::from_secs(remaining)),
+            // The entry's exact remaining lifetime keeps repeated hits on one
+            // stable expiry instant; the wire TTL is rendered separately.
+            EffectiveExpiry::cacheable(lifetime),
             None,
             None,
             Vec::new(),

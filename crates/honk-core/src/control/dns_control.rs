@@ -276,50 +276,83 @@ impl DnsController {
         let evidence = observed_route.as_mut();
         #[cfg(not(feature = "native-api"))]
         let evidence = None;
-        let answer = match self
-            .dns_service
-            .resolve_client_outcome_with_runtime(
-                &admission.runtime,
-                data,
-                metadata,
-                ingress,
-                evidence,
-            )
-            .await
-        {
-            Ok(outcome) => {
-                self.submit_projection(admission.runtime.runtime(), &outcome);
-                DnsClientAnswer(Ok(outcome))
-            }
-            Err(error)
-                if error
-                    .downcast_ref::<crate::dns::forwarder::DnsForwardError>()
-                    .is_some_and(|error| {
-                        matches!(
-                            error.unshared(),
-                            crate::dns::forwarder::DnsForwardError::Overloaded
-                        )
-                    }) =>
+        // The match ends and the outcome moves into `project_answer` before
+        // its await, so the answer future stores no second outcome.
+        let response = 'failed: {
+            let outcome = match self
+                .dns_service
+                .resolve_client_outcome_with_runtime(
+                    &admission.runtime,
+                    data,
+                    metadata,
+                    ingress,
+                    evidence,
+                )
+                .await
             {
-                crate::stats::record_dns_event(crate::stats::DnsStatEvent::OutcomeRejected);
-                DnsClientAnswer(Err(build_dns_refused(data)))
-            }
-            Err(error) => {
-                crate::logging::warn_throttled!(
-                    error = %error,
-                    "DNS controller forward failed; sending SERVFAIL"
-                );
-                DnsClientAnswer(Err(build_dns_servfail(data)))
+                Ok(outcome) => outcome,
+                Err(error)
+                    if error
+                        .downcast_ref::<crate::dns::forwarder::DnsForwardError>()
+                        .is_some_and(|error| {
+                            matches!(
+                                error.unshared(),
+                                crate::dns::forwarder::DnsForwardError::Overloaded
+                            )
+                        }) =>
+                {
+                    crate::stats::record_dns_event(crate::stats::DnsStatEvent::OutcomeRejected);
+                    break 'failed build_dns_refused(data);
+                }
+                Err(error) => {
+                    crate::logging::warn_throttled!(
+                        error = %error,
+                        "DNS controller forward failed; sending SERVFAIL"
+                    );
+                    break 'failed build_dns_servfail(data);
+                }
+            };
+            match self.project_answer(&admission.runtime, outcome).await {
+                Ok(answer) => return answer,
+                Err(error) => {
+                    crate::observe::flows::dns::decision("cancelled", Some("runtime_retired"));
+                    tracing::debug!(%error, "DNS projection wait cancelled with runtime retirement");
+                    break 'failed build_dns_servfail(data);
+                }
             }
         };
         #[cfg(feature = "native-api")]
-        let answer = match (answer.0, observed_route) {
-            (Err(response), Some(source)) => DnsClientAnswer(
-                crate::dns::outcome::DnsOutcome::client_error(data, ingress, response, source),
-            ),
-            (result, _) => DnsClientAnswer(result),
-        };
-        answer
+        if let Some(source) = observed_route {
+            return DnsClientAnswer(crate::dns::outcome::DnsOutcome::client_error(
+                data, ingress, response, source,
+            ));
+        }
+        DnsClientAnswer(Err(response))
+    }
+
+    /// Projects a resolved outcome before it is answered. Only a projection
+    /// that meets a held publication waits, inside its own box; the outcome
+    /// is fully moved there, so ready answers reserve no space for that wait.
+    async fn project_answer(
+        &self,
+        lease: &crate::dns::runtime::RuntimeLease,
+        outcome: crate::dns::outcome::DnsOutcome,
+    ) -> Result<DnsClientAnswer, crate::dns::runtime::RuntimeCancelled> {
+        let observed_at = tokio::time::Instant::now();
+        if !self.try_submit_projection(lease.runtime(), &outcome, observed_at) {
+            return Box::pin(async move {
+                tokio::select! {
+                    biased;
+                    error = lease.cancelled() => return Err(error),
+                    () = self.routing_projection.submit_after_publication(|| {
+                        self.try_submit_projection(lease.runtime(), &outcome, observed_at)
+                    }) => {}
+                }
+                Ok(DnsClientAnswer(Ok(outcome)))
+            })
+            .await;
+        }
+        Ok(DnsClientAnswer(Ok(outcome)))
     }
 
     #[cfg(test)]
@@ -337,15 +370,20 @@ impl DnsController {
             .into_wire()
     }
 
-    fn submit_projection(
+    /// Projects `outcome`, or returns `false` while a publication holds the
+    /// projection fence.
+    fn try_submit_projection(
         &self,
         runtime: &crate::dns::runtime::DnsRuntime,
         outcome: &crate::dns::outcome::DnsOutcome,
-    ) {
+        observed_at: tokio::time::Instant,
+    ) -> bool {
         use crate::dns::outcome::{OutcomeStatus, ResponseClass};
         use crate::dns::projection::ProjectionObservation;
         use honk_outbound::alive::IpVersion;
 
+        let projection = &self.routing_projection;
+        let snapshot = runtime.routing_projection();
         let domain = outcome.domain();
         let family = match outcome.qtype() {
             1 => Some(IpVersion::V4),
@@ -357,18 +395,29 @@ impl DnsController {
         } else {
             match (outcome.status(), outcome.response_class(), family) {
                 (OutcomeStatus::Accepted, ResponseClass::Positive, Some(family)) => {
+                    // Uncacheable does not mean the accepted address has no routing lifetime.
+                    let advertised_ttl = if outcome.expiry().is_cacheable() {
+                        outcome.expiry().ttl()
+                    } else {
+                        Duration::from_secs(u64::from(crate::dns::forwarder::extract_min_ttl(
+                            outcome.reusable(),
+                        )))
+                    };
+                    let expires_at = observed_at + advertised_ttl;
+                    if outcome.provenance() == crate::dns::outcome::Provenance::Cache {
+                        return projection.try_submit_cache_hit(
+                            snapshot,
+                            domain,
+                            family,
+                            outcome.answer_ips(),
+                            expires_at,
+                        );
+                    }
                     ProjectionObservation::Positive {
                         domain,
                         family,
                         ips: outcome.answer_ips(),
-                        // Uncacheable does not mean the accepted address has no routing lifetime.
-                        advertised_ttl: if outcome.expiry().is_cacheable() {
-                            outcome.expiry().ttl()
-                        } else {
-                            Duration::from_secs(u64::from(crate::dns::forwarder::extract_min_ttl(
-                                outcome.reusable(),
-                            )))
-                        },
+                        expires_at,
                     }
                 }
                 (OutcomeStatus::Accepted, ResponseClass::Nodata, Some(family)) => {
@@ -387,7 +436,6 @@ impl DnsController {
                 | (OutcomeStatus::Rejected, _, _) => ProjectionObservation::Retain,
             }
         };
-        self.routing_projection
-            .submit(Arc::clone(runtime.routing_projection()), observation);
+        projection.try_submit(snapshot, observation)
     }
 }

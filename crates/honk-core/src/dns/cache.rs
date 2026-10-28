@@ -349,6 +349,11 @@ mod storage {
                 .unwrap_or(0)
         }
 
+        /// Returns the exact remaining lifetime (zero if expired).
+        pub fn remaining_ttl(&self) -> std::time::Duration {
+            self.expires_at.saturating_duration_since(Instant::now())
+        }
+
         /// Returns `true` once the entry is too old even for serve-stale use
         /// (past `expires_at + STALE_RETENTION`).
         #[inline]

@@ -296,9 +296,15 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 延长 TTL 和更新 LRU 时复用已经入堆的条目。过期唤醒和淘汰候选先重新校验当前 owner，再重排或删除；缩短 TTL 则立即安排更早的截止时间。独立的入队 sequence 标记隔离清除后重建及地址族变化，并保留原有的有界堆压缩。
 
+由 DNS 缓存返回的正应答使用该缓存项的精确剩余寿命。地址集合未变时重新提交只刷新 TTL 与 LRU 新近度，不重建集合。缓存命中还可跳过投影锁：前提是距上次加锁提交不到一秒，且 policy generation、owner 结构和规范化地址集合都相同，报告的到期时间不晚于已应用值、最多早一秒。因此被合并的命中最多使 LRU 新近度滞后一秒、使缩短生效最多晚一秒；跳过本身不会延长或缩短寿命。新增、删除、重建键或因容量被省略的 owner、更新的 generation，以及新鲜、过期或上游应答始终走加锁路径。
+
+每个正应答 observation 在首次提交前固定绝对到期时间。等待发布与重试都会消耗原有寿命，不会重新开始计时；reload 被拒绝后也是如此。如果实际应用时已经到期，只清除所查询地址族的 owner，不插入可被后续 reload 预填的过期 owner。
+
 被省略的 key 按普通的缺失域名事实处理，而不是伪造零 bitmap。现有 dial-mode 和终态 `must`/`block` 语义仍然有效：符合条件的未确定 direct 结果进入 control-plane routing，但该容量策略不会把所有未知事实都强制送入慢路径，也不改变 `ip` 模式。Sniff 写入共享物理 map，仍可能耗尽其预留空间；backend 写入失败继续可观测，并在适用路径中重试。
 
 worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired state，并自行调度剩余已就绪工作，不必等待下一次 DNS observation。过时 key 优先于新增项进入批次；已写入的投影达到 IP 上限后，新增 DNS key 必须等待删除确认，删除失败期间也不释放额度。失败写入保持 dirty，并以有界退避重试。批次修改 backend 前，worker 获取 backend lock，并在持有 publication fence 时重新检查 generation。reload 在同一个 backend lock 下安装替换投影快照。因此，旧批次在替换 generation 发布后既不能进入，也不能继续修改 map。
+
+同代 DNS observation 与 worker 批次共享 publication fence；desired-state mutex 仍串行化 observation 与写入确认。只有携带更新快照的 observation 才独占 fence。查询与 reload 争用时，在应答前异步等待，并受其已捕获 runtime 的取消约束。取消与发布释放同时就绪时优先取消，因此该等待者不发布 observation，而是经现有应答路径返回终态 SERVFAIL。只有争用等待被装箱，未争用应答的 future 大小不变。这不把缓存 flush 的取消范围扩展到解析之后，也不改变独立监听器的 reload 准入。
 
 重试唤醒与批次准入共用同一个带容量判断的逐 IP deadline；投影已满时，过期但无法准入的新增项不会在删除退避期间空转。成功 reload 会先把实际写入新 map 的完整 IP 集合记为 applied，再协调当前 owner，包括加载期间已到期的 owner。worker 的 map 写入与确认保持在同一个 generation fence 内，旧完成事件不能覆盖新发布的记账。保留物理 map 的 reload 也保留原有 applied 状态。
 
