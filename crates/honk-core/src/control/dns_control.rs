@@ -226,8 +226,8 @@ impl DnsController {
     /// permits remain owned by the caller through response I/O.
     pub(crate) fn try_admit_query(&self, udp: bool) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
         let runtime = self
-            .runtime_provider()
-            .try_acquire()
+            .dns_service
+            .try_acquire_runtime()
             .map_err(|_| DnsAdmissionError {
                 error: TryAcquireError::Closed,
                 udp_reply: None,

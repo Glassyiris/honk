@@ -373,6 +373,11 @@ impl RuntimeLease {
         &self,
         operation: std::pin::Pin<&mut impl Future<Output = T>>,
     ) -> Result<T, RuntimeCancelled> {
+        // A retired runtime never polls new work; checking the flag first keeps
+        // that contract while the select below polls the operation first.
+        if self.runtime.cancellation_requested.load(Ordering::Acquire) {
+            return Err(self.cancelled().await);
+        }
         #[cfg(feature = "native-api")]
         let observer = honk_outbound::runtime::flow_observation::current().map(|observer| {
             let mut context = observer.context();
@@ -406,17 +411,18 @@ impl RuntimeLease {
                 operation.await
             }
         };
+        // Ready cache hits must not register a cancellation waiter; the
+        // post-result check keeps cancellation winning a completion race.
         tokio::select! {
             biased;
-            error = self.cancelled() => Err(error),
             result = operation => {
-                // Cancellation can be published after select polls its first branch.
                 if self.runtime.cancellation_requested.load(Ordering::Acquire) {
                     Err(self.cancelled().await)
                 } else {
                     Ok(result)
                 }
             },
+            error = self.cancelled() => Err(error),
         }
     }
 
