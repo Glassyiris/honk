@@ -313,6 +313,31 @@ mod state_claim_tests {
     #[cfg(feature = "native-api")]
     #[tokio::test(flavor = "current_thread")]
     async fn a_native_bind_failure_rolls_back_started_owners_before_returning() {
+        const CHILD: &str = "HONK_NATIVE_BIND_ROLLBACK_CHILD";
+        const NAME: &str = "state::startup::state_claim_tests::a_native_bind_failure_rolls_back_started_owners_before_returning";
+        // Startup installs a process-wide data directory, unlike the other state fixtures.
+        if std::env::var(CHILD).as_deref() != Ok(NAME) {
+            let executable = std::env::current_exe().unwrap();
+            let listed = std::process::Command::new(&executable)
+                .args(["--exact", NAME, "--list", "--format", "terse"])
+                .output()
+                .unwrap();
+            assert!(listed.status.success());
+            assert_eq!(
+                String::from_utf8(listed.stdout).unwrap().trim(),
+                format!("{NAME}: test")
+            );
+            assert!(
+                std::process::Command::new(executable)
+                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                    .env(CHILD, NAME)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().unwrap();
@@ -322,12 +347,24 @@ mod state_claim_tests {
         let lock_path = directory.path().join("honk-core.lock");
         crate::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = Some(lock_path.clone()));
         let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (proxy_tcp, proxy_udp) = (0..32)
+            .find_map(|_| {
+                let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                match std::net::UdpSocket::bind(tcp.local_addr().unwrap()) {
+                    Ok(udp) => Some((tcp, udp)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+                    Err(error) => panic!("reserve UDP listener: {error}"),
+                }
+            })
+            .expect("reserve a TCP/UDP listener port");
+        let proxy_address = proxy_tcp.local_addr().unwrap();
         let config = directory.path().join("config.dae");
         std::fs::write(
             &config,
             format!(
-                "global {{\n data_dir: '{}'\n}}\nexperimental {{\n native_api {{\n  enabled: true\n  listen: '{}'\n  allow_anonymous_loopback: true\n }}\n}}\n",
+                "global {{\n data_dir: '{}'\n tproxy_port: {}\n}}\nexperimental {{\n native_api {{\n  enabled: true\n  listen: '{}'\n  allow_anonymous_loopback: true\n }}\n}}\n",
                 data_dir.display(),
+                proxy_address.port(),
                 occupied.local_addr().unwrap()
             ),
         )
@@ -335,43 +372,23 @@ mod state_claim_tests {
         let cli =
             crate::Cli::parse_from(["honk-core", "--mock-ebpf", "-c", config.to_str().unwrap()]);
 
-        #[derive(Clone, Default)]
-        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self {
-                self.clone()
-            }
-        }
-        let capture = Capture::default();
-        let _logs = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .finish(),
-        );
-
-        let error = crate::run(cli).await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("native API listener bind failed"),
-            "{error:#}"
-        );
-        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            logs.contains("Control plane stopped"),
-            "startup failure must finish joined rollback before returning: {logs}"
-        );
+        drop((proxy_tcp, proxy_udp));
+        crate::run(cli)
+            .await
+            .expect_err("an occupied native listener must refuse startup");
+        let _tcp = std::net::TcpListener::bind(proxy_address)
+            .expect("startup rollback retained the TCP listener");
+        let _udp = std::net::UdpSocket::bind(proxy_address)
+            .expect("startup rollback retained the UDP listener");
+        let _lock = nix::fcntl::Flock::lock(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .expect("startup rollback retained the instance lock");
         crate::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = None);
     }
 }

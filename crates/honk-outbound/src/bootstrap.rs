@@ -609,7 +609,30 @@ impl Drop for LookupObservation {
 }
 
 #[cfg(test)]
-pub(crate) static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) fn run_global_test_in_child(name: &str) -> bool {
+    const CHILD: &str = "HONK_GLOBAL_BOOTSTRAP_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return false;
+    }
+    // Ordinary resolver consumers do not take a test mutex around the global.
+    let executable = std::env::current_exe().unwrap();
+    let listed = std::process::Command::new(&executable)
+        .args(["--exact", name, "--list", "--format", "terse"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert_eq!(
+        String::from_utf8(listed.stdout).unwrap().trim(),
+        format!("{name}: test")
+    );
+    let status = std::process::Command::new(executable)
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(CHILD, name)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    true
+}
 
 #[cfg(test)]
 mod tests;

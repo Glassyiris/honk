@@ -91,10 +91,11 @@ fn spawn_udp_stub_on(
 
 /// End-to-end: a stub UDP DNS server on loopback answering A records,
 /// installed as the global bootstrap resolver.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn test_resolve_via_bootstrap_udp() {
-    let _lock = GLOBAL_TEST_LOCK.lock().unwrap();
+    if run_global_test_in_child("bootstrap::tests::test_resolve_via_bootstrap_udp") {
+        return;
+    }
     let a = IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7));
     let server_addr = spawn_udp_stub(move |query| vec![addr_response(query, &[a])]).await;
 
@@ -124,9 +125,12 @@ async fn silent_aaaa_keeps_a_answer_within_family_budget() {
     assert_eq!(ips, vec![a]);
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn truncated_udp_answer_retries_over_tcp() {
+    #[cfg(feature = "flow-observation")]
+    if run_global_test_in_child("bootstrap::tests::truncated_udp_answer_retries_over_tcp") {
+        return;
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53));
     let (tcp, udp) = async {
@@ -208,7 +212,6 @@ async fn truncated_udp_answer_retries_over_tcp() {
     {
         use crate::runtime::flow_observation::FlowEvent;
 
-        let _lock = GLOBAL_TEST_LOCK.lock().unwrap();
         set_global(Some(resolver));
         let ech = observer.scope(query_ech_config("ech.invalid")).await;
         set_global(None);
@@ -348,10 +351,11 @@ fn test_parse_https_rr_ech() {
 
 /// End-to-end: stub UDP DNS server answering HTTPS records with an ech
 /// SvcParam, installed as the global bootstrap resolver.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn test_query_ech_config_via_bootstrap_udp() {
-    let _lock = GLOBAL_TEST_LOCK.lock().unwrap();
+    if run_global_test_in_child("bootstrap::tests::test_query_ech_config_via_bootstrap_udp") {
+        return;
+    }
     let ech = b"\x00\x02real-ech-bytes";
     let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let server_addr = server.local_addr().unwrap();
