@@ -665,7 +665,6 @@ impl ControlPlane {
                             .map(|(ip, bitmap)| (ip, &bitmap.bitmap)));
                 drop(old_projection);
                 let provider = self.dns_controller.runtime_provider();
-                let publication = provider.prepare_publication(new_runtime);
 
                 let transition_group_count =
                     current_config.groups.len().max(new_config.groups.len());
@@ -716,6 +715,8 @@ impl ControlPlane {
                         "Failed to publish exact group connectivity after reload; remaining slots stay fail-open"
                     );
                 }
+                // Fence DNS admission for authority changes, not the preceding map staging.
+                let publication = provider.prepare_publication(new_runtime);
                 let old_registry =
                     std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
                 new_runtime_registry.activate_background_dial_admission();
