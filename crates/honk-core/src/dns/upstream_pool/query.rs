@@ -314,6 +314,25 @@ impl UpstreamPool {
             .await
     }
 
+    /// Boxed so a direct UDP query, which normally reuses its current
+    /// address, does not reserve the resolver's state in its future.
+    async fn resolve_observed_addrs(
+        &self,
+        entry: &UpstreamEntry,
+    ) -> (
+        anyhow::Result<Vec<SocketAddr>>,
+        Option<honk_outbound::runtime::flow_observation::LookupSelection>,
+    ) {
+        Box::pin(async {
+            let resolve = honk_outbound::runtime::flow_observation::observe_resolution(
+                self.resolve_addrs(entry),
+            );
+            crate::observe::scope_pin!(resolve);
+            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await
+        })
+        .await
+    }
+
     #[cfg(test)]
     pub(super) async fn resolve_upstream_addr(
         &self,
@@ -325,6 +344,9 @@ impl UpstreamPool {
             .next()
             .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))
     }
+
+    /// Boxed so a direct UDP query, which takes this path only for a TC
+    /// fallback, does not reserve transport dial state in its future.
     async fn exchange_routed(
         &self,
         entry: &UpstreamEntry,
@@ -332,19 +354,22 @@ impl UpstreamPool {
         raw_query: &[u8],
         business: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        let _release = IdlePressureRelease(&self.socket_budget);
-        match self
-            .get_transport(entry, route.node.as_ref(), route.target)
-            .await
-        {
-            Ok(transport) => transport.exchange(raw_query, business).await,
-            Err(error) => {
-                if let Some(business) = business {
-                    business.finish(honk_outbound::group::ScoreOutcome::from_error(&error));
+        Box::pin(async move {
+            let _release = IdlePressureRelease(&self.socket_budget);
+            match self
+                .get_transport(entry, route.node.as_ref(), route.target)
+                .await
+            {
+                Ok(transport) => transport.exchange(raw_query, business).await,
+                Err(error) => {
+                    if let Some(business) = business {
+                        business.finish(honk_outbound::group::ScoreOutcome::from_error(&error));
+                    }
+                    Err(error)
                 }
-                Err(error)
             }
-        }
+        })
+        .await
     }
 
     async fn query_udp_via_proxy(
@@ -442,12 +467,7 @@ impl UpstreamPool {
         let has_traffic_router =
             self.traffic_router_snapshot.read().is_some() || self.traffic_router.read().is_some();
         let initial_route = if current.is_none() && entry.outbound.is_none() && has_traffic_router {
-            let resolve = honk_outbound::runtime::flow_observation::observe_resolution(
-                self.resolve_addrs(entry),
-            );
-            crate::observe::scope_pin!(resolve);
-            let (targets, witness) =
-                crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await;
+            let (targets, witness) = self.resolve_observed_addrs(entry).await;
             let target = targets?
                 .into_iter()
                 .next()
@@ -504,11 +524,7 @@ impl UpstreamPool {
             None
         };
 
-        let resolve =
-            honk_outbound::runtime::flow_observation::observe_resolution(self.resolve_addrs(entry));
-        crate::observe::scope_pin!(resolve);
-        let (addresses, witness) =
-            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await;
+        let (addresses, witness) = self.resolve_observed_addrs(entry).await;
         let addresses = addresses?;
         let (first, first_error, retry) = if let Some((failed_address, first_error)) = failed {
             let [first, retry] = udp_attempt_addresses(&addresses, Some(failed_address))
@@ -629,11 +645,7 @@ impl UpstreamPool {
             return self.query_datagram(upstream_name, entry, raw_query).await;
         }
 
-        let resolve =
-            honk_outbound::runtime::flow_observation::observe_resolution(self.resolve_addrs(entry));
-        crate::observe::scope_pin!(resolve);
-        let (targets, witness) =
-            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await;
+        let (targets, witness) = self.resolve_observed_addrs(entry).await;
         let targets = targets?;
         let mut last_error = None;
         let mut first_error = None;

@@ -238,6 +238,8 @@ DNS client task owner 与捕获的 runtime owner 保留同一份 packet-adapter 
 
 `-> node-or-group` 强制选择一个由 generation 固定的拨号叶子。没有显式目标时，上游 endpoint 经过固定的流量 Router 与组快照。UDP+代理有意使用 TCP-DNS；此策略独立于普通代理 UDP 流量使用的 SOCKS5 RFC 1928 UDP transport。
 
+直连 UDP 查询的 future 只为直连交换保留状态。经路由的 transport 交换（包括 `TC` fallback 与代理 UDP）及 endpoint 地址解析仅在实际走到时才将其状态装箱；否则每次缓存未命中都要为用不到的路径分配并复制数十 KB 状态。
+
 直连上游 socket 带 bypass mark，使其流量不会重新进入透明拦截。主机名 endpoint 通过 generation 捕获的 bootstrap resolver 解析；拨号从不依赖 honk 被拦截的 resolver 路径。
 
 拨号/TLS/QUIC/HTTP session 建立使用 dial/handshake timeout，请求/响应交换使用独立的 query timeout。一次查询尝试只有一个绝对交换 deadline。每个 transport 失败后最多重试一次，并在需要时重置无效的可复用 session，因此总查询工作有界。Transport slot 对并发初始化执行 singleflight，并为每个关闭中的资源保留唯一的 teardown future。池关闭先停止准入并等待已准入交换，然后关闭空闲资源，显式 join 每个 receive 或协议 driver task。

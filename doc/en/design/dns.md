@@ -238,6 +238,8 @@ The DNS client's task owner and any captured runtime owner retain the same packe
 
 `-> node-or-group` forces one generation-pinned dial leaf. Without an explicit target, the upstream endpoint is passed through the pinned traffic router and group snapshot. UDP+proxy deliberately uses TCP-DNS; this policy is separate from the SOCKS5 RFC 1928 UDP transport used by ordinary proxied UDP flows.
 
+A direct UDP query's future reserves only the direct exchange. Routed transport exchanges, including `TC` fallback and proxied UDP, and endpoint address resolution box their state when taken; otherwise every cache miss would allocate and copy tens of kilobytes of state for paths it does not use.
+
 Direct upstream sockets carry the bypass mark so their traffic cannot re-enter transparent interception. Hostname endpoints resolve through the generation-captured bootstrap resolver; dials never depend on honk's intercepted resolver path.
 
 Dial/TLS/QUIC/HTTP session setup uses the dial/handshake timeout, while request/response exchange uses the distinct query timeout. A query attempt has one absolute exchange deadline. Every transport retries at most once after failure, resetting an invalid reusable session where required, so aggregate query work remains bounded. Transport slots single-flight concurrent initialization and retain one teardown future per closing resource. Pool shutdown first closes admission and waits for admitted exchanges, then closes idle resources and explicitly joins every receive or protocol-driver task.
