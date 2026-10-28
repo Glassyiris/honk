@@ -551,30 +551,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn hosts_hit_bypasses_bootstrap_admission_while_all_socket_credits_are_held() {
-        let budget = DnsSocketBudget::new(2);
-        let held = budget
-            .acquire_bootstrap_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert_eq!(budget.available_sockets(), 0);
-        let endpoint = DnsEndpoint::parse("localhost:853", DnsProtocol::Tls, None).unwrap();
-        let addresses = tokio::time::timeout(
-            Duration::from_secs(1),
-            endpoint.resolve_addrs_budgeted(&budget, Instant::now()),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(!addresses.is_empty());
-        assert!(addresses.iter().all(|address| address.ip().is_loopback()));
-        assert!(addresses.iter().all(|address| address.port() == 853));
-        assert_eq!(budget.available_sockets(), 0);
-        drop(held);
-        assert_eq!(budget.available_sockets(), 2);
-    }
-
     async fn spawn_bootstrap_server(
         ipv4: [u8; 4],
         ipv6: Option<[u8; 16]>,

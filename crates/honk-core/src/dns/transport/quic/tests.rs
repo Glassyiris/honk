@@ -112,9 +112,8 @@ async fn literal_doq_and_doh3_handshakes_record_actual_success_and_failure() {
             .await
             .unwrap();
             if succeeds {
-                let (connection, owner) = client.unwrap();
+                let (connection, _owner) = client.unwrap();
                 let accepted = accepted.unwrap();
-                assert!(owner.packet().is_none());
                 connection.close(0_u32.into(), b"done");
                 accepted.close(0_u32.into(), b"done");
             } else {

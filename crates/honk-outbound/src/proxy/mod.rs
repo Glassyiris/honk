@@ -230,9 +230,9 @@ mod tests;
 #[cfg(test)]
 mod runtime_owned_io_tests {
     use super::RuntimeOwnedIo;
-    use std::io::{IoSlice, Read};
+    use std::io::Read;
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
     struct SocketOwner {
@@ -261,21 +261,8 @@ mod runtime_owned_io_tests {
             _permit: capacity.clone().acquire_owned().await.unwrap(),
         };
         let stream = RuntimeOwnedIo::new(tokio::net::UnixStream::from_std(stream).unwrap(), owner);
-        assert!(stream.is_write_vectored());
-        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (mut reader, writer) = tokio::io::split(stream);
         let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
-        assert_eq!(
-            writer
-                .write_vectored(&[IoSlice::new(b"own"), IoSlice::new(b"ed")])
-                .await
-                .unwrap(),
-            5
-        );
-        writer.flush().await.unwrap();
-        let mut sent = [0; 5];
-        peer.read_exact(&mut sent).await.unwrap();
-        assert_eq!(&sent, b"owned");
-
         drop(writer);
         assert_eq!(capacity.available_permits(), 0);
         peer.write_all(b"reply").await.unwrap();

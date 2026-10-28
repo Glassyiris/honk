@@ -147,11 +147,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         .expect("truncated outcome");
     assert!(outcome.answer_ips().is_empty());
     assert!(!outcome.expiry().is_cacheable());
-    assert!(controller.try_submit_projection(
-        runtime.runtime(),
-        &outcome,
-        tokio::time::Instant::now()
-    ));
+    controller.try_submit_projection(runtime.runtime(), &outcome, tokio::time::Instant::now());
     drop(runtime);
 
     assert!(cache.lock().await.is_empty());

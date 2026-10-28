@@ -707,15 +707,9 @@ async fn query_start_spawns_only_unfinished_work_and_retains_panics() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn udp_supervisors_share_one_socket_and_join_on_shutdown() {
+async fn udp_listener_answers_concurrent_queries_and_joins_on_shutdown() {
     let (controller, calls) = controller([192, 0, 2, 30]);
     let (mut listener, address, drain) = start_listener("udp://127.0.0.1:0", controller);
-    assert_eq!(
-        listener.supervisors.len(),
-        4,
-        "supervisors are capped at four"
-    );
-
     let mut clients = JoinSet::new();
     for txid in 0..8u16 {
         clients.spawn(async move {

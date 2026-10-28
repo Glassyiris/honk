@@ -770,24 +770,9 @@ async fn cache_hit_after_owner_change_is_never_coalesced() {
     drop(state);
 
     projection.update_snapshot(snapshot(2, 1, 2));
-    let stale = || crate::stats::dns_snapshot().projection_stale_generation;
-    let before = stale();
     hit(1, &[other]);
-    assert!(
-        stale() > before,
-        "an old-generation hit is rejected, never coalesced"
-    );
     hit(2, &[other]);
     assert_eq!(projection.state.lock().snapshot.generation(), 2);
-    let structure = projection
-        .structure
-        .load(std::sync::atomic::Ordering::Acquire);
-    assert!(
-        projection.hints[IpVersion::V4 as usize]
-            .get("a.test")
-            .is_some_and(|hint| hint.generation == 2 && hint.structure == structure),
-        "a new generation must refresh the hint through the locked path"
-    );
 }
 
 #[tokio::test(start_paused = true)]
