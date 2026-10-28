@@ -10,9 +10,11 @@ use crate::control::drain::DrainTracker;
 use crate::dns::query::{DnsRequestMeta, validate_exact_dns_query};
 use crate::stats::StatsManager;
 use honk_config::dns::DnsBindEndpoint;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::task::Poll;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
@@ -151,15 +153,21 @@ impl BoundDnsListener {
         let mut supervisors = JoinSet::new();
 
         if let Some(socket) = udp {
-            supervisors.spawn(run_udp_supervisor(
-                socket,
-                Arc::clone(&controller),
-                stats,
-                Arc::clone(&drain),
-                phase_rx.clone(),
-                native.clone(),
-                diagnostics.clone(),
-            ));
+            for _ in 0..tokio::runtime::Handle::current()
+                .metrics()
+                .num_workers()
+                .clamp(1, 4)
+            {
+                supervisors.spawn(run_udp_supervisor(
+                    Arc::clone(&socket),
+                    Arc::clone(&controller),
+                    Arc::clone(&stats),
+                    Arc::clone(&drain),
+                    phase_rx.clone(),
+                    native.clone(),
+                    diagnostics.clone(),
+                ));
+            }
         }
         if let Some(listener) = tcp {
             supervisors.spawn(run_tcp_supervisor(
@@ -301,7 +309,7 @@ fn bind_udp_listener(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     if addr.is_ipv6() && addr.ip().is_unspecified() {
         socket.set_only_v6(false)?;
     }
-    let _ = socket.set_recv_buffer_size(1 << 20);
+    let _ = socket.set_recv_buffer_size(4 << 20);
     socket.bind(&addr.into())?;
     socket.set_nonblocking(true)?;
     let socket = std::net::UdpSocket::from(socket);
@@ -409,6 +417,9 @@ async fn run_udp_supervisor(
                     if std::mem::replace(&mut receive_failing, false) {
                         info!("standalone UDP DNS receive recovered");
                     }
+                    if !tokio::task::coop::has_budget_remaining() {
+                        tokio::task::yield_now().await;
+                    }
                     if *phase.borrow() != ListenerPhase::Running {
                         break 'receive;
                     }
@@ -479,7 +490,7 @@ async fn run_udp_supervisor(
                     let guard = ConnectionGuard::new(Arc::clone(&drain));
                     let child_socket = Arc::clone(&socket);
                     let child_controller = Arc::clone(&controller);
-                    children.spawn(async move {
+                    let child = Box::pin(async move {
                         let _guard = guard;
                         let metadata = DnsRequestMeta::new(Some(client_addr.ip()), None);
                         let operation = async {
@@ -518,6 +529,7 @@ async fn run_udp_supervisor(
                         }
                         observation.finish(crate::observe::vocab::ConnectionState::Closed, "dns_query_completed");
                     });
+                    start_query(&mut children, &phase, &mut failure, child).await;
                 }
                 for _ in 0..received {
                     let Some(completed) = children.try_join_next() else {
@@ -532,6 +544,39 @@ async fn run_udp_supervisor(
     drop(socket);
     finish_children(&mut children, &mut phase, &mut failure, "UDP query").await;
     failure.map_or(Ok(()), Err)
+}
+
+/// Polls a query once on the supervisor so ready answers skip a task spawn;
+/// only unfinished work becomes a joined child. A panic fails teardown like a
+/// child join error, and Abort drops unfinished work as `abort_all` would.
+async fn start_query<F>(
+    children: &mut JoinSet<()>,
+    phase: &watch::Receiver<ListenerPhase>,
+    failure: &mut Option<anyhow::Error>,
+    mut child: std::pin::Pin<Box<F>>,
+) where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let polled = poll_fn(|cx| {
+        Poll::Ready(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || child.as_mut().poll(cx),
+        )))
+    })
+    .await;
+    match polled {
+        Ok(Poll::Ready(())) => {}
+        Ok(Poll::Pending) => {
+            if *phase.borrow() != ListenerPhase::Abort {
+                children.spawn(child);
+            }
+        }
+        Err(_) => {
+            debug!(label = "UDP query", "standalone DNS child panicked");
+            failure.get_or_insert_with(|| {
+                anyhow::anyhow!("standalone DNS child panicked").context("UDP query")
+            });
+        }
+    }
 }
 
 async fn send_udp_refused(
