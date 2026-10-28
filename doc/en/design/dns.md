@@ -225,7 +225,7 @@ When `store_dns` enables persistence, a bounded actor mirrors retained positive 
 
 | Protocol | Reuse model | Dial-path proxy |
 | --- | --- | --- |
-| UDP | One connected generation-owned socket and receive task per direct upstream; TCP pool handles `TC` fallback. | A configured proxy intentionally carries the query as pooled TCP-DNS. |
+| UDP | One generation-owned primary connected socket plus up to three pressure-triggered socket shards per direct upstream address, each with a receive task; TCP pool handles `TC` fallback. | A configured proxy intentionally carries the query as pooled TCP-DNS. |
 | TCP | Idle RFC 7766 stream pool. | Supported through the selected node or group leaf. |
 | DoT | Idle TLS stream pool. | Supported over a proxied TCP base stream. |
 | DoH | One long-lived, multiplexed HTTP/2-only TLS session. | Supported over a proxied TCP base stream. |
@@ -305,7 +305,7 @@ Within a generation, each owner caches its predicate bitmap, and each IP counts 
 
 TTL extensions and LRU refreshes reuse their queued heap entries. Expiry wakes and eviction candidates revalidate the current owner before rescheduling or removing it; shorter TTLs are scheduled immediately. Separate queued sequence stamps fence clear/re-add and address-family changes while retaining the existing bounded heap compaction.
 
-A positive answer served from the DNS cache uses the entry's exact remaining lifetime. Re-submitting an unchanged address set refreshes TTL and LRU recency without rebuilding the set. Cache hits may additionally skip the projection locks when, within one second of the last locked submission, the same policy generation, unchanged owner structure and identical canonical address set report an expiry no later than the applied one and at most one second earlier. A coalesced hit therefore leaves LRU recency at most one second stale and applies a shortening at most one second late; it never extends or shortens a lifetime by skipping. Any added, removed, re-keyed or capacity-omitted owner, a newer generation, or a fresh, stale or upstream answer always takes the locked path.
+A positive answer served from the DNS cache uses the entry's exact remaining lifetime. Re-submitting an unchanged address set refreshes TTL and LRU recency without rebuilding the set. Cache hits may additionally skip the projection locks when, within one second of the last locked submission, the same policy generation, unchanged owner structure and identical canonical address set report an expiry no later than the applied one and at most one second earlier. A coalesced hit skips a shortening of at most one second and schedules no later update, so routing lifetime can exceed the cache-reported expiry by at most that window; LRU recency may lag by the same window. Any added, removed, re-keyed or capacity-omitted owner, a newer generation, or a fresh, stale or upstream answer always takes the locked path.
 
 Every positive observation fixes its absolute expiry before its first submission. Publication waits and retries consume that lifetime instead of restarting it, including after a rejected reload. If the deadline has already elapsed when the observation can be applied, it clears only the queried address-family owner; no expired owner is inserted for a subsequent reload to prefill.
 

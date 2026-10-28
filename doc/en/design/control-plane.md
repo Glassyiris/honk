@@ -224,10 +224,7 @@ Admission ceilings are distinct:
 | DNS proxy stream / non-raw packet preparation | Conservative process-wide logical leases, at most the DNS socket limit; not an aggregate proxy FD bound |
 | NFQUEUE ingest actor | 256 entries and 8 MiB |
 
-DNS query memory is a sizing allowance rather than a hard RSS limit. Its socket
-gate retains credits through idle pools and actual driver teardown; pressure
-reclaims unborrowed cached transports instead of permanently starving another
-upstream. Proxy carrier ownership remains separate; see [DNS admission](./dns.md#resolution-pipeline).
+Proxy carrier ownership remains separate; see [DNS admission](./dns.md#resolution-pipeline) for the query and socket admission contracts.
 
 TCP accepts use the descriptor-derived flow budget, not a separate 256-entry ceiling. The [joined removal worker](./datapath.md#userspace-maintenance-and-accounting) serves TCP, UDP and expiry hints; UDP retains its 1024-message channel and deduplicating `removal_dirty` compensation. Exact tombstones are acknowledged only after owned I/O and backend retirement finish.
 

@@ -210,9 +210,7 @@ memory 或 scheduler capacity。TCP 从描述符导出的 floor 开始，封顶 
 | DNS 代理 stream / 非原始 UDP 的 packet 准备 | 不超过 DNS socket 上限的进程级保守逻辑 lease；不是所有代理 FD 的总上限 |
 | NFQUEUE ingest actor | 256 个条目和 8 MiB |
 
-DNS 查询内存值用于容量估算，不是硬 RSS 上限。Socket gate 的额度保留到空闲池及
-实际 driver teardown 完成；压力下回收未被借用的缓存 transport，避免其他上游永久
-饥饿。代理 carrier 的所有权仍独立管理，见 [DNS 准入](./dns.md#解析管线)。
+代理 carrier 的所有权仍独立管理；查询与 socket 的准入约束见 [DNS 准入](./dns.md#解析管线)。
 
 TCP accept 使用描述符导出的流预算，没有独立的 256 项上限。[Joined removal worker](./datapath.md#用户空间维护与计数) 处理 TCP、UDP 与 expiry hint；UDP 保留 1024 条消息的 channel 和去重 `removal_dirty` 补偿。只有自有 I/O 和后端退役完成后才确认精确 tombstone。
 
@@ -264,7 +262,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
    停止 warm coordinator 会取消可能依赖另一 coordinator 的 retention-reconciliation 等待；coordinator 退出前仍会 abort 并 join 自己派发的子任务。QUIC warm 释放与终止关闭在 client 槽位上串行化，即使未启用原生任务所有权也一样；取消释放不会提前清空槽位，终止关闭仍能取得 client。
 5. 开放 pending 准入，最后重开 NFQUEUE。规则派生 feature bit 存在 policy descriptor 中，不再单独发布到静态 flag map。
 
-`control/reload/transaction.rs` 在候选准备与提交外层持有 `reload_lock`。新代发布依次取得 `router` → `config` → `datapath_flags.publication()`（仅原生显式源激活）→ `ebpf`，随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`。在这些 guard 内，provider 的 DNS publication guard 延后到 backend staging 完成、registry 权限替换之前取得，仍持有到原有 DNS pointer 提交点。因此 backend staging 不再占用 provider 准入锁，而 registry 转移、回调安装和 Score 权限发布仍阻止新的旧代 DNS 准入。原生 no-op 激活取得 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 独立 mode/fence 更新按 flags mutex → `ebpf`；`reset_for_activation` 不重新取得这两者，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 外运行。这只是记录既有锁边，不授权新增锁边；变更仍须遵守 CONTRIBUTING §2/§11 与人工审查。
+`control/reload/transaction.rs` 在候选准备与提交外层持有 `reload_lock`。新代发布依次取得 `router` → `config` → `datapath_flags.publication()`（仅原生显式源激活）→ `ebpf`，随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`。在这些 guard 内，provider 的 DNS publication guard 延后到 backend staging 完成后、紧接着在 registry 权限替换之前取得，仍持有到原有 DNS pointer 提交点。因此 backend staging 不再占用 provider 准入锁，而 registry 转移、回调安装和 Score 权限发布仍阻止新的旧代 DNS 准入。原生 no-op 激活取得 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 独立 mode/fence 更新按 flags mutex → `ebpf`；`reset_for_activation` 不重新取得这两者，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 外运行。这只是记录既有锁边，不授权新增锁边；变更仍须遵守 CONTRIBUTING §2/§11 与人工审查。
 
 `RoutingPushPlan::compile` 是唯一用户态 lowering 路径；调用方不选择 slot，也没有独立 domain-publication handshake。`routing_policy.rs` ABI 分别为 `RoutingInput` 128 字节、`RoutingDecision` 24 字节与 `RoutingPolicyDescriptor` 24 字节。真实 eBPF 要求 Linux 6.12+；生成的进程名匹配代码在固定偏移读取前检查 `pname_len`，以符合 6.12 verifier。已加载路由 slot 的 BTF 必须暴露当前输出布局。
 

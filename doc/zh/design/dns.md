@@ -225,7 +225,7 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 
 | 协议 | 复用模型 | 拨号路径代理 |
 | --- | --- | --- |
-| UDP | 每个直连上游一个由 generation 持有的 connected socket 与 receive task；`TC` fallback 由 TCP 池处理。 | 配置代理时，查询由池化 TCP-DNS 承载。 |
+| UDP | 每个直连上游地址由 generation 持有一个主 connected socket 及最多三个压力触发的 socket 分片，每个 socket 各有一个 receive task；`TC` fallback 由 TCP 池处理。 | 配置代理时，查询由池化 TCP-DNS 承载。 |
 | TCP | RFC 7766 空闲 stream 池。 | 支持经所选节点或组叶子。 |
 | DoT | 空闲 TLS stream 池。 | 支持经代理 TCP 基础 stream。 |
 | DoH | 一个长生命周期、可复用并发请求的 HTTP/2-only TLS session。 | HTTP/2 会话可经由代理 TCP 连接建立。 |
@@ -298,7 +298,7 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 延长 TTL 和更新 LRU 时复用已经入堆的条目。过期唤醒和淘汰候选先重新校验当前 owner，再重排或删除；缩短 TTL 则立即安排更早的截止时间。独立的入队 sequence 标记隔离清除后重建及地址族变化，并保留原有的有界堆压缩。
 
-由 DNS 缓存返回的正应答使用该缓存项的精确剩余寿命。地址集合未变时重新提交只刷新 TTL 与 LRU 新近度，不重建集合。缓存命中还可跳过投影锁：前提是距上次加锁提交不到一秒，且 policy generation、owner 结构和规范化地址集合都相同，报告的到期时间不晚于已应用值、最多早一秒。因此被合并的命中最多使 LRU 新近度滞后一秒、使缩短生效最多晚一秒；跳过本身不会延长或缩短寿命。新增、删除、重建键或因容量被省略的 owner、更新的 generation，以及新鲜、过期或上游应答始终走加锁路径。
+由 DNS 缓存返回的正应答使用该缓存项的精确剩余寿命。地址集合未变时重新提交只刷新 TTL 与 LRU 新近度，不重建集合。缓存命中还可跳过投影锁：前提是距上次加锁提交不到一秒，且 policy generation、owner 结构和规范化地址集合都相同，报告的到期时间不晚于已应用值、最多早一秒。被合并的命中会跳过最多一秒的寿命缩短，且不会安排后续更新，因此路由到期时间最多可比缓存报告的到期时间晚一秒；LRU 新近度也可能滞后同样的窗口。新增、删除、重建键或因容量被省略的 owner、更新的 generation，以及新鲜、过期或上游应答始终走加锁路径。
 
 每个正应答 observation 在首次提交前固定绝对到期时间。等待发布与重试都会消耗原有寿命，不会重新开始计时；reload 被拒绝后也是如此。如果实际应用时已经到期，只清除所查询地址族的 owner，不插入可被后续 reload 预填的过期 owner。
 
