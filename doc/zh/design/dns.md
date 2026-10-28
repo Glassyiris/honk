@@ -284,6 +284,10 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 投影最多保留 10,000 个 owner（同一名称的 A 与 AAAA owner 分别计数），并向容量为 65,536 的 domain map 准入最多 49,152 个唯一 IP key。选入 desired/reload 集合的零 bitmap 另有 32,768 个 key 的上限，为后续命中规则的 DNS 事实留出空间；等待成功删除的过时零值 key 可暂时突破该子上限，但仍受 applied 总上限约束。剩余 16,384 个 map 槽位不供 DNS 投影使用，留给 sniff 写入。IPv4 与 mapped-IPv6 owner 共用一个 key，并按 OR 合并事实。增量协调与 reload 使用同一准入策略：先淘汰零 bitmap，同一优先级内淘汰地址最大的 IP。被省略的 owner 仍可在后续策略 generation 重新参与投影；普通刷新也可在空间可用时重新准入被省略的 IP。容量压力会产生警告。
 
+同一 generation 内，每个 owner 缓存其谓词 bitmap，每个 IP 按名称/地址族成员记录各 bitmap 的贡献次数。变更单个 owner 时只合并不同的 bitmap，不再重新匹配共享该 IP 的所有名称。Reload 投影在候选快照下对每个保留名称只计算一次；发布时重建缓存贡献，不改变准入策略。
+
+延长 TTL 和更新 LRU 时复用已经入堆的条目。过期唤醒和淘汰候选先重新校验当前 owner，再重排或删除；缩短 TTL 则立即安排更早的截止时间。独立的入队 sequence 标记隔离清除后重建及地址族变化，并保留原有的有界堆压缩。
+
 被省略的 key 按普通的缺失域名事实处理，而不是伪造零 bitmap。现有 dial-mode 和终态 `must`/`block` 语义仍然有效：符合条件的未确定 direct 结果进入 control-plane routing，但该容量策略不会把所有未知事实都强制送入慢路径，也不改变 `ip` 模式。Sniff 写入共享物理 map，仍可能耗尽其预留空间；backend 写入失败继续可观测，并在适用路径中重试。
 
 worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired state，并自行调度剩余已就绪工作，不必等待下一次 DNS observation。过时 key 优先于新增项进入批次；已写入的投影达到 IP 上限后，新增 DNS key 必须等待删除确认，删除失败期间也不释放额度。失败写入保持 dirty，并以有界退避重试。批次修改 backend 前，worker 获取 backend lock，并在持有 publication fence 时重新检查 generation。reload 在同一个 backend lock 下安装替换投影快照。因此，旧批次在替换 generation 发布后既不能进入，也不能继续修改 map。

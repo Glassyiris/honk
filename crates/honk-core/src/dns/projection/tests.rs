@@ -142,17 +142,30 @@ async fn address_family_owners_expire_independently() {
     let now = tokio::time::Instant::now();
     let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4));
     let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 4));
+    let blocker = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5));
     let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
     state.observe(positive("a.test", &[v4], Duration::from_secs(30)), now);
     state.observe(positive("a.test", &[v6], Duration::from_secs(60)), now);
+    state.observe(positive("b.test", &[blocker], Duration::from_secs(5)), now);
+    state.observe(clear_v4("a.test"), now + Duration::from_secs(1));
+    state.observe(
+        positive("a.test", &[v4], Duration::from_secs(40)),
+        now + Duration::from_secs(1),
+    );
 
-    let later = now + Duration::from_secs(31);
+    state.expire(now + Duration::from_secs(31));
+    assert!(state.desired.contains_key(&v4) && state.desired.contains_key(&v6));
+    assert!(!state.desired.contains_key(&blocker));
+
+    let later = now + Duration::from_secs(41);
     state.expire(later);
     assert!(!state.desired.contains_key(&v4) && state.desired.contains_key(&v6));
 
     state.observe(positive("a.test", &[v4], Duration::from_secs(60)), later);
     state.expire(now + Duration::from_secs(61));
     assert!(state.desired.contains_key(&v4) && !state.desired.contains_key(&v6));
+    state.expire(now + Duration::from_secs(101));
+    assert!(state.owner_domains().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -161,6 +174,8 @@ async fn positive_refresh_uses_advertised_ttl_and_retain_keeps_owner() {
     let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
     let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
     state.observe(positive("a.test", &[ip], Duration::from_secs(30)), now);
+    let initial = state.batch(now);
+    assert!(state.commit_success(&initial.sets, &initial.removes));
     state.observe(ProjectionObservation::Retain, now + Duration::from_secs(1));
     state.observe(
         ProjectionObservation::Positive {
@@ -171,8 +186,9 @@ async fn positive_refresh_uses_advertised_ttl_and_retain_keeps_owner() {
         },
         now + Duration::from_secs(1),
     );
+    assert_eq!(state.next_deadline(), Some(now + Duration::from_secs(3)));
     state.expire(now + Duration::from_secs(2));
-    assert!(state.batch(now + Duration::from_secs(2)).sets.len() == 1);
+    assert!(state.desired.contains_key(&ip));
     state.expire(now + Duration::from_secs(3));
     assert_eq!(state.owner_domains(), Vec::<String>::new());
 }
@@ -258,6 +274,18 @@ async fn deterministic_capacity_evicts_oldest_domain() {
     assert_eq!(
         state.owner_domains(),
         vec!["a.test".to_owned(), "c.test".to_owned()]
+    );
+    state.observe(
+        positive(
+            "d.test",
+            &[IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5))],
+            Duration::from_secs(30),
+        ),
+        now,
+    );
+    assert_eq!(
+        state.owner_domains(),
+        vec!["c.test".to_owned(), "d.test".to_owned()]
     );
 }
 
@@ -527,6 +555,7 @@ async fn refresh_and_ip_replacement_preserve_ttl() {
     assert!(state.batch(now).sets.is_empty());
     state.expire(now + Duration::from_secs(11));
     assert_eq!(state.owner_domains(), vec!["a.test".to_owned()]);
+    assert_eq!(state.next_deadline(), Some(now + Duration::from_secs(20)));
 
     state.observe(positive("a.test", &[new_ip], Duration::from_secs(30)), now);
     let replacement = state.batch(now);
@@ -542,12 +571,22 @@ async fn refresh_and_ip_replacement_preserve_ttl() {
     assert!(!state.reverse.contains_key(&old_ip));
     assert!(
         state.reverse[&new_ip]
+            .members
             .iter()
             .any(|(domain, _)| &**domain == "a.test")
     );
-    state.expire(now + Duration::from_secs(29));
+    assert!(state.commit_success(&replacement.sets, &replacement.removes));
+    for (observed_at, ttl) in [(11, 5), (12, 20), (13, 5), (14, 20)] {
+        state.observe(
+            positive("a.test", &[new_ip], Duration::from_secs(ttl)),
+            now + Duration::from_secs(observed_at),
+        );
+    }
+    state.expire(now + Duration::from_secs(19));
+    assert_eq!(state.next_deadline(), Some(now + Duration::from_secs(34)));
+    state.expire(now + Duration::from_secs(33));
     assert_eq!(state.owner_domains(), vec!["a.test".to_owned()]);
-    state.expire(now + Duration::from_secs(31));
+    state.expire(now + Duration::from_secs(34));
     assert!(state.owner_domains().is_empty());
 }
 

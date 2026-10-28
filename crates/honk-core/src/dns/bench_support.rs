@@ -59,6 +59,19 @@ pub struct ProjectionBenchmark {
 
 impl ProjectionBenchmark {
     pub fn new() -> Self {
+        Self::with_domains(vec![Arc::<str>::from("projection.example")])
+    }
+
+    /// `names` distinct names answered with one IP, observed round-robin.
+    pub fn shared_ip(names: usize) -> Self {
+        Self::with_domains(
+            (0..names)
+                .map(|index| Arc::<str>::from(format!("n{index}.projection.example")))
+                .collect(),
+        )
+    }
+
+    fn with_domains(domains: Vec<Arc<str>>) -> Self {
         let rule = honk_config::routing::RoutingRule {
             name: "projection-bench".to_owned(),
             condition: honk_config::routing::RoutingCondition {
@@ -75,7 +88,7 @@ impl ProjectionBenchmark {
         Self {
             replacement: ProjectionReplacementBenchmark::new(
                 snapshot,
-                Arc::<str>::from("projection.example"),
+                domains,
                 IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
             ),
         }

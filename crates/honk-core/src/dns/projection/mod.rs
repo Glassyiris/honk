@@ -335,42 +335,41 @@ impl RoutingProjection {
 #[cfg(feature = "dns-bench")]
 pub(crate) struct ProjectionReplacementBenchmark {
     state: DesiredState,
-    domain: Arc<str>,
+    domains: Vec<Arc<str>>,
+    next: usize,
     ip: IpAddr,
     now: tokio::time::Instant,
 }
 
 #[cfg(feature = "dns-bench")]
 impl ProjectionReplacementBenchmark {
+    /// Observes `domains` round-robin on one shared IP; more names than the
+    /// owner capacity make every observation insert one owner and evict another.
     pub(crate) fn new(
         snapshot: Arc<RoutingProjectionSnapshot>,
-        domain: Arc<str>,
+        domains: Vec<Arc<str>>,
         ip: IpAddr,
     ) -> Self {
-        let now = tokio::time::Instant::now();
-        let mut state = DesiredState::new(snapshot, DEFAULT_DOMAIN_CAPACITY);
-        state.observe(
-            ProjectionObservation::Positive {
-                domain: &domain,
-                family: state::family_of(ip),
-                ips: std::slice::from_ref(&ip),
-                advertised_ttl: Duration::from_secs(300),
-            },
-            now,
-        );
-        Self {
-            state,
-            domain,
+        let mut replacement = Self {
+            state: DesiredState::new(snapshot, DEFAULT_DOMAIN_CAPACITY),
+            domains,
+            next: 0,
             ip,
-            now,
+            now: tokio::time::Instant::now(),
+        };
+        for _ in 0..replacement.domains.len().min(DEFAULT_DOMAIN_CAPACITY) {
+            replacement.replace();
         }
+        replacement
     }
 
     pub(crate) fn replace(&mut self) -> u64 {
         self.now += Duration::from_millis(1);
+        let domain = &self.domains[self.next];
+        self.next = (self.next + 1) % self.domains.len();
         self.state.observe(
             ProjectionObservation::Positive {
-                domain: &self.domain,
+                domain,
                 family: state::family_of(self.ip),
                 ips: std::slice::from_ref(&self.ip),
                 advertised_ttl: Duration::from_secs(300),
