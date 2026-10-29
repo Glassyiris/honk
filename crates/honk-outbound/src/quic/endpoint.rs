@@ -37,18 +37,7 @@ pub fn client_endpoint(ipv6: bool) -> io::Result<Endpoint> {
     client_endpoint_with_mtu(ipv6, 1252)
 }
 
-/// [`client_endpoint`] retaining `owner` through socket and I/O-poller teardown.
-///
-/// Closing or dropping an endpoint can leave Quinn drivers or connections alive;
-/// the owner is released only after their last socket or poller reference drops.
-pub fn client_endpoint_with_owner<T>(ipv6: bool, owner: T) -> io::Result<Endpoint>
-where
-    T: Send + Sync + 'static,
-{
-    client_endpoint_with_mtu_and_owner(ipv6, 1252, owner, None)
-}
-
-/// [`client_endpoint_with_owner`] with native Quinn drivers retained by `tasks`.
+/// [`client_endpoint`] retaining `owner` through socket/poller teardown and Quinn drivers in `tasks`.
 ///
 /// The caller must keep `tasks` alive through endpoint use. `parent` retains the
 /// same driver joins if endpoint setup or its closer is cancelled.

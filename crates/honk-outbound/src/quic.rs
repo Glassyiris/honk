@@ -30,8 +30,8 @@ use metrics::QuicClientConnectionMonitor;
 
 pub(crate) use endpoint::endpoint_config_with_mtu;
 pub use endpoint::{
-    client_endpoint, client_endpoint_with_mtu, client_endpoint_with_owner,
-    client_endpoint_with_owner_and_tasks, marked_udp_socket,
+    client_endpoint, client_endpoint_with_mtu, client_endpoint_with_owner_and_tasks,
+    marked_udp_socket,
 };
 pub use metrics::{
     QuicConnectionMonitor, QuicStatsSnapshot, monitor_quic_connection, quic_stats_snapshot,
