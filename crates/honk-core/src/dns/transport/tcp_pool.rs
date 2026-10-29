@@ -81,18 +81,19 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
+    async fn serve(listener: Arc<TcpListener>) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut response = read_length_prefixed(&mut stream, Duration::from_secs(2))
+            .await
+            .unwrap();
+        response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        write_length_prefixed(&mut stream, &response).await.unwrap();
+        assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn idle_tcp_credit_blocks_cold_transport_and_survives_creator_cancellation() {
         let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
-        let serve = |listener: Arc<TcpListener>| async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut response = read_length_prefixed(&mut stream, Duration::from_secs(2))
-                .await
-                .unwrap();
-            response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
-            write_length_prefixed(&mut stream, &response).await.unwrap();
-            assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
-        };
         let first_server = tokio::spawn(serve(Arc::clone(&listener)));
         let budget = DnsSocketBudget::new(1);
         let dial = DialContext {
@@ -174,15 +175,6 @@ mod tests {
 
         let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
         let address = listener.local_addr().unwrap();
-        let serve = |listener: Arc<TcpListener>| async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut response = read_length_prefixed(&mut stream, Duration::from_secs(2))
-                .await
-                .unwrap();
-            response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
-            write_length_prefixed(&mut stream, &response).await.unwrap();
-            assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
-        };
         let first_server = tokio::spawn(serve(Arc::clone(&listener)));
         let node = honk_config::Config::builtin_direct_node();
         let generation = Arc::new(
