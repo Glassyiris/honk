@@ -146,7 +146,7 @@ The root `rust-toolchain.toml` pins the host compiler; `crates/honk-ebpf/rust-to
 
 | Recipe                                                                          | Purpose                                                                                                                                                                                                                                      |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `build` / `check` / `lint` / `fmt` / `fmt-check`                                              | `cargo build --release` / `check` / `clippy --all --all-targets --features honk-core/native-ui,honk-core/udp-bench -- -D warnings` / `fmt --all` / `fmt --all -- --check`                                                                                                                                  |
+| `build` / `check` / `lint` / `fmt` / `fmt-check`                                              | `cargo build --release` / `check` / `clippy --all --all-targets --features honk-core/native-ui,honk-core/udp-bench,honk-core/dns-bench -- -D warnings` / `fmt --all` / `fmt --all -- --check`                                                                                                                                  |
 | `test-routing` | Complete pre-provisioned floor-kernel VM gate, including compiled routing goldens and failed-publication preservation; prerequisites in `honk-real-ebpf-tests` |
 | `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test` = full workspace; `test-ci` = nextest CI profile with `honk-core/native-ui`, per-test timeouts and JUnit; `test-core` = core + outbound unit/integration tests; `test-config` = config unit/integration tests; `test-ebpf` = honk-ebpf-common only) |
 | `test-netns` | Depends on `test-routing`, sharing its single disposable-VM run of routing, real NFQUEUE/eBPF, ownership, lifecycle and exact SO_MARK tests |
@@ -177,7 +177,7 @@ Do not treat dated pass counts as repository status; use current command output 
 ```bash
 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
   cargo test --workspace --no-fail-fast
-cargo clippy --workspace --all-targets --features honk-core/udp-bench -- -D warnings
+cargo clippy --workspace --all-targets --features honk-core/udp-bench,honk-core/dns-bench -- -D warnings
 ```
 
 Group-policy/scorer changes should run `cargo test -p honk-config group_policy`, `cargo test -p honk-outbound group::score`, and focused core Score/Clash tests before the workspace gate (Score needs no feature flag).
@@ -209,7 +209,7 @@ size observations are historical, not a maintained target allowlist.
 - Use `tracing` macros for logging; prefer structured fields (`info!(network = "tcp", outbound = %name, ...)`). Levels follow frequency × actionability: ERROR only when configured function is lost until an operator acts (committed-degraded activation, process exit, permanent subsystem death, invariant breach); WARN once per entered degraded state (fallback, ceiling, node/group unavailable, rejected candidate with the old config intact); INFO for low-rate lifecycle, operator outcomes and recovery; DEBUG for single connection/request/query outcomes and periodic maintenance. Log a failure once, at the layer that owns its stats/Score/recovery; repeat a persisting state at DEBUG, not per tick. A failure that repeats per query with no episode boundary (DNS SERVFAIL, singleflight saturation) uses `logging::warn_throttled!`: WARN at most every 10 s per site. Native `/api/v1/logs`, Clash `/logs` and the console all receive these levels.
 - Use `tokio` async/await and `tokio::select!` for long-lived loops.
 - Kernel/userspace structs belong in `honk-ebpf-common`; follow its stable `#[repr(C)]` layout and coordinated `honk-ebpf`/`honk-core` map-writer change rules.
-- Follow `cargo fmt --all` and keep `just lint` (all targets with `honk-core/native-ui,honk-core/udp-bench`) and `cargo clippy --workspace --all-targets --no-default-features --features honk-core/udp-bench -- -D warnings` clean.
+- Follow `cargo fmt --all` and keep `just lint` (all targets with `honk-core/native-ui,honk-core/udp-bench,honk-core/dns-bench`) and `cargo clippy --workspace --all-targets --no-default-features --features honk-core/udp-bench -- -D warnings` clean.
 - **Claims need their line.** A consequence stated in a PR or an issue names the code producing it, or is narrowed until it can; say what you did not check. Line numbers come from `origin/main`, not your working tree.
 - **Read to the end of the path before describing a defect.** The trigger, the consequence, and the absence of a thing are each bounded by code you have not opened yet: the callee, the caller, the consumer that clamps the value, the search that would have settled it.
 - **Fix where the paths converge**, not where you first saw the failure: a guard on one loader leaves its siblings failing open.

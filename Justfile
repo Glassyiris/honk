@@ -79,7 +79,7 @@ check:
 
 # Clippy lint all (fetches the pinned doona for native-ui unless HONK_DOONA_DIR is set)
 lint:
-    HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo clippy --all --all-targets --features honk-core/native-ui,honk-core/udp-bench -- -D warnings
+    HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo clippy --all --all-targets --features honk-core/native-ui,honk-core/udp-bench,honk-core/dns-bench -- -D warnings
 
 # Format all
 fmt:

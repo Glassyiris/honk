@@ -319,7 +319,7 @@ jobs:
           dir=$(ci/fetch-doona.sh)
           echo "HONK_DOONA_DIR=$dir" >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all --all-targets --features honk-core/native-ui,honk-core/udp-bench -- -D warnings
+      - run: cargo clippy --all --all-targets --features honk-core/native-ui,honk-core/udp-bench,honk-core/dns-bench -- -D warnings
       - name: Write lint CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0

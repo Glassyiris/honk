@@ -83,7 +83,7 @@ jobs:
           bpf-linker --version
       # Floating selectors deliberately bypass the repository pins to expose drift.
       - run: cargo +stable fmt --all -- --check
-      - run: cargo +stable clippy --all --all-targets --features honk-core/udp-bench -- -D warnings
+      - run: cargo +stable clippy --all --all-targets --features honk-core/udp-bench,honk-core/dns-bench -- -D warnings
       - run: cargo +stable nextest run --workspace --profile ci
       - name: Upload preview JUnit
         if: failure()
