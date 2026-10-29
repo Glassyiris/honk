@@ -160,15 +160,6 @@ mod entries {
         pub(super) shards: [Option<Arc<UdpPool>>; MAX_UDP_SHARDS],
     }
 
-    impl UdpFamily {
-        pub(super) fn new(address: SocketAddr) -> Self {
-            Self {
-                address,
-                shards: std::array::from_fn(|_| None),
-            }
-        }
-    }
-
     #[derive(Default)]
     pub(super) struct UdpState {
         pub(super) current: Option<SocketAddr>,
@@ -509,10 +500,9 @@ impl UpstreamPool {
     }
 
     pub(super) async fn join_retired_transports(&self) {
-        while let Some(result) = std::future::poll_fn(|cx| {
-            self.retiring_transports.lock().teardowns.poll_join_next(cx)
-        })
-        .await
+        while let Some(result) =
+            std::future::poll_fn(|cx| self.retiring_transports.lock().teardowns.poll_join_next(cx))
+                .await
         {
             if result.is_err() {
                 self.transport_tasks_failed

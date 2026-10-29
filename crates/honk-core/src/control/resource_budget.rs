@@ -11,7 +11,7 @@ const MAX_ACTIVE_TCP_FLOWS: usize = 16_384;
 const MAX_TRANSIENT_DIALS: usize = 1_024;
 const MAX_UDP_SLOW_PATH: usize = 256;
 // Sizing allowance for the boxed upstream future and multiple maximum-size wire copies.
-pub(crate) const DNS_UDP_QUERY_MEMORY_BYTES: u64 = 256 * 1024;
+const DNS_UDP_QUERY_MEMORY_BYTES: u64 = 256 * 1024;
 const MAX_VLESS_CARRIERS: usize = 8_192;
 // About twice a measured Shadowsocks shared source (~35 KiB).
 const UDP_ENDPOINT_MEMORY_BYTES: u64 = 64 * 1024;

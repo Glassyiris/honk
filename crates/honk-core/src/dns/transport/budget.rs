@@ -145,7 +145,7 @@ impl DnsSocketBudget {
         Arc::clone(&EXTRA_UDP_SOCKETS).try_acquire_owned().ok()
     }
 
-    pub(crate) fn shares_sockets(&self, other: &Self) -> bool {
+    pub(crate) fn shares_admission(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.sockets, &other.sockets)
             && Arc::ptr_eq(&self.proxy_streams, &other.proxy_streams)
     }

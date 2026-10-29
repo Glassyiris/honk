@@ -70,7 +70,7 @@ impl ControlPlane {
         config.validate_assembled()?;
         let dns_socket_budget = dns_upstream_pool.socket_budget().clone();
         anyhow::ensure!(
-            dns_socket_budget.shares_sockets(dns_forwarder.socket_budget()),
+            dns_socket_budget.shares_admission(dns_forwarder.socket_budget()),
             "DNS forwarder and upstream pool must share socket admission"
         );
         anyhow::ensure!(

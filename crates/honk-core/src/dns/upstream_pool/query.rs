@@ -147,7 +147,10 @@ impl UpstreamPool {
                 } else {
                     None
                 };
-                let pools = state.pools[family].get_or_insert_with(|| UdpFamily::new(address));
+                let pools = state.pools[family].get_or_insert_with(|| UdpFamily {
+                    address,
+                    shards: std::array::from_fn(|_| None),
+                });
                 (retired_family, pools.shards[slot].take())
             };
             let mut replaced = retired_family
