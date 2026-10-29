@@ -343,10 +343,7 @@ mod storage {
 
         /// Returns the remaining TTL in seconds (0 if expired).
         pub fn remaining_ttl_secs(&self) -> u64 {
-            self.expires_at
-                .checked_duration_since(Instant::now())
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0)
+            self.remaining_ttl().as_secs()
         }
 
         /// Returns the exact remaining lifetime (zero if expired).

@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use tracing::debug;
 
 use super::super::effective_expiry;
@@ -93,7 +95,7 @@ pub(super) async fn lookup(
     #[cfg(feature = "native-api")]
     crate::observe::flows::dns::cache_entry(entry_id.as_deref());
     let remaining = entry.remaining_ttl_secs();
-    let lifetime = entry.remaining_ttl();
+    let expires_at = entry.expires_at;
     debug!(remaining, "DNS forwarder: positive cache hit");
     let refresh_after = (entry.min_ttl as u64 / 10).max(1);
     if allow_refresh && remaining <= refresh_after {
@@ -130,9 +132,8 @@ pub(super) async fn lookup(
             None,
             OutcomeStatus::Accepted,
             Provenance::Cache,
-            // The entry's exact remaining lifetime keeps repeated hits on one
-            // stable expiry instant; the wire TTL is rendered separately.
-            EffectiveExpiry::cacheable(lifetime),
+            // Preferred-family probes must not extend the entry's expiry.
+            EffectiveExpiry::cacheable(expires_at.saturating_duration_since(Instant::now())),
             None,
             None,
             Vec::new(),
