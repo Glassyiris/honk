@@ -33,10 +33,10 @@ pub(super) async fn lookup(
         matches!(context.mode, ResolveMode::Strict),
     ) {
         ExactLookup::Negative {
-            hit,
+            rcode,
+            expires_at,
             revision: _revision,
         } => {
-            let expires_at = Instant::now() + hit.remaining_ttl;
             crate::observe::flows::dns::cache_state("hit");
             #[cfg(feature = "native-api")]
             let entry_id = if entry_id_demanded(context) {
@@ -46,8 +46,7 @@ pub(super) async fn lookup(
             };
             #[cfg(feature = "native-api")]
             crate::observe::flows::dns::cache_entry(entry_id.as_deref());
-            let response =
-                crate::dns::response::build_dns_error_response(context.raw_query, hit.rcode);
+            let response = crate::dns::response::build_dns_error_response(context.raw_query, rcode);
             let response = context
                 .forwarder
                 .apply_prefer_strategy(

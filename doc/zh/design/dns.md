@@ -211,6 +211,8 @@ wire 身份保留 flags、精确 question 编码、QCLASS 与 EDNS 内容。UDP 
 | Stale 处理 | 过期正应答在一小时内仍可用于 serve-stale。普通上游交换失败或已接受的 SERVFAIL 可返回该应答；typed local packet refusal 不可。`optimistic_stale_reply_ttl` 默认为 30 秒；非零值替换每个非 OPT RR 的 TTL，并设置 outcome TTL。`0` 保留缓存中已按策略改写的 TTL，而不是权威 TTL；此时 outcome TTL 由该 wire 的 `extract_min_ttl` 得出，不存在正 TTL 时回退为 60 秒。接近过期的命中会启动去重的 stale-while-revalidate refresh。 |
 | Flush fence | publication epoch 防止 flush 前开始的前台或后台工作在 flush barrier 后重新填充内存或持久化。 |
 
+正、负缓存命中的 outcome 在等待偏好地址族时保留条目原有的过期时刻，不通过取整后的 TTL 元数据重新计算生命周期。
+
 后台刷新在命中正缓存时，一并读取 `Resolve` 缓存槽的发布版本号（`revision`）。每次已接受的精确键发布都会推进版本号，包括负缓存合并和持久化恢复。发布时在分片锁内检查：版本号必须一致，正缓存也必须仍在。版本号不符、缓存槽仅剩负缓存或已被淘汰时，刷新结果会被丢弃；已淘汰的槽不会因刷新完成而重新写入。
 
 匹配且可缓存的 NXDOMAIN 先移除被刷新的正缓存，再写入负缓存；可缓存的正应答或 NODATA 替换整个缓存槽。NXDOMAIN、NODATA 或零 TTL 正应答没有可用生命周期时移除整个槽，包括其中的负缓存。若 SERVFAIL 没有可用的过期应答回退，则保留正缓存并合并负缓存。

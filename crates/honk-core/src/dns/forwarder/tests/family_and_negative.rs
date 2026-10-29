@@ -178,7 +178,7 @@ async fn cached_prefer_expiry_excludes_sibling_wait() {
 
 #[tokio::test]
 async fn cached_negative_prefer_expiry_excludes_sibling_wait() {
-    use crate::dns::cache::{CacheKey, ExactLookup, OperationKind};
+    use crate::dns::cache::{CacheKey, OperationKind};
     use crate::dns::planner::{RequestScope, UpstreamTag};
     use crate::dns::query::QueryContext;
 
@@ -204,9 +204,9 @@ async fn cached_negative_prefer_expiry_excludes_sibling_wait() {
         upstream.entered.notified().await;
         // Negative hits round up to whole seconds; cross that rounding boundary.
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        let ExactLookup::Negative { hit, .. } = cache.lookup_exact(&key, true) else {
-            panic!("negative cache entry");
-        };
+        let hit = cache
+            .negative_hit_exact(&key)
+            .expect("negative cache entry");
         upstream.release.notify_one();
         hit.remaining_ttl
     });

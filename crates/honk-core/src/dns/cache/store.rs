@@ -9,7 +9,8 @@ use super::{
 
 pub(crate) enum ExactLookup {
     Negative {
-        hit: NegativeCacheHit,
+        rcode: u8,
+        expires_at: Instant,
         revision: u64,
     },
     Positive {
@@ -38,24 +39,11 @@ impl DnsCacheService {
         let (negative, clear_negative, positive) = match shard.get(&key) {
             Some(value) => {
                 let (negative, clear_negative) = match value.negative.as_ref() {
-                    Some(negative) => match negative.expires_at.checked_duration_since(now) {
-                        Some(remaining) => {
-                            let rounded_secs = remaining
-                                .as_secs()
-                                .saturating_add(u64::from(remaining.subsec_nanos() > 0));
-                            (
-                                Some((
-                                    NegativeCacheHit {
-                                        rcode: negative.rcode,
-                                        remaining_ttl: Duration::from_secs(rounded_secs),
-                                    },
-                                    value.revision,
-                                )),
-                                false,
-                            )
-                        }
-                        None => (None, true),
-                    },
+                    Some(negative) if now <= negative.expires_at => (
+                        Some((negative.rcode, negative.expires_at, value.revision)),
+                        false,
+                    ),
+                    Some(_) => (None, true),
                     None => (None, false),
                 };
                 let positive = if negative.is_none() {
@@ -89,8 +77,12 @@ impl DnsCacheService {
             }
         }
 
-        let result = if let Some((hit, revision)) = negative {
-            ExactLookup::Negative { hit, revision }
+        let result = if let Some((rcode, expires_at, revision)) = negative {
+            ExactLookup::Negative {
+                rcode,
+                expires_at,
+                revision,
+            }
         } else {
             let (positive, clear_positive) = positive;
             if clear_positive {
