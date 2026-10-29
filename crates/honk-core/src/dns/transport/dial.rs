@@ -349,66 +349,42 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn socket_capacity_refusal_does_not_start_or_retry_an_address() {
-        let addresses = vec![
-            "192.0.2.1:53".parse().unwrap(),
-            "[2001:db8::1]:53".parse().unwrap(),
-        ];
-        let budget = DnsSocketBudget::new(0);
-        let attempts = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&attempts);
-        let start = tokio::time::Instant::now();
-        let error = dial_candidates(
-            addresses,
-            start + Duration::from_secs(3),
-            "test",
-            Some(PacketAdmission::Physical(&budget)),
-            move |address, _, _| {
-                recorded.lock().push(address);
-                async move { Ok(address) }
-            },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            honk_outbound::proxy::packet_rejection(&error),
-            Some(honk_outbound::proxy::PacketRejection::Capacity)
-        );
-        assert!(attempts.lock().is_empty());
-        assert_eq!(start.elapsed(), Duration::from_millis(1500));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn proxy_capacity_refusal_is_not_masked_by_candidate_timeout() {
-        let budget = DnsSocketBudget::new(1);
-        let held = budget
+    async fn capacity_refusal_does_not_start_or_retry_an_address() {
+        let physical_budget = DnsSocketBudget::new(0);
+        let proxy_budget = DnsSocketBudget::new(1);
+        let held = proxy_budget
             .acquire_proxy_until(tokio::time::Instant::now() + Duration::from_secs(1))
             .await
             .unwrap();
-        let attempts = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&attempts);
-        let start = tokio::time::Instant::now();
-        let error = dial_candidates(
-            vec![
-                "192.0.2.1:53".parse().unwrap(),
-                "[2001:db8::1]:53".parse().unwrap(),
-            ],
-            start + Duration::from_secs(3),
-            "test",
-            Some(PacketAdmission::Proxy(&budget)),
-            move |address, _, _| {
-                recorded.lock().push(address);
-                async move { Ok(address) }
-            },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            honk_outbound::proxy::packet_rejection(&error),
-            Some(honk_outbound::proxy::PacketRejection::Capacity)
-        );
-        assert!(attempts.lock().is_empty());
-        assert_eq!(start.elapsed(), Duration::from_millis(1500));
+        for admission in [
+            PacketAdmission::Physical(&physical_budget),
+            PacketAdmission::Proxy(&proxy_budget),
+        ] {
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&attempts);
+            let start = tokio::time::Instant::now();
+            let error = dial_candidates(
+                vec![
+                    "192.0.2.1:53".parse().unwrap(),
+                    "[2001:db8::1]:53".parse().unwrap(),
+                ],
+                start + Duration::from_secs(3),
+                "test",
+                Some(admission),
+                move |address, _, _| {
+                    recorded.lock().push(address);
+                    async move { Ok(address) }
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                honk_outbound::proxy::packet_rejection(&error),
+                Some(honk_outbound::proxy::PacketRejection::Capacity)
+            );
+            assert!(attempts.lock().is_empty());
+            assert_eq!(start.elapsed(), Duration::from_millis(1500));
+        }
         drop(held);
     }
 }
