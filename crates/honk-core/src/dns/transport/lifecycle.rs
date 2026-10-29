@@ -268,7 +268,6 @@ impl<T> LifecycleSlot<T> {
                 SlotState::Ready(value) if Arc::strong_count(value) == 1 => {
                     let value = Arc::clone(value);
                     let resource = Arc::clone(&value);
-                    // Invoke the callback only when polled after releasing the state lock.
                     let teardown = async move { close(resource).await }.boxed().shared();
                     inner.state = SlotState::Closing {
                         value: Arc::clone(&value),
