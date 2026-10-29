@@ -9,6 +9,9 @@ use tokio::sync::mpsc;
 use super::*;
 use crate::dns::forwarder::DnsUpstreamPool;
 use crate::dns::transport::{DnsSocketBudget, UdpPool};
+use crate::test_support::run_exact_in_child;
+
+const CHILD: &str = "HONK_DNS_EXTRA_SHARD_CHILD";
 
 fn pool(address: SocketAddr, budget: &DnsSocketBudget) -> Arc<UpstreamPool> {
     Arc::new(
@@ -58,8 +61,9 @@ async fn peer_for(pool: &UdpPool, peers: &mut mpsc::UnboundedReceiver<SocketAddr
 
 #[tokio::test]
 async fn pending_pressure_expands_before_saturation_without_replaying_packets() {
-    if run_shard_case_in_child(
-        "pending_pressure_expands_before_saturation_without_replaying_packets",
+    if run_exact_in_child(
+        CHILD,
+        "dns::upstream_pool::tests::udp_shards::pending_pressure_expands_before_saturation_without_replaying_packets",
     ) {
         return;
     }
@@ -164,7 +168,10 @@ async fn cancelling_a_blocked_creator_does_not_spend_or_publish_extra_sockets() 
 
 #[tokio::test]
 async fn a_failed_shard_is_replaced_without_replacing_healthy_siblings() {
-    if run_shard_case_in_child("a_failed_shard_is_replaced_without_replacing_healthy_siblings") {
+    if run_exact_in_child(
+        CHILD,
+        "dns::upstream_pool::tests::udp_shards::a_failed_shard_is_replaced_without_replacing_healthy_siblings",
+    ) {
         return;
     }
     let (address, mut peers, echo) = echo().await;
@@ -252,8 +259,9 @@ async fn replaced_active_pool_stays_owned_until_exchange_ends_and_close_joins_it
 
 #[tokio::test]
 async fn reaped_shards_and_cancelled_close_resume_until_tasks_and_credits_return() {
-    if run_shard_case_in_child(
-        "reaped_shards_and_cancelled_close_resume_until_tasks_and_credits_return",
+    if run_exact_in_child(
+        CHILD,
+        "dns::upstream_pool::tests::udp_shards::reaped_shards_and_cancelled_close_resume_until_tasks_and_credits_return",
     ) {
         return;
     }
@@ -338,34 +346,12 @@ async fn retiring_last_exchange_wakes_replacement_without_a_maintenance_tick() {
     }
 }
 
-fn run_shard_case_in_child(test: &str) -> bool {
-    const CHILD: &str = "HONK_DNS_EXTRA_SHARD_CHILD";
-    let name = format!("dns::upstream_pool::tests::udp_shards::{test}");
-    if std::env::var(CHILD).as_deref() == Ok(name.as_str()) {
-        return false;
-    }
-    let executable = std::env::current_exe().unwrap();
-    let listed = std::process::Command::new(&executable)
-        .args(["--exact", &name, "--list", "--format", "terse"])
-        .output()
-        .unwrap();
-    assert!(listed.status.success());
-    assert_eq!(
-        String::from_utf8(listed.stdout).unwrap().trim(),
-        format!("{name}: test")
-    );
-    let status = std::process::Command::new(executable)
-        .args(["--exact", &name, "--test-threads=1", "--nocapture"])
-        .env(CHILD, &name)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    true
-}
-
 #[tokio::test]
 async fn process_extra_shards_stay_bounded_across_generations() {
-    if run_shard_case_in_child("process_extra_shards_stay_bounded_across_generations") {
+    if run_exact_in_child(
+        CHILD,
+        "dns::upstream_pool::tests::udp_shards::process_extra_shards_stay_bounded_across_generations",
+    ) {
         return;
     }
     let (address, mut peers, echo) = echo().await;

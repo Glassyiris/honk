@@ -329,28 +329,7 @@ async fn cold_non_raw_upstream_bootstrap_shares_the_two_credit_bound() {
 async fn non_raw_quic_capacity_precedes_real_trojan_bootstrap() {
     const CHILD: &str = "HONK_DNS_TROJAN_BOOTSTRAP_GATE_CHILD";
     const NAME: &str = "dns::transport::tests_proto::quic_lifecycle::non_raw_quic_capacity_precedes_real_trojan_bootstrap";
-    if std::env::var(CHILD).as_deref() != Ok(NAME) {
-        let executable = std::env::current_exe().unwrap();
-        let listed = std::process::Command::new(&executable)
-            .args(["--exact", NAME, "--list", "--format", "terse"])
-            .output()
-            .unwrap();
-        assert!(listed.status.success());
-        assert_eq!(
-            String::from_utf8(listed.stdout).unwrap().trim(),
-            format!("{NAME}: test")
-        );
-        let output = std::process::Command::new(executable)
-            .args(["--exact", NAME, "--test-threads=1", "--nocapture"])
-            .env(CHILD, NAME)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if crate::test_support::run_exact_in_child(CHILD, NAME) {
         return;
     }
 

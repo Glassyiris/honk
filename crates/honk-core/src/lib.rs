@@ -38,6 +38,34 @@ pub mod stats;
 pub mod subscription;
 mod sysctl;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) fn run_exact_in_child(env: &str, name: &str) -> bool {
+        if std::env::var(env).as_deref() == Ok(name) {
+            return false;
+        }
+        let executable = std::env::current_exe().unwrap();
+        let listed = std::process::Command::new(&executable)
+            .args(["--exact", name, "--list", "--format", "terse"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert_eq!(
+            String::from_utf8(listed.stdout).unwrap().trim(),
+            format!("{name}: test")
+        );
+        assert!(
+            std::process::Command::new(executable)
+                .args(["--exact", name, "--test-threads=1", "--nocapture"])
+                .env(env, name)
+                .status()
+                .unwrap()
+                .success()
+        );
+        true
+    }
+}
+
 pub use honk_outbound::alive as outbound;
 pub use honk_outbound::group;
 pub use honk_outbound::proxy;

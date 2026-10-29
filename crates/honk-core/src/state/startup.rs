@@ -316,25 +316,7 @@ mod state_claim_tests {
         const CHILD: &str = "HONK_NATIVE_BIND_ROLLBACK_CHILD";
         const NAME: &str = "state::startup::state_claim_tests::a_native_bind_failure_rolls_back_started_owners_before_returning";
         // Startup installs a process-wide data directory, unlike the other state fixtures.
-        if std::env::var(CHILD).as_deref() != Ok(NAME) {
-            let executable = std::env::current_exe().unwrap();
-            let listed = std::process::Command::new(&executable)
-                .args(["--exact", NAME, "--list", "--format", "terse"])
-                .output()
-                .unwrap();
-            assert!(listed.status.success());
-            assert_eq!(
-                String::from_utf8(listed.stdout).unwrap().trim(),
-                format!("{NAME}: test")
-            );
-            assert!(
-                std::process::Command::new(executable)
-                    .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
-                    .env(CHILD, NAME)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+        if crate::test_support::run_exact_in_child(CHILD, NAME) {
             return;
         }
 
