@@ -49,6 +49,10 @@ impl UdpPoolCapacity {
         "IDs exhausted",
         honk_outbound::proxy::PacketRejection::Capacity,
     );
+    pub(crate) const SHARDS: Self = Self(
+        "shard admission saturated",
+        honk_outbound::proxy::PacketRejection::Capacity,
+    );
 }
 
 struct SocketOwner {

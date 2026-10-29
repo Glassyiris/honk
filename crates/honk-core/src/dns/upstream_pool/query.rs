@@ -119,7 +119,7 @@ impl UpstreamPool {
             if slot.is_none() {
                 return cached
                     .map(|pool| (pool, true))
-                    .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::IDS));
+                    .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::SHARDS));
             }
             let deadline = tokio::time::Instant::now() + self.dns_dial_timeout;
             let _creation = tokio::time::timeout_at(deadline, entry.udp_creation[family].lock())
@@ -132,7 +132,7 @@ impl UpstreamPool {
             let Some(slot) = slot else {
                 return cached
                     .map(|pool| (pool, true))
-                    .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::IDS));
+                    .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::SHARDS));
             };
             let (retired_family, retired_shard) = {
                 let mut state = entry.udp.lock();
@@ -162,7 +162,7 @@ impl UpstreamPool {
                 let Some(extra) = self.socket_budget.try_extra_udp() else {
                     return cached
                         .map(|pool| (pool, true))
-                        .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::IDS));
+                        .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::SHARDS));
                 };
                 Some(extra)
             };
@@ -175,7 +175,7 @@ impl UpstreamPool {
                 let Some(permit) = self.socket_budget.try_acquire() else {
                     return cached
                         .map(|pool| (pool, true))
-                        .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::IDS));
+                        .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::SHARDS));
                 };
                 permit
             };
