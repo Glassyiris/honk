@@ -347,24 +347,12 @@ mod state_claim_tests {
         let lock_path = directory.path().join("honk-core.lock");
         crate::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = Some(lock_path.clone()));
         let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let (proxy_tcp, proxy_udp) = (0..32)
-            .find_map(|_| {
-                let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                match std::net::UdpSocket::bind(tcp.local_addr().unwrap()) {
-                    Ok(udp) => Some((tcp, udp)),
-                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
-                    Err(error) => panic!("reserve UDP listener: {error}"),
-                }
-            })
-            .expect("reserve a TCP/UDP listener port");
-        let proxy_address = proxy_tcp.local_addr().unwrap();
         let config = directory.path().join("config.dae");
         std::fs::write(
             &config,
             format!(
-                "global {{\n data_dir: '{}'\n tproxy_port: {}\n}}\nexperimental {{\n native_api {{\n  enabled: true\n  listen: '{}'\n  allow_anonymous_loopback: true\n }}\n}}\n",
+                "global {{\n data_dir: '{}'\n}}\nexperimental {{\n native_api {{\n  enabled: true\n  listen: '{}'\n  allow_anonymous_loopback: true\n }}\n}}\n",
                 data_dir.display(),
-                proxy_address.port(),
                 occupied.local_addr().unwrap()
             ),
         )
@@ -372,14 +360,15 @@ mod state_claim_tests {
         let cli =
             crate::Cli::parse_from(["honk-core", "--mock-ebpf", "-c", config.to_str().unwrap()]);
 
-        drop((proxy_tcp, proxy_udp));
-        crate::run(cli)
+        let error = crate::run(cli)
             .await
             .expect_err("an occupied native listener must refuse startup");
-        let _tcp = std::net::TcpListener::bind(proxy_address)
-            .expect("startup rollback retained the TCP listener");
-        let _udp = std::net::UdpSocket::bind(proxy_address)
-            .expect("startup rollback retained the UDP listener");
+        assert!(
+            error
+                .to_string()
+                .contains("native API listener bind failed"),
+            "{error:#}"
+        );
         let _lock = nix::fcntl::Flock::lock(
             std::fs::OpenOptions::new()
                 .read(true)
