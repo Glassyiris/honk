@@ -280,19 +280,19 @@ pub struct TransportLifecycleStats {
 }
 
 #[derive(Default)]
-struct RetiredUdp {
-    held: Vec<Arc<crate::dns::transport::UdpPool>>,
-    tasks: tokio::task::JoinSet<()>,
+struct RetiredTransports {
+    udp_pools: Vec<Arc<crate::dns::transport::UdpPool>>,
+    teardowns: tokio::task::JoinSet<()>,
 }
 
-impl RetiredUdp {
+impl RetiredTransports {
     fn drain(
         &mut self,
         runtime: Option<tokio::runtime::Handle>,
         force: bool,
         failed: &std::sync::atomic::AtomicBool,
     ) {
-        while let Some(result) = self.tasks.try_join_next() {
+        while let Some(result) = self.teardowns.try_join_next() {
             if result.is_err() {
                 failed.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -300,12 +300,12 @@ impl RetiredUdp {
         let Some(runtime) = runtime else {
             return;
         };
-        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.udp_pools)
             .into_iter()
             .partition(|pool| force || pool.is_stopped() || Arc::strong_count(pool) == 1);
-        self.held = waiting;
+        self.udp_pools = waiting;
         for pool in ready {
-            self.tasks
+            self.teardowns
                 .spawn_on(async move { pool.close().await }, &runtime);
         }
     }
@@ -314,7 +314,7 @@ impl RetiredUdp {
 pub(crate) struct DnsIdleResources {
     registered: parking_lot::Mutex<bool>,
     entries: Arc<HashMap<String, UpstreamEntry>>,
-    retiring_udp: Arc<parking_lot::Mutex<RetiredUdp>>,
+    retiring_transports: Arc<parking_lot::Mutex<RetiredTransports>>,
     admission: Arc<AdmissionGate>,
     transport_tasks_failed: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -334,7 +334,7 @@ pub struct UpstreamPool {
     dns_query_timeout: Duration,
     dns_dial_timeout: Duration,
     socket_budget: crate::dns::transport::DnsSocketBudget,
-    retiring_udp: Arc<parking_lot::Mutex<RetiredUdp>>,
+    retiring_transports: Arc<parking_lot::Mutex<RetiredTransports>>,
     active_transport_tasks: Arc<AtomicUsize>,
     transport_tasks_failed: Arc<std::sync::atomic::AtomicBool>,
     admission: Arc<AdmissionGate>,
@@ -383,13 +383,13 @@ impl UpstreamPool {
         strategy: DnsStrategy,
     ) -> anyhow::Result<Self> {
         let entries = Arc::new(build_entries(upstreams, bootstrap_resolver, strategy)?);
-        let retiring_udp = Arc::new(parking_lot::Mutex::default());
+        let retiring_transports = Arc::new(parking_lot::Mutex::default());
         let admission = Arc::new(AdmissionGate::new());
         let transport_tasks_failed = Arc::default();
         let idle_resources = Arc::new(DnsIdleResources {
             registered: parking_lot::Mutex::new(true),
             entries: Arc::clone(&entries),
-            retiring_udp: Arc::clone(&retiring_udp),
+            retiring_transports: Arc::clone(&retiring_transports),
             admission: Arc::clone(&admission),
             transport_tasks_failed: Arc::clone(&transport_tasks_failed),
         });
@@ -407,7 +407,7 @@ impl UpstreamPool {
             dns_query_timeout: Duration::from_secs(3),
             dns_dial_timeout: Duration::from_secs(10),
             socket_budget: crate::dns::transport::DnsSocketBudget::default(),
-            retiring_udp,
+            retiring_transports,
             active_transport_tasks: Arc::new(AtomicUsize::new(0)),
             transport_tasks_failed,
             admission,
@@ -427,7 +427,7 @@ impl UpstreamPool {
         self.idle_resources = Arc::new(DnsIdleResources {
             registered: parking_lot::Mutex::new(true),
             entries: Arc::clone(&self.entries),
-            retiring_udp: Arc::clone(&self.retiring_udp),
+            retiring_transports: Arc::clone(&self.retiring_transports),
             admission: Arc::clone(&self.admission),
             transport_tasks_failed: Arc::clone(&self.transport_tasks_failed),
         });
@@ -492,13 +492,13 @@ impl UpstreamPool {
     /// Retired pools stay owned here until their receive task has exited; each still
     /// holds a socket credit, so this list is bounded by the DNS socket budget.
     pub(super) fn retire_udp_pools(&self, pools: Vec<Arc<crate::dns::transport::UdpPool>>) {
-        self.retiring_udp.lock().held.extend(pools);
-        self.drain_retired_udp(false);
+        self.retiring_transports.lock().udp_pools.extend(pools);
+        self.drain_retired_transports(false);
     }
 
-    pub(super) fn drain_retired_udp(&self, force: bool) {
-        let mut retired = self.retiring_udp.lock();
-        if retired.held.is_empty() && retired.tasks.is_empty() {
+    pub(super) fn drain_retired_transports(&self, force: bool) {
+        let mut retired = self.retiring_transports.lock();
+        if retired.udp_pools.is_empty() && retired.teardowns.is_empty() {
             return;
         }
         retired.drain(
@@ -508,9 +508,11 @@ impl UpstreamPool {
         );
     }
 
-    pub(super) async fn join_retired_udp(&self) {
-        while let Some(result) =
-            std::future::poll_fn(|cx| self.retiring_udp.lock().tasks.poll_join_next(cx)).await
+    pub(super) async fn join_retired_transports(&self) {
+        while let Some(result) = std::future::poll_fn(|cx| {
+            self.retiring_transports.lock().teardowns.poll_join_next(cx)
+        })
+        .await
         {
             if result.is_err() {
                 self.transport_tasks_failed

@@ -17,7 +17,7 @@ struct UdpRetirementDrain<'a>(&'a UpstreamPool);
 
 impl Drop for UdpRetirementDrain<'_> {
     fn drop(&mut self) {
-        self.0.drain_retired_udp(false);
+        self.0.drain_retired_transports(false);
         self.0.socket_budget.reclaim_idle_if_waiting();
     }
 }

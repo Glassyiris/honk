@@ -193,7 +193,7 @@ async fn a_failed_shard_is_replaced_without_replacing_healthy_siblings() {
     failed.close().await;
     drop(failed);
     assert_eq!(pool.reap_udp_shards(std::time::Instant::now()), 1);
-    pool.join_retired_udp().await;
+    pool.join_retired_transports().await;
     let replacement = pool
         .select_udp_pool(entry, address, &[], true)
         .await
@@ -235,15 +235,15 @@ async fn replaced_active_pool_stays_owned_until_exchange_ends_and_close_joins_it
     let in_flight = Arc::clone(&old);
     let replacement = pool.udp_pool(entry, new_address).await.unwrap();
     peer_for(&replacement, &mut new_peers).await;
-    assert_eq!(pool.retiring_udp.lock().held.len(), 1);
+    assert_eq!(pool.retiring_transports.lock().udp_pools.len(), 1);
     assert_eq!(budget.available_sockets(), 0);
     drop(old);
-    pool.drain_retired_udp(false);
-    assert_eq!(pool.retiring_udp.lock().held.len(), 1);
+    pool.drain_retired_transports(false);
+    assert_eq!(pool.retiring_transports.lock().udp_pools.len(), 1);
     drop(in_flight);
     drop(replacement);
     pool.close().await;
-    assert!(pool.retiring_udp.lock().held.is_empty());
+    assert!(pool.retiring_transports.lock().udp_pools.is_empty());
     assert_eq!(pool.lifecycle_stats().tasks, 0);
     assert_eq!(budget.available_sockets(), 2);
     old_echo.abort();
@@ -277,7 +277,7 @@ async fn reaped_shards_and_cancelled_close_resume_until_tasks_and_credits_return
     assert!(futures::poll!(cancelled.as_mut()).is_pending());
     drop(cancelled);
     pool.close().await;
-    assert!(pool.retiring_udp.lock().held.is_empty());
+    assert!(pool.retiring_transports.lock().udp_pools.is_empty());
     assert_eq!(pool.lifecycle_stats().tasks, 0);
     assert_eq!(budget.available_sockets(), 3);
     assert_eq!(

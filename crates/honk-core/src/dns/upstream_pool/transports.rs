@@ -56,8 +56,8 @@ impl super::DnsIdleResources {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let mut retiring = self.retiring_udp.lock();
-        retiring.held.extend(udp_pools);
+        let mut retiring = self.retiring_transports.lock();
+        retiring.udp_pools.extend(udp_pools);
         for slot in slots {
             let failed = Arc::clone(&self.transport_tasks_failed);
             if let Some(teardown) = slot.retire_idle(move |transport| async move {
@@ -66,7 +66,7 @@ impl super::DnsIdleResources {
                     failed.store(true, Ordering::Release);
                 }
             }) {
-                retiring.tasks.spawn_on(teardown, &runtime);
+                retiring.teardowns.spawn_on(teardown, &runtime);
             }
         }
         retiring.drain(Some(runtime), false, &self.transport_tasks_failed);
@@ -256,9 +256,9 @@ impl UpstreamPool {
                     .flat_map(|family| family.shards.into_iter().flatten()),
             );
         }
-        self.retiring_udp.lock().held.extend(udp_pools);
-        self.drain_retired_udp(true);
-        self.join_retired_udp().await;
+        self.retiring_transports.lock().udp_pools.extend(udp_pools);
+        self.drain_retired_transports(true);
+        self.join_retired_transports().await;
         for slot in slots {
             let failed = Arc::clone(&self.transport_tasks_failed);
             slot.close(move |transport| async move {
