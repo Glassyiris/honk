@@ -54,6 +54,53 @@ async fn bind_tcp_udp() -> (TcpListener, UdpSocket, SocketAddr) {
 }
 
 #[tokio::test]
+async fn pressure_retirement_counts_one_idle_udp_pool() {
+    const NAME: &str =
+        "dns::upstream_pool::tests::pressure::pressure_retirement_counts_one_idle_udp_pool";
+    if crate::test_support::run_exact_in_child("HONK_DNS_PRESSURE_STATS_CHILD", NAME) {
+        return;
+    }
+    stall_guard(async {
+        let (address, server) = spawn_udp_echo(1).await;
+        let budget = DnsSocketBudget::new(1);
+        let pool = UpstreamPool::new(
+            &[make_upstream("udp", &address.to_string(), DnsProtocol::Udp)],
+            make_router(),
+        )
+        .unwrap()
+        .with_socket_budget(budget.clone());
+        assert_eq!(
+            pool.query("udp", &mock_dns_query(0x1000)).await.unwrap(),
+            mock_dns_response(0x1000)
+        );
+        assert_eq!(server.await.unwrap().len(), 1);
+        let before = crate::stats::dns_snapshot();
+
+        let reclaimed = budget
+            .acquire_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let delta = crate::stats::dns_snapshot().delta(before);
+        assert_eq!(delta.pressure_retired_udp_pool, 1);
+        assert_eq!(delta.pressure_retired_transport, 0);
+        assert_eq!(delta.socket_admission_timeout, 0);
+        assert_eq!(delta.socket_admission_refused, 0);
+
+        drop(reclaimed);
+        pool.close().await;
+        assert_eq!(
+            crate::stats::dns_snapshot()
+                .delta(before)
+                .pressure_retired_udp_pool,
+            1
+        );
+        assert_eq!(budget.available_sockets(), 1);
+        assert_eq!(pool.lifecycle_stats().tasks, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn budget_one_alternates_numeric_udp_upstreams() {
     stall_guard(async {
         let (a_address, a_server) = spawn_udp_echo(2).await;

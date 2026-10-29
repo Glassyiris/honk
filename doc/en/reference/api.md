@@ -1431,12 +1431,17 @@ Download or extraction failures are logged and do not stop the engine.
 
 ## `GET /stats`
 
-`GET /stats` is a userspace snapshot. It is not the eBPF `OUTBOUND_STATS` map and does not expose its packet counters. The fixed TCP, UDP, and NFQUEUE schemas create no dynamic per-node labels.
+`GET /stats` is a userspace snapshot. It is not the eBPF `OUTBOUND_STATS` map and does not expose its packet counters. The fixed DNS, TCP, UDP, and NFQUEUE schemas create no dynamic per-node labels.
 
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
   pool: { readyHits, readyMisses, entries },
+  dns: {
+    socketAdmission: { refused, timeouts },
+    proxyAdmission: { timeouts },
+    pressure: { retiredUdpPools, retiredTransports }
+  },
   quic: {
     activeConnections, srttUs, cwndBytes, flowReceivedBytes, flowSentBytes,
     receiveWindowBytes, receiveWindowAvailableBytes, streamReceiveWindowBytes,
@@ -1499,6 +1504,20 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
       trialSuccess, trialFailure, trialCancelled, trialSetupHistogram,
       trialSetupMillis, trialElapsedMillis }
 ```
+
+### DNS fields
+
+All `dns` fields are process-lifetime `u64` event counters shared across active and retired generations; reload does not reset them. Fields are sampled independently, so one snapshot does not imply cross-counter coherence. These totals are exposed by Clash `/stats`, not the native DNS diagnostic or history APIs.
+
+| Field | Meaning |
+| --- | --- |
+| `socketAdmission.refused` | Endpoint network bootstrap refused because it needs two credits and the whole DNS socket partition is smaller than that. |
+| `socketAdmission.timeouts` | Mandatory physical socket admission calls that return because their admission deadline expires. |
+| `proxyAdmission.timeouts` | Mandatory proxy stream or non-raw packet preparation admission calls that return because their admission deadline expires. |
+| `pressure.retiredUdpPools` | Idle UDP socket pools selected for pressure retirement, once per detached pool. |
+| `pressure.retiredTransports` | Idle TCP/TLS/H2/QUIC transport pools first selected for pressure retirement; resuming retained teardown does not count again. |
+
+`socketAdmission.refused` and `socketAdmission.timeouts` are disjoint. Initial contention, optional UDP shard-growth misses, and caller cancellation do not count as admission failures. Counters advance at admission, not once per singleflight follower or client reply. Pressure counters describe selected resources, not queries, drops, or descriptors already released; one transport pool may own multiple sockets. DNS admission failure may render as `SERVFAIL`, independently of singleflight `REFUSED`. Existing throttled failure logging is unchanged.
 
 ### TCP fields
 

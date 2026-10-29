@@ -125,6 +125,8 @@ DNS 自有 socket 使用独立扣除、由活跃与退役 generation 共同持�
 
 必要准入阻塞时，按 generation 注册的弱 owner 通过保留的 close/join 路径回收未被借用的缓存 UDP socket 及空闲 TCP/TLS/H2/QUIC 资源。完成与取消在释放借用后重新检查压力，等待中的其他上游不必依赖维护定时器；已开始的交换不会被淘汰。Socket 准入失败在重试及 resolver hook 中保留类型化 `Capacity`，可能渲染为 `SERVFAIL`，不同于 singleflight 的 `REFUSED`。入口饱和时独立监听器回拒绝、透明 UDP 丢弃的既有行为不变。
 
+Clash [`/stats.dns`](../reference/api.md#dns-字段) 暴露进程生命周期内物理准入的拒绝、超时计数，逻辑代理准入的超时计数，以及因压力而选中退役的资源数。这些计数不表示已经释放的描述符，也不按 singleflight follower 重复统计失败；原生 DNS 诊断／历史仍只提供既有结果视图。
+
 初始化与 flight fan-out 使用 `SharedError`。该 Arc-backed error 为 builder 与
 waiter clone 原始 causal chain，而不是从 display 文本重建。完成的 failure 不
 进入 cache；所有已加入 waiter 观察相同 typed source，包括

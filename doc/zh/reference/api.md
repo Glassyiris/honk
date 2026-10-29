@@ -1300,12 +1300,17 @@ URLTest、LoadBalance、Fallback 与 Score 拒绝手动选择。
 
 ## `GET /stats`
 
-`GET /stats` 是用户态快照，而不是 eBPF `OUTBOUND_STATS` map，也不暴露该 map 的报文计数器。固定 TCP、UDP 和 NFQUEUE 模式不创建动态的逐节点标签。
+`GET /stats` 是用户态快照，而不是 eBPF `OUTBOUND_STATS` map，也不暴露该 map 的报文计数器。固定 DNS、TCP、UDP 和 NFQUEUE 模式不创建动态的逐节点标签。
 
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
   pool: { readyHits, readyMisses, entries },
+  dns: {
+    socketAdmission: { refused, timeouts },
+    proxyAdmission: { timeouts },
+    pressure: { retiredUdpPools, retiredTransports }
+  },
   quic: {
     activeConnections, srttUs, cwndBytes, flowReceivedBytes, flowSentBytes,
     receiveWindowBytes, receiveWindowAvailableBytes, streamReceiveWindowBytes,
@@ -1368,6 +1373,20 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
       trialSuccess, trialFailure, trialCancelled, trialSetupHistogram,
       trialSetupMillis, trialElapsedMillis }
 ```
+
+### DNS 字段
+
+全部 `dns` 字段均为进程生命周期 `u64` 事件计数器，由活跃与退役 generation 共用，reload 不清零。各字段独立采样，单次快照不保证跨计数器一致性。这些总数由 Clash `/stats` 暴露，原生 DNS 诊断或历史 API 不提供。
+
+| 字段 | 含义 |
+| --- | --- |
+| `socketAdmission.refused` | Endpoint 网络 bootstrap 需要两个额度，而整个 DNS socket 分区不足两个时被拒绝的次数。 |
+| `socketAdmission.timeouts` | 因准入期限耗尽而返回的必要物理 socket 准入调用。 |
+| `proxyAdmission.timeouts` | 因准入期限耗尽而返回的必要代理 stream 或非原始 packet 准备准入调用。 |
+| `pressure.retiredUdpPools` | 因压力而选中退役的空闲 UDP socket pool，每个被摘除的 pool 只计一次。 |
+| `pressure.retiredTransports` | 首次因压力而选中退役的空闲 TCP/TLS/H2/QUIC transport pool；恢复已保留的 teardown 不重复计数。 |
+
+`socketAdmission.refused` 与 `socketAdmission.timeouts` 互不重叠。初次竞争、可选 UDP shard 扩容失败和调用方取消不计作准入失败。计数在准入处增加，不按 singleflight follower 或客户端应答重复增加。压力计数表示被选中的资源，不是查询数、丢包数或已经释放的描述符数；一个 transport pool 可能持有多个 socket。DNS 准入失败可能渲染为 `SERVFAIL`，与 singleflight 的 `REFUSED` 独立。既有节流失败日志保持不变。
 
 ### TCP 字段
 

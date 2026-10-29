@@ -83,6 +83,7 @@ impl DnsSocketBudget {
         deadline: tokio::time::Instant,
     ) -> anyhow::Result<OwnedSemaphorePermit> {
         if self.limit < 2 {
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::SocketAdmissionRefused);
             return Err(
                 anyhow::Error::new(honk_outbound::proxy::PacketRejection::Capacity)
                     .context("DNS bootstrap requires two socket credits"),
@@ -107,6 +108,7 @@ impl DnsSocketBudget {
         )
         .await
         .map_err(|_| {
+            crate::stats::record_dns_event(crate::stats::DnsStatEvent::SocketAdmissionTimeout);
             anyhow::Error::new(honk_outbound::proxy::PacketRejection::Capacity)
                 .context("DNS socket admission timed out")
         })?
@@ -128,6 +130,7 @@ impl DnsSocketBudget {
         tokio::time::timeout_at(deadline, Arc::clone(&self.proxy_streams).acquire_owned())
             .await
             .map_err(|_| {
+                crate::stats::record_dns_event(crate::stats::DnsStatEvent::ProxyAdmissionTimeout);
                 anyhow::Error::new(honk_outbound::proxy::PacketRejection::Capacity)
                     .context("DNS proxy stream admission timed out")
             })?
@@ -203,5 +206,88 @@ impl DnsSocketBudget {
     #[cfg(test)]
     pub(crate) fn available_proxy_streams(&self) -> usize {
         self.proxy_streams.available_permits()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn socket_admission_timeout_is_not_a_refusal() {
+        const NAME: &str =
+            "dns::transport::budget::tests::socket_admission_timeout_is_not_a_refusal";
+        if crate::test_support::run_exact_in_child("HONK_DNS_ADMISSION_STATS_CHILD", NAME) {
+            return;
+        }
+        let budget = DnsSocketBudget::new(1);
+        let _held = budget.try_acquire().unwrap();
+        let before = crate::stats::dns_snapshot();
+
+        assert!(budget.try_acquire().is_none());
+        let mut cancelled = Box::pin(
+            budget.acquire_until(tokio::time::Instant::now() + std::time::Duration::from_secs(1)),
+        );
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        drop(cancelled);
+        assert_eq!(crate::stats::dns_snapshot(), before);
+
+        let error = budget
+            .acquire_until(tokio::time::Instant::now() + std::time::Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Capacity)
+        );
+        let delta = crate::stats::dns_snapshot().delta(before);
+        assert_eq!(delta.socket_admission_timeout, 1);
+        assert_eq!(delta.socket_admission_refused, 0);
+        assert_eq!(delta.proxy_admission_timeout, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mandatory_admission_failures_count_only_their_cause() {
+        #[derive(Debug)]
+        enum Case {
+            BootstrapRefusal,
+            ProxyTimeout,
+        }
+        const NAME: &str =
+            "dns::transport::budget::tests::mandatory_admission_failures_count_only_their_cause";
+        if crate::test_support::run_exact_in_child("HONK_DNS_ADMISSION_STATS_CHILD", NAME) {
+            return;
+        }
+        for (case, expected) in [
+            (Case::BootstrapRefusal, [1, 0, 0]),
+            (Case::ProxyTimeout, [0, 0, 1]),
+        ] {
+            let budget = DnsSocketBudget::new(1);
+            let _socket = budget.try_acquire().unwrap();
+            let _proxy = Arc::clone(&budget.proxy_streams)
+                .try_acquire_owned()
+                .unwrap();
+            let before = crate::stats::dns_snapshot();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1);
+            let error = match case {
+                Case::BootstrapRefusal => budget.acquire_bootstrap_until(deadline).await,
+                Case::ProxyTimeout => budget.acquire_proxy_until(deadline).await,
+            }
+            .unwrap_err();
+            assert_eq!(
+                honk_outbound::proxy::packet_rejection(&error),
+                Some(honk_outbound::proxy::PacketRejection::Capacity)
+            );
+            let delta = crate::stats::dns_snapshot().delta(before);
+            assert_eq!(
+                [
+                    delta.socket_admission_refused,
+                    delta.socket_admission_timeout,
+                    delta.proxy_admission_timeout,
+                ],
+                expected,
+                "{case:?}"
+            );
+        }
     }
 }

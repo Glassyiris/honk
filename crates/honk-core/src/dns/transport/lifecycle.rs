@@ -274,6 +274,9 @@ impl<T> LifecycleSlot<T> {
                         teardown: teardown.clone(),
                     };
                     inner.idle_retiring = true;
+                    crate::stats::record_dns_event(
+                        crate::stats::DnsStatEvent::PressureRetiredTransport,
+                    );
                     (value, teardown)
                 }
                 SlotState::Closing { value, teardown } => {

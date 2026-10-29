@@ -67,6 +67,11 @@ async fn idle_retirement_blocks_replacement_until_close_finishes() {
 
 #[tokio::test]
 async fn cancelled_idle_retirement_resumes_retained_close() {
+    const NAME: &str = "dns::transport::lifecycle::tests::idle_retirement::cancelled_idle_retirement_resumes_retained_close";
+    if crate::test_support::run_exact_in_child("HONK_DNS_TRANSPORT_PRESSURE_STATS_CHILD", NAME) {
+        return;
+    }
+    let before = crate::stats::dns_snapshot();
     let slot = Arc::new(LifecycleSlot::new());
     let resource = slot
         .acquire(|| async { Ok::<_, anyhow::Error>(1_u8) })
@@ -118,4 +123,10 @@ async fn cancelled_idle_retirement_resumes_retained_close() {
     assert_eq!(closes.load(Ordering::SeqCst), 1);
     assert_eq!(slot.close_count(), 1);
     assert_eq!(slot.state(), LifecycleState::Closed);
+    assert_eq!(
+        crate::stats::dns_snapshot()
+            .delta(before)
+            .pressure_retired_transport,
+        1
+    );
 }

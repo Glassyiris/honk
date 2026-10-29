@@ -124,6 +124,8 @@ DNS-owned sockets have a separately backed process-wide descriptor partition, sh
 
 When mandatory admission is blocked, weak generation-local owners reclaim unborrowed cached UDP sockets and idle TCP/TLS/H2/QUIC resources through their retained close/join paths. Completion and cancellation recheck pressure after releasing borrowed owners, so a waiting peer does not depend on the maintenance timer. Active exchanges are not evicted. Socket admission failure stays typed `Capacity` through retries and resolver hooks; it may render as `SERVFAIL`, unlike singleflight `REFUSED`. The existing standalone-refusal versus transparent-UDP-drop behavior at ingress saturation is unchanged.
 
+Clash [`/stats.dns`](../reference/api.md#dns-fields) exposes process-lifetime physical admission refusal and timeout counts, logical proxy admission timeouts, and resources selected for pressure retirement. The counts do not measure released descriptors or multiply failures by singleflight followers; native DNS diagnostics/history retain their existing outcome-only view.
+
 Initialization and flight fan-out use `SharedError`, an `Arc`-backed error that
 clones the original causal chain for builders and waiters instead of rebuilding
 it from display text. A completed failure is not cached; all attached waiters

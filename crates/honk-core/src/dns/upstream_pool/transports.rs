@@ -35,6 +35,9 @@ impl super::DnsIdleResources {
                         Arc::strong_count(pool) == 1 && pool.is_idle(now, std::time::Duration::ZERO)
                     }) {
                         udp_pools.extend(shard.take());
+                        crate::stats::record_dns_event(
+                            crate::stats::DnsStatEvent::PressureRetiredUdpPool,
+                        );
                     }
                 }
                 clear_current |=
