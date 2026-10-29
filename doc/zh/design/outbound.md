@@ -264,8 +264,9 @@ permit 仍持有时的 H2 driver 终止。Session 在发布或 detached attach �
 pool 通知；手动清理已关闭 carrier 时也会广播容量变化。
 
 VLESS 物理 carrier 还持有不可变进程级 VLESS-carrier gate 的一个 permit。
-启动资源预算在计算 UDP endpoint 前先分出 `min(after_dials / 8, 8192)`；零值
-保持为零。重载流量与 DNS runtime fork 共用同一个 gate。permit 随实际 carrier
+启动资源预算先扣除 DNS socket 分区，再在计算 UDP endpoint 前分出
+`min(after_dns / 8, 8192)`；零值保持为零。重载流量与 DNS runtime fork 共用
+同一个 gate。permit 随实际 carrier
 I/O 经 provisional、active、draining 与 idle 状态一直保留到 task teardown，
 因此权威描述符边界来自它，而不是各节点 pool cap 的总和。
 
@@ -664,16 +665,17 @@ carrier 独立保留，不能挤掉空闲 replacement；idle 回收和解除保�
 均线性遍历 pool。
 
 文件描述符分区在进程启动时固定，并在 reload 与 DNS fork 间共享。启用 `rprx`
-时，即使初始配置没有 VLESS 节点，也会在划分 UDP endpoint 定额前预留
-`min(after_dials / 8, 8192)` 个 carrier slot；原生 VLESS UDP、UoT 与 Single XUDP
-也使用此 gate。关闭 `rprx` 时不预留 carrier，相关余量保留给 UDP endpoint。
+时，先扣除 DNS socket 分区，再在划分 UDP endpoint 定额前预留
+`min(after_dns / 8, 8192)` 个 carrier slot，即使初始配置没有 VLESS 节点；
+原生 VLESS UDP、UoT 与 Single XUDP 也使用此 gate。关闭 `rprx` 时不预留
+carrier，相关余量保留给 UDP endpoint。
 耗尽后立即返回 typed Capacity 拒绝，不排队等待。
 
 | 生效 `nofile` | 不预留 carrier 时的 UDP endpoint 上限 | 预留后的上限 | 减少 |
 | ---: | ---: | ---: | ---: |
-| 1,024 | 50 | 44 | 12.00% |
-| 4,096 | 216 | 189 | 12.50% |
-| 65,536 | 4,588 | 4,015 | 12.49% |
+| 1,024 | 45 | 39 | 13.33% |
+| 4,096 | 192 | 168 | 12.50% |
+| 65,536 | 4,563 | 3,992 | 12.51% |
 | 1,048,576 | 32,768 | 32,768 | 0%（已达 endpoint 封顶） |
 
 这些是按描述符推导的上限，并非预分配 endpoint 内存；启动时还按

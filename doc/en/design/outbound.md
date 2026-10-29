@@ -292,8 +292,9 @@ the pool notification before publication or detached attachment; manual pruning
 also broadcasts when it removes an already-closed carrier.
 
 VLESS physical carriers additionally hold one permit from the immutable
-process-wide VLESS-carrier gate. The startup resource budget computes
-`min(after_dials / 8, 8192)` before sizing UDP endpoints; zero remains zero.
+process-wide VLESS-carrier gate. The startup resource budget deducts the DNS
+socket partition, then computes `min(after_dns / 8, 8192)` before sizing UDP
+endpoints; zero remains zero.
 Reloaded traffic and DNS runtime forks share the same gate. A permit stays with
 actual carrier I/O through provisional, active, draining, and idle task
 teardown. This gate, not a sum of node-local pool caps, is the authoritative descriptor bound.
@@ -769,17 +770,18 @@ carriers with live children remain independently and cannot displace the idle
 replacement; idle reaping and unpin removal traverse the pool linearly.
 
 The descriptor partition is fixed at process startup and shared across reloads
-and DNS forks. With `rprx`, it reserves `min(after_dials / 8, 8192)` carrier slots
-before sizing UDP endpoints, even when the initial configuration has no VLESS
-nodes; native VLESS UDP, UoT, and Single XUDP consume this gate too. Without
-`rprx`, no carrier slots are reserved and UDP endpoints retain that headroom.
+and DNS forks. After reserving DNS sockets, `rprx` reserves
+`min(after_dns / 8, 8192)` carrier slots before sizing UDP endpoints, even when
+the initial configuration has no VLESS nodes; native VLESS UDP, UoT, and Single
+XUDP consume this gate too. Without `rprx`, no carrier slots are reserved and
+UDP endpoints retain that headroom.
 Exhaustion returns an immediate typed Capacity refusal, not a wait queue.
 
 | Effective `nofile` | UDP endpoints without carrier reserve | UDP endpoints with carrier reserve | Reduction |
 | ---: | ---: | ---: | ---: |
-| 1,024 | 50 | 44 | 12.00% |
-| 4,096 | 216 | 189 | 12.50% |
-| 65,536 | 4,588 | 4,015 | 12.49% |
+| 1,024 | 45 | 39 | 13.33% |
+| 4,096 | 192 | 168 | 12.50% |
+| 65,536 | 4,563 | 3,992 | 12.51% |
 | 1,048,576 | 32,768 | 32,768 | 0% (endpoint cap) |
 
 These are descriptor-derived limits, not preallocated endpoint memory; startup
