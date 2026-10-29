@@ -126,7 +126,7 @@ async fn literal_doq_and_doh3_handshakes_record_actual_success_and_failure() {
                 address,
                 if succeeds { "succeeded" } else { "failed" },
             );
-            endpoint.close(Duration::from_secs(1)).await;
+            endpoint.close().await;
             server.close(0_u32.into(), b"done");
         }
     }
@@ -163,6 +163,6 @@ async fn literal_doq_and_doh3_cancel_after_wire_start_keep_parent_and_lookup() {
             }
         }
         assert_handshake(&events.lock(), observer.context(), address, "cancelled");
-        endpoint.close(Duration::from_secs(1)).await;
+        endpoint.close().await;
     }
 }

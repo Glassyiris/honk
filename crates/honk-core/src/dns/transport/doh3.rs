@@ -274,7 +274,7 @@ impl Doh3Client {
         self.session
             .close(move |session| session.close(timeout))
             .await;
-        self.quic_ep.close(self.dial.query_timeout).await;
+        self.quic_ep.close().await;
     }
 }
 

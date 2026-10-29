@@ -90,7 +90,7 @@ impl SharedQuicEndpoint {
         Ok(QuicEndpoint::Direct { endpoint, drivers })
     }
 
-    pub(super) async fn close(&self, _timeout: Duration) {
+    pub(super) async fn close(&self) {
         self.tasks.close().await;
     }
 
@@ -301,7 +301,7 @@ mod direct_endpoint_tests {
             drop((connection, owner));
         }
         assert_ne!(ports[0], ports[1]);
-        endpoint.close(Duration::from_secs(1)).await;
+        endpoint.close().await;
         server.close(0_u32.into(), b"done");
     }
 
@@ -388,7 +388,7 @@ mod direct_endpoint_tests {
                 connection.close(0_u32.into(), b"done");
                 owner.close(Duration::ZERO).await;
                 drop((connection, owner));
-                endpoints.close(Duration::ZERO).await;
+                endpoints.close().await;
                 assert_eq!(budget.available_sockets(), 1);
                 accepted.close(0_u32.into(), b"done");
                 server.close(0_u32.into(), b"done");
@@ -407,7 +407,7 @@ mod direct_endpoint_tests {
             .unwrap();
         drop(endpoint);
         assert_eq!(budget.available_sockets(), 0);
-        endpoints.close(Duration::ZERO).await;
+        endpoints.close().await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while budget.available_sockets() != 1 {
                 tokio::task::yield_now().await;
@@ -453,7 +453,7 @@ mod direct_endpoint_tests {
             peer.try_recv_from(&mut wire).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-        endpoints.close(Duration::ZERO).await;
+        endpoints.close().await;
     }
 }
 #[cfg(test)]

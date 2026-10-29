@@ -188,7 +188,7 @@ impl DoqClient {
         self.connection
             .close(move |connection| connection.close(timeout))
             .await;
-        self.quic_ep.close(self.dial.query_timeout).await;
+        self.quic_ep.close().await;
     }
 }
 

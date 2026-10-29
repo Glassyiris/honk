@@ -319,7 +319,7 @@ async fn cold_non_raw_upstream_bootstrap_shares_the_two_credit_bound() {
         assert_eq!(budget.available_proxy_streams(), 1);
         assert_eq!(budget.available_sockets(), 2);
         drop(next);
-        endpoints.close(Duration::ZERO).await;
+        endpoints.close().await;
         assert_eq!(fixture.active.load(Ordering::SeqCst), 0);
         assert_eq!(budget.available_proxy_streams(), 2);
     }
