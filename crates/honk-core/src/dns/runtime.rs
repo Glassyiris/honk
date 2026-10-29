@@ -9,7 +9,6 @@ use super::forwarder::DnsForwarder;
 pub(crate) const RETIREMENT_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const MAX_RETIRED_RUNTIMES: usize = 4;
 const MAX_CONCURRENT_QUERIES: usize = 2048;
-pub(crate) const MAX_UDP_CLIENT_QUERIES: usize = 1536;
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("DNS network admission is unavailable")]
@@ -103,7 +102,6 @@ pub(crate) use super::projection::RoutingProjectionSnapshot;
 
 pub(crate) struct DnsRuntimeParts {
     pub(crate) generation: RuntimeGeneration,
-    pub(crate) udp_query_limit: usize,
     pub(crate) forwarder: Arc<DnsForwarder>,
     pub(crate) routing_projection: Arc<RoutingProjectionSnapshot>,
     /// Defers reusable-state retirement of the traffic registry until this
@@ -116,7 +114,6 @@ pub(crate) struct DnsRuntimeParts {
 pub(crate) struct DnsRuntime {
     parts: DnsRuntimeParts,
     query_limit: Arc<Semaphore>,
-    udp_query_limit: Arc<Semaphore>,
     state: AtomicU8,
     leases: AtomicUsize,
     lease_released: Notify,
@@ -136,9 +133,6 @@ impl DnsRuntime {
     pub(crate) fn new(parts: DnsRuntimeParts) -> Arc<Self> {
         Arc::new(Self {
             query_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
-            udp_query_limit: Arc::new(Semaphore::new(
-                parts.udp_query_limit.min(MAX_UDP_CLIENT_QUERIES),
-            )),
             parts,
             state: AtomicU8::new(RuntimeState::Active as u8),
             leases: AtomicUsize::new(0),
@@ -183,10 +177,6 @@ impl DnsRuntime {
 
     pub(crate) fn try_acquire_query(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
         Arc::clone(&self.query_limit).try_acquire_owned()
-    }
-
-    pub(crate) fn try_acquire_udp_query(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
-        Arc::clone(&self.udp_query_limit).try_acquire_owned()
     }
 
     pub(crate) fn forwarder(&self) -> &Arc<DnsForwarder> {

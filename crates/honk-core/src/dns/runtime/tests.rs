@@ -106,7 +106,6 @@ fn runtime_with_outbound(
     );
     let runtime = DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
-        udp_query_limit: 256,
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(generation, router)),
         outbound_runtime,
@@ -135,34 +134,11 @@ fn runtime_with_bootstrap_pool(generation: u64, pool: Arc<LazyBootstrapPool>) ->
     );
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
-        udp_query_limit: 256,
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(generation, router)),
         outbound_runtime: None,
         transport: pool,
     })
-}
-
-#[test]
-fn udp_client_limit_cannot_consume_the_combined_query_ceiling() {
-    let (template, _) = runtime(0, 0);
-    let runtime = DnsRuntime::new(DnsRuntimeParts {
-        generation: RuntimeGeneration::new(1),
-        udp_query_limit: usize::MAX,
-        forwarder: Arc::clone(template.forwarder()),
-        routing_projection: Arc::clone(template.routing_projection()),
-        outbound_runtime: None,
-        transport: Arc::new(ObservedTransport::default()),
-    });
-    let udp: Vec<_> = (0..super::MAX_UDP_CLIENT_QUERIES)
-        .map(|_| runtime.try_acquire_udp_query().unwrap())
-        .collect();
-    assert!(runtime.try_acquire_udp_query().is_err());
-    let combined: Vec<_> = (0..super::MAX_CONCURRENT_QUERIES)
-        .map(|_| runtime.try_acquire_query().unwrap())
-        .collect();
-    assert!(runtime.try_acquire_query().is_err());
-    drop((udp, combined));
 }
 
 #[tokio::test]
@@ -426,7 +402,6 @@ fn prefetch_runtime(transport: Arc<BlockingTransport>) -> Arc<DnsRuntime> {
     ));
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(1),
-        udp_query_limit: 256,
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(1, router)),
         outbound_runtime: None,

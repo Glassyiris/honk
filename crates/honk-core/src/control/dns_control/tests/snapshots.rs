@@ -65,7 +65,7 @@ async fn snapshot_publication_does_not_wait_for_answer_query_exchange() {
 }
 
 #[tokio::test]
-async fn admitted_query_keeps_old_generation_quota_after_publication() {
+async fn admitted_query_keeps_shared_udp_quota_after_publication() {
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let controller = snapshot_controller(snapshot_forwarder(Arc::new(SnapshotUpstream {
@@ -106,18 +106,17 @@ async fn admitted_query_keeps_old_generation_quota_after_publication() {
         })),
     )
     .await;
+    assert!(controller.try_admit_query(true).is_err());
     let new_admission = controller
-        .try_admit_query(true)
-        .expect("new-generation UDP quota must be independent");
+        .try_admit_query(false)
+        .expect("TCP remains admissible while the shared UDP quota is occupied");
     let new_response = tokio::time::timeout(
         Duration::from_secs(1),
         controller.answer_query(
             &new_admission,
             &crate::dns::forwarder::build_dns_query("example.com", 1),
             crate::dns::query::DnsRequestMeta::EMPTY,
-            crate::dns::query::IngressProfile::Udp {
-                advertised_size: 512,
-            },
+            crate::dns::query::IngressProfile::Tcp,
         ),
     )
     .await
@@ -134,6 +133,40 @@ async fn admitted_query_keeps_old_generation_quota_after_publication() {
         crate::dns::forwarder::extract_answer_ips(old_response.wire()),
         ["192.0.2.9".parse::<std::net::IpAddr>().expect("old IP")]
     );
+    let _new_udp = controller
+        .try_admit_query(true)
+        .expect("old query completion releases its shared UDP permit");
+    assert!(controller.try_admit_query(true).is_err());
+}
+
+#[tokio::test]
+async fn forced_retirement_does_not_reissue_held_udp_permits() {
+    let forwarder = || {
+        snapshot_forwarder(Arc::new(SnapshotUpstream {
+            ip: [192, 0, 2, 9],
+            calls: AtomicUsize::new(0),
+            entered: None,
+            release: None,
+        }))
+    };
+    let controller = snapshot_controller(forwarder());
+    let held = controller.try_admit_query(true).unwrap();
+    for _ in 0..=crate::dns::runtime::MAX_RETIRED_RUNTIMES {
+        publish_snapshot_forwarder(&controller, forwarder()).await;
+        assert!(controller.try_admit_query(true).is_err());
+    }
+    tokio::time::timeout(Duration::from_secs(1), held.runtime.runtime().wait_closed())
+        .await
+        .expect("cap-evicted generation closes even while its caller retains admission");
+    assert!(controller.try_admit_query(true).is_err());
+    let _tcp = controller
+        .try_admit_query(false)
+        .expect("TCP remains admissible");
+    drop(held);
+    let _udp = controller
+        .try_admit_query(true)
+        .expect("caller drop returns the shared permit");
+    assert!(controller.try_admit_query(true).is_err());
 }
 
 #[tokio::test]

@@ -189,7 +189,6 @@ pub fn observability_snapshot_checksum() -> u64 {
 fn runtime(shared: &RuntimeShared, generation: u64) -> Arc<DnsRuntime> {
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
-        udp_query_limit: 256,
         forwarder: Arc::new(DnsForwarder::new(
             Arc::new(UnusedPool),
             Arc::clone(&shared.cache),

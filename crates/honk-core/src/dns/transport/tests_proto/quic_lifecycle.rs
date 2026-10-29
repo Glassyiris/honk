@@ -40,7 +40,6 @@ fn quic_runtime_with_fault(
         .unwrap();
     let runtime = DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(1),
-        udp_query_limit: 256,
         forwarder: Arc::new(DnsForwarder::new(
             pool.clone(),
             Arc::new(tokio::sync::Mutex::new(DnsCache::new(16))),

@@ -640,7 +640,6 @@ async fn listener_queries_acquire_the_newly_published_runtime() {
             routing_projection: projection,
             outbound_runtime: None,
             transport: Arc::new(TestRuntimeTransport),
-            udp_query_limit: 256,
         },
     ));
 

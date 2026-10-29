@@ -15,13 +15,15 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, RwLock, TryAcquireError};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, TryAcquireError};
 use tracing::warn;
 
 mod transport;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) const MAX_UDP_CLIENT_QUERIES: usize = 1536;
 
 use crate::dns::query::{DnsRequestMeta, IngressProfile};
 use crate::dns::response::{build_dns_refused, build_dns_servfail};
@@ -40,6 +42,7 @@ impl crate::dns::runtime::RuntimeTransport for NoopRuntimeTransport {
 pub struct DnsController {
     dns_service: crate::dns::DnsService,
     routing_projection: Arc<crate::dns::projection::RoutingProjection>,
+    udp_query_limit: Arc<Semaphore>,
 }
 
 pub(crate) struct DnsClientAnswer(Result<crate::dns::outcome::DnsOutcome, Vec<u8>>);
@@ -66,8 +69,8 @@ impl DnsClientAnswer {
     }
 }
 
-/// Admission for one DNS request. The runtime lease and both runtime-owned
-/// permits are held by the transport owner through response I/O.
+/// Admission retained by the transport through response I/O. The query permit
+/// is generation-owned; the UDP permit comes from the controller's shared budget.
 pub(crate) struct AdmittedDnsQuery {
     runtime: crate::dns::runtime::RuntimeLease,
     _query_permit: OwnedSemaphorePermit,
@@ -128,11 +131,11 @@ impl DnsController {
             )),
             outbound_runtime: None,
             transport: Arc::new(NoopRuntimeTransport),
-            udp_query_limit,
         });
         Self::new_with_runtime(
             Arc::new(crate::dns::runtime::DnsServiceProvider::new(runtime)),
             ebpf,
+            udp_query_limit,
         )
     }
 
@@ -140,16 +143,19 @@ impl DnsController {
     pub(crate) fn new_with_runtime(
         runtime_provider: Arc<crate::dns::runtime::DnsServiceProvider>,
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        udp_query_limit: usize,
     ) -> Self {
         Self::new_with_service(
             crate::dns::DnsService::with_provider(runtime_provider),
             ebpf,
+            udp_query_limit,
         )
     }
 
     pub(crate) fn new_with_service(
         dns_service: crate::dns::DnsService,
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        udp_query_limit: usize,
     ) -> Self {
         let snapshot = {
             let runtime = dns_service
@@ -163,6 +169,7 @@ impl DnsController {
         Self {
             dns_service,
             routing_projection,
+            udp_query_limit: Arc::new(Semaphore::new(udp_query_limit.min(MAX_UDP_CLIENT_QUERIES))),
         }
     }
 
@@ -232,17 +239,18 @@ impl DnsController {
                 error: TryAcquireError::Closed,
                 udp_reply: None,
             })?;
-        let udp_permit =
-            if udp {
-                Some(runtime.runtime().try_acquire_udp_query().map_err(|error| {
-                    DnsAdmissionError {
+        let udp_permit = if udp {
+            Some(
+                Arc::clone(&self.udp_query_limit)
+                    .try_acquire_owned()
+                    .map_err(|error| DnsAdmissionError {
                         error,
                         udp_reply: None,
-                    }
-                })?)
-            } else {
-                None
-            };
+                    })?,
+            )
+        } else {
+            None
+        };
         let query_permit = match runtime.runtime().try_acquire_query() {
             Ok(permit) => permit,
             Err(error) => {

@@ -185,7 +185,6 @@ impl ControlPlane {
         let initial_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation: crate::dns::runtime::RuntimeGeneration::new(0),
-                udp_query_limit: resource_budget.dns_udp_queries,
                 forwarder: dns_forwarder.clone(),
                 routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
                     0,
@@ -204,6 +203,7 @@ impl ControlPlane {
             crate::control::dns_control::DnsController::new_with_service(
                 dns_service,
                 ebpf_arc.clone(),
+                resource_budget.dns_udp_queries,
             ),
         );
         // Health-check name resolution shares honk's own DNS forwarder

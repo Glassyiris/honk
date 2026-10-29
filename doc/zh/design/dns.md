@@ -109,7 +109,7 @@ Honk 的独立 bind 可以是 `:53530`、其他空闲端口或关闭；它不是
 
 | 阶段 | 不变量 |
 | --- | --- |
-| 1. 准入与 generation | `DnsController` 固定一个 runtime，取得该代的 owned query permit；UDP 入口同时取得该代的 UDP permit。每代 2,048 查询的 permit 一直保留到应答完成；饱和时降级为 `REFUSED`。 |
+| 1. 准入与 generation | `DnsController` 固定一个 runtime，取得该代的 owned query permit；UDP 入口同时取得 controller 持有的进程级 UDP permit。两种 permit 都保留到应答完成；饱和时降级为 `REFUSED`。 |
 | 2. 解析与校验 | adapter 要求一条完整请求。`DnsEngine` 解析 wire，拒绝没有可用问题或有多个问题的请求，生成小写的路由域名而不改变 qname 的大小写，并记录入口 profile。 |
 | 3. 地址族 gate 与 hosts | `ipv4only`/`ipv6only` 在 hosts 或上游工作前，以 NODATA 拒绝另一地址族。除此之外，不可变 hosts 快照先于请求路由、缓存与上游交换执行。 |
 | 4. 请求规划 | 按源码顺序的请求规则依据路由域名、QTYPE 与逻辑客户端来源选择 reject、`asis` 或命名上游。首条命中。 |
@@ -119,7 +119,7 @@ Honk 的独立 bind 可以是 `:53530`、其他空闲端口或关闭；它不是
 | 8. 发布与渲染 | 只有严格校验后的最终 wire 响应才能进入缓存或发布给 singleflight waiter。偏好地址族压制在保存已校验、可复用的应答后，才应用于调用方渲染。 |
 | 9. 结果与投影 | forwarder 返回类型化结果。`DnsController` 使用固定 generation 的投影快照提交该结果，随后入口 adapter 写应答。 |
 
-每代有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。UDP 客户端准入与普通 UDP 初始化分开，启动时封顶为 `min(1536, MemTotal / 4 / 256 KiB)`。每查询 256 KiB 是容量估算，不是强制 RSS 上限；共享的 2,048 查询上限也不是 TCP 专用预留。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。发布结果时，删除 flight 与向已加入 follower 广播结果原子完成；后续缓存未命中的请求可以开启新 flight。已完成的失败保留原始原因但不进入缓存，因此已加入的 follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
+每代有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。UDP 客户端准入与普通 UDP 初始化分开，启动时封顶为 `min(1536, MemTotal / 4 / 256 KiB)`。`DnsController` 持有这份由活跃代与退役代共用的进程级 UDP 预算；reload 不补发额度，permit 保留到应答完成。每查询 256 KiB 是容量估算，不是强制 RSS 上限；共享的 2,048 查询上限也不是 TCP 专用预留。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。发布结果时，删除 flight 与向已加入 follower 广播结果原子完成；后续缓存未命中的请求可以开启新 flight。已完成的失败保留原始原因但不进入缓存，因此已加入的 follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
 
 DNS 自有 socket 使用独立扣除、由活跃与退役 generation 共同持有的进程级描述符分区。额度随实际 socket、空闲 stream、endpoint poller 或 packet-adapter worker 保留到 teardown。Endpoint 网络 bootstrap 为并发 A/AAAA 一次预留两个额度。Literal IP 与 pinned 地址绕过该准入；`/etc/hosts` 仅在未先查询配置的 resolver 时才无需网络额度。配置 resolver 的准入先于 hosts 回退，拒绝时立即返回。代理 TCP stream 与非原始 UDP 的 packet 准备则共用不超过 DNS socket 分区大小的保守逻辑 lease 上限，并在代理节点 bootstrap 前取得 lease。Direct/Shadowsocks/SOCKS5 的原始 UDP 部分使用物理额度；SOCKS5 控制 TCP 和其他代理 carrier 保留既有 outbound 所有权。两额度预留只覆盖 DNS 上游 endpoint 名称：解析原始 Shadowsocks/SOCKS5 代理节点或 SOCKS5 relay 名称时，准备过程只持有一个额度，却可能为并发 A/AAAA 短暂打开两个未计入的 resolver socket。Shadowsocks 在打开 UDP socket 前关闭它们；SOCKS5 解析 relay 时可能与控制 TCP 重叠。这不等于所有代理 carrier 或代理准备阶段 resolver socket 的总 FD 上限。
 
@@ -318,11 +318,11 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 ## Generation 与 reload
 
-一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、routing/group snapshot、transport manager、路由投影、捕获的 bootstrap resolver 及代内 query/UDP admission。每个新 forwarder 独占 singleflight 和 refresh/prefetch worker；clone 仍属于该代。每个 DNS pool 持有新的 outbound runtime fork，不复用 traffic session 或旧 DNS 代 session。fork 与来源配置代共享 dial semaphore、进程 physical-dial ceiling 和进程 VLESS-carrier gate，但不共享 retirement state 或 protocol pool。
+一个 `DnsRuntime` 包含 forwarder 与 policy、不可变 hosts 表、routing/group snapshot、transport manager、路由投影、捕获的 bootstrap resolver 及代内 query admission。每个新 forwarder 独占 singleflight 和 refresh/prefetch worker；clone 仍属于该代。每个 DNS pool 持有新的 outbound runtime fork，不复用 traffic session 或旧 DNS 代 session。fork 与来源配置代共享 dial semaphore、进程 physical-dial ceiling 和进程 VLESS-carrier gate，但不共享 retirement state 或 protocol pool。
 
 现有维护任务也会回收当前 DNS registry 已结束的任务与空闲 VLESS carrier。Registry 终止关闭时会释放其缓存 connector，即使已退役 runtime 仍被保留。
 
-发布后，新代立即拥有独立执行资源：旧代即使饱和，也不能占用新代 query/UDP 配额，或让新查询加入旧 flight。仅已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程等待后台工作任务结束并关闭 DNS transport；只有这些 transport 排空后，才关闭它们的私有 outbound runtime fork，再退役捕获的普通流量 registry 中未转移的可复用状态。
+发布后，新代立即拥有独立的 query 与 singleflight 资源：旧代即使饱和，也不能占用新代的代内 query 配额，或让新查询加入旧 flight。UDP 准入仍跨代共享，旧 UDP caller 在释放 permit 前可能占满这份进程级配额。已完成答案缓存、publication/flush fence 和持久化继续共享；它们不持有在途工作。旧查询 lease 自然排空到应答 I/O 完成，然后退役流程等待后台工作任务结束并关闭 DNS transport；只有这些 transport 排空后，才关闭它们的私有 outbound runtime fork，再退役捕获的普通流量 registry 中未转移的可复用状态。
 
 30 秒期限只限制等待查询 lease 排空的时间，不限制 transport 与 outbound pool 整体拆除所需的时间。它是安全限制，并非新代服务的前置条件；到期会取消 runtime 所有的 forwarding 和已准入应答 future。应用解析的 bootstrap fallback 仍在原查询 lease 内执行，drain 会等待它，强制 shutdown 也会取消它。最多保留四个已退役代；超过上限与 provider 关闭会触发相同的强制取消。某代完成退役且 lease 排空后即释放其 runtime，只保留 outbound registry 供上述强制关闭使用。已就绪的终态 `SERVFAIL` 应答仍会尝试发送，但停滞的已准入应答 I/O 会被取消；TCP 写入被取消时关闭连接。
 

@@ -1,5 +1,26 @@
 use super::*;
 
+#[tokio::test]
+async fn udp_client_limit_cannot_consume_the_combined_query_ceiling() {
+    let controller = controller_with_limit(
+        Arc::new(SlowUpstream {
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            response: Vec::new(),
+        }),
+        usize::MAX,
+    );
+    let udp: Vec<_> = (0..super::super::MAX_UDP_CLIENT_QUERIES)
+        .map(|_| controller.try_admit_query(true).unwrap())
+        .collect();
+    assert!(controller.try_admit_query(true).is_err());
+    let tcp: Vec<_> = (0..2048 - super::super::MAX_UDP_CLIENT_QUERIES)
+        .map(|_| controller.try_admit_query(false).unwrap())
+        .collect();
+    assert!(controller.try_admit_query(false).is_err());
+    drop((udp, tcp));
+}
+
 #[cfg(feature = "native-api")]
 #[tokio::test]
 async fn native_log_captures_transparent_udp_completion_with_full_source() {

@@ -1,7 +1,7 @@
 //! Immutable process-wide descriptor partitioning for the control plane.
 
+use crate::control::dns_control::MAX_UDP_CLIENT_QUERIES;
 use crate::control::udp_endpoint::{MAX_ENDPOINTS, MAX_REPLY_SOCKETS_PER_ENDPOINT};
-use crate::dns::runtime::MAX_UDP_CLIENT_QUERIES;
 use crate::dns::transport::DEFAULT_DNS_SOCKET_LIMIT;
 use crate::pool::MAX_TOTAL_ENTRIES;
 

@@ -204,7 +204,7 @@ memory 或 scheduler capacity。TCP 从描述符导出的 floor 开始，封顶 
 | TCP 流 permit | 描述符导出的 floor，加上对观测到的 idle non-TCP headroom 的有界借用 |
 | VLESS 物理 carrier | 启动时固定的 `min(after_dns / 8, 8192)` 进程 gate |
 | 冷 non-DNS UDP slow path | `min(udp_endpoints, 256)` |
-| UDP DNS 客户端生命周期 | 每代 `min(1536, MemTotal / 4 / 256 KiB)` |
+| UDP DNS 客户端生命周期 | 进程级 `min(1536, MemTotal / 4 / 256 KiB)`，跨 reload 共用 |
 | 所有 controller DNS 查询生命周期 | 每代 2,048，TCP 与 UDP 共用 |
 | DNS 自有 socket / endpoint 网络 bootstrap | 独立描述符分区支持的进程 gate，最多 256 个额度，跨 reload 共享 |
 | DNS 代理 stream / 非原始 UDP 的 packet 准备 | 不超过 DNS socket 上限的进程级保守逻辑 lease；不是所有代理 FD 的总上限 |

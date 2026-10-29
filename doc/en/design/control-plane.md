@@ -218,7 +218,7 @@ Admission ceilings are distinct:
 | TCP flow permits | Descriptor-derived floor plus bounded borrowing of observed idle non-TCP headroom |
 | VLESS physical carriers | Startup `min(after_dns / 8, 8192)` process gate |
 | Cold non-DNS UDP slow path | `min(udp_endpoints, 256)` |
-| UDP DNS client lifecycles | `min(1536, MemTotal / 4 / 256 KiB)` per generation |
+| UDP DNS client lifecycles | `min(1536, MemTotal / 4 / 256 KiB)` process-wide, shared across reload |
 | All controller DNS query lifecycles | 2,048 per generation, shared by TCP and UDP |
 | DNS-owned sockets / endpoint network bootstrap | Separately backed process gate, at most 256 credits, shared across reload |
 | DNS proxy stream / non-raw packet preparation | Conservative process-wide logical leases, at most the DNS socket limit; not an aggregate proxy FD bound |
