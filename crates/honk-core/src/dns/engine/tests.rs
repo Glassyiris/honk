@@ -756,7 +756,10 @@ async fn negative_outcome_expiry_matches_insert_and_cache_hit_lifetime() {
     #[cfg(feature = "native-api")]
     assert_eq!(hit.cache_entry_id(), None);
     assert!(hit.expiry().is_cacheable());
-    assert_eq!(hit.expiry().ttl(), std::time::Duration::from_secs(20));
+    assert!(
+        (std::time::Duration::from_secs(19)..=std::time::Duration::from_secs(20))
+            .contains(&hit.expiry().ttl())
+    );
     assert_eq!(pool.calls.load(Ordering::SeqCst), 1);
 }
 

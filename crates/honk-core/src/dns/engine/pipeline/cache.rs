@@ -36,6 +36,7 @@ pub(super) async fn lookup(
             hit,
             revision: _revision,
         } => {
+            let expires_at = Instant::now() + hit.remaining_ttl;
             crate::observe::flows::dns::cache_state("hit");
             #[cfg(feature = "native-api")]
             let entry_id = if entry_id_demanded(context) {
@@ -68,7 +69,9 @@ pub(super) async fn lookup(
                     None,
                     OutcomeStatus::Accepted,
                     Provenance::Cache,
-                    EffectiveExpiry::cacheable(hit.remaining_ttl),
+                    EffectiveExpiry::cacheable(
+                        expires_at.saturating_duration_since(Instant::now()),
+                    ),
                     None,
                     None,
                     Vec::new(),
