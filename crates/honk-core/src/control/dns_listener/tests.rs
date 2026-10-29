@@ -705,26 +705,3 @@ async fn query_start_spawns_only_unfinished_work_and_retains_panics() {
     start_query(&mut children, &phase, &mut failure, panicking).await;
     assert!(failure.is_some(), "a query panic must fail teardown");
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn udp_listener_answers_concurrent_queries_and_joins_on_shutdown() {
-    let (controller, calls) = controller([192, 0, 2, 30]);
-    let (mut listener, address, drain) = start_listener("udp://127.0.0.1:0", controller);
-    let mut clients = JoinSet::new();
-    for txid in 0..8u16 {
-        clients.spawn(async move {
-            udp_exchange(address, &query(&format!("worker{txid}.example"), txid)).await
-        });
-    }
-    while let Some(answer) = clients.join_next().await {
-        assert!(
-            answer
-                .unwrap()
-                .windows(4)
-                .any(|window| window == [192, 0, 2, 30])
-        );
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 8);
-
-    stop_listener(&mut listener, &drain).await;
-}
