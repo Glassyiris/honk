@@ -162,7 +162,7 @@ pub(super) struct DesiredState {
     pub(super) expiry_deadlines: BinaryHeap<Reverse<DeadlineEntry>>,
     pub(super) eviction_order: BinaryHeap<Reverse<(u64, usize, OwnerKey)>>,
     /// Advances whenever an owner is added, removed, re-keyed or rebuilt, so
-    /// lock-free cache-hit hints can detect that their owner may have changed.
+    /// cache-hit hints can detect owner changes without taking the state lock.
     pub(super) structure: Arc<AtomicU64>,
 }
 
@@ -599,8 +599,8 @@ impl DesiredState {
     }
 
     /// The live owner's key, exact canonical address set and expiry, for a
-    /// lock-free cache-hit hint. Owners with a capacity-omitted address are
-    /// excluded so their refreshes keep retrying admission under the lock.
+    /// cache-hit hint that skips the projection fence and state lock. Owners with
+    /// capacity-omitted addresses are excluded so refreshes keep retrying admission.
     pub(super) fn cache_hit_hint(
         &self,
         family: usize,

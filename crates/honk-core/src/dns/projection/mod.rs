@@ -86,11 +86,11 @@ use state::DesiredState;
 
 const DEFAULT_DOMAIN_CAPACITY: usize = 10_000;
 /// Cache-hit refreshes of an unchanged owner within this window skip the
-/// projection locks. Bounds both stale LRU recency and how late a skipped
-/// TTL shortening is applied.
+/// projection fence and state lock. Bounds stale LRU recency and how late a
+/// skipped TTL shortening is applied.
 const CACHE_HIT_COALESCE: Duration = Duration::from_secs(1);
 
-/// Owner state last applied under the projection locks, readable without them.
+/// Owner state last applied under the projection fence and state lock.
 struct CacheHitHint {
     structure: u64,
     generation: u64,
@@ -327,9 +327,9 @@ impl RoutingProjection {
         })
     }
 
-    /// Submit an observation whose answer came from the DNS cache. A refresh
-    /// identical to one applied within `CACHE_HIT_COALESCE`, which would only
-    /// shorten expiry by at most that window, is coalesced without locking.
+    /// Submits a DNS-cache observation. A refresh identical to one applied within
+    /// `CACHE_HIT_COALESCE`, shortening expiry by at most that window, is coalesced
+    /// without taking the projection fence or state lock.
     /// Returns `false` while a publication holds the fence.
     pub(crate) fn try_submit_cache_hit(
         &self,

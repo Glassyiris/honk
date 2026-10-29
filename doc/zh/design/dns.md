@@ -121,7 +121,7 @@ Honk 的独立 bind 可以是 `:53530`、其他空闲端口或关闭；它不是
 
 每代有两个相互独立的 2,048 上限：controller 查询生命周期与活跃 singleflight key。UDP 客户端准入与普通 UDP 初始化分开，启动时封顶为 `min(1536, MemTotal / 4 / 256 KiB)`。每查询 256 KiB 是容量估算，不是强制 RSS 上限；共享的 2,048 查询上限也不是 TCP 专用预留。每个 flight 最多接受 256 个 follower。flight 饱和时拒绝，不会开启无限上游交换；controller 将该过载渲染为 `REFUSED`。发布结果时，删除 flight 与向已加入 follower 广播结果原子完成；后续缓存未命中的请求可以开启新 flight。已完成的失败保留原始原因但不进入缓存，因此已加入的 follower 不会各自重复失败的交换。丢弃未发布结果的 leader 会删除 flight 并唤醒 follower 重新竞争所有权；这包括取消，以及缺少已验证 response template、仅被 compatibility mode 接受的成功结果。
 
-DNS 自有 socket 使用独立扣除、由活跃与退役 generation 共同持有的进程级描述符分区。额度随实际 socket、空闲 stream、endpoint poller 或 packet-adapter worker 保留到 teardown。Endpoint 网络 bootstrap 为并发 A/AAAA 一次预留两个额度；本地解析结果不占网络额度。代理 TCP stream 与非原始 UDP 的 packet 准备则共用不超过 DNS socket 分区大小的保守逻辑 lease 上限，并在代理节点 bootstrap 前取得 lease。Direct/Shadowsocks/SOCKS5 的原始 UDP 部分使用物理额度；SOCKS5 控制 TCP 和其他代理 carrier 保留既有 outbound 所有权。这不等于所有代理 carrier 的总 FD 上限。
+DNS 自有 socket 使用独立扣除、由活跃与退役 generation 共同持有的进程级描述符分区。额度随实际 socket、空闲 stream、endpoint poller 或 packet-adapter worker 保留到 teardown。Endpoint 网络 bootstrap 为并发 A/AAAA 一次预留两个额度。Literal IP 与 pinned 地址绕过该准入；`/etc/hosts` 仅在未先查询配置的 resolver 时才无需网络额度。配置 resolver 的准入先于 hosts 回退，拒绝时立即返回。代理 TCP stream 与非原始 UDP 的 packet 准备则共用不超过 DNS socket 分区大小的保守逻辑 lease 上限，并在代理节点 bootstrap 前取得 lease。Direct/Shadowsocks/SOCKS5 的原始 UDP 部分使用物理额度；SOCKS5 控制 TCP 和其他代理 carrier 保留既有 outbound 所有权。这不等于所有代理 carrier 的总 FD 上限。
 
 必要准入阻塞时，按 generation 注册的弱 owner 通过保留的 close/join 路径回收未被借用的缓存 UDP socket 及空闲 TCP/TLS/H2/QUIC 资源。完成与取消在释放借用后重新检查压力，等待中的其他上游不必依赖维护定时器；已开始的交换不会被淘汰。Socket 准入失败在重试及 resolver hook 中保留类型化 `Capacity`，可能渲染为 `SERVFAIL`，不同于 singleflight 的 `REFUSED`。入口饱和时独立监听器回拒绝、透明 UDP 丢弃的既有行为不变。
 
@@ -266,8 +266,8 @@ UDP 冷路径和 cached-current 快捷路径使用同一取池入口，在交换
 `transport/udp_pool/error_queue.rs` 读取 `IP_RECVERR`/`IPV6_RECVERR` 提供的
 原始报文；ERROR 就绪位与普通报文的 READABLE 就绪位由不同消费者处理。
 只有完整匹配 DNS ID 和 question 的错误引用才能结束对应请求，并保留原始
-I/O 错误原因。过短、已退役或不相关的引用不影响其他请求；归属判断仍受与
-普通响应相同的有限 ID 隔离窗口约束。没有可用引用的接收错误让请求继续受
+I/O 错误原因。过短、已退役或不相关的引用不影响其他请求；已归属的 ICMP
+错误按 abandoned ID 隔离三秒。没有可用引用的接收错误让请求继续受
 自身 deadline 限制，不支持 error queue 的平台也采取此保守行为。
 send 系统调用失败仍按既有行为把原始错误返回当前交换，不宣称对 send 错误
 实现了引用归属，也不在该交换内重新发送；发送与等待响应共用一个绝对
@@ -298,7 +298,7 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 延长 TTL 和更新 LRU 时复用已经入堆的条目。过期唤醒和淘汰候选先重新校验当前 owner，再重排或删除；缩短 TTL 则立即安排更早的截止时间。独立的入队 sequence 标记隔离清除后重建及地址族变化，并保留原有的有界堆压缩。
 
-由 DNS 缓存返回的正应答使用该缓存项的精确剩余寿命。地址集合未变时重新提交只刷新 TTL 与 LRU 新近度，不重建集合。缓存命中还可跳过投影锁：前提是距上次加锁提交不到一秒，且 policy generation、owner 结构和规范化地址集合都相同，报告的到期时间不晚于已应用值、最多早一秒。被合并的命中会跳过最多一秒的寿命缩短，且不会安排后续更新，因此路由到期时间最多可比缓存报告的到期时间晚一秒；LRU 新近度也可能滞后同样的窗口。新增、删除、重建键或因容量被省略的 owner、更新的 generation，以及新鲜、过期或上游应答始终走加锁路径。
+由 DNS 缓存返回的正应答使用该缓存项的精确剩余寿命。地址集合未变时重新提交只刷新 TTL 与 LRU 新近度，不重建集合。缓存命中还可跳过投影的 publication fence 与 state lock：前提是距上次加锁提交不到一秒，且 policy generation、owner 结构和规范化地址集合都相同，报告的到期时间不晚于已应用值、最多早一秒。被合并的命中会跳过最多一秒的寿命缩短，且不会安排后续更新，因此路由到期时间最多可比缓存报告的到期时间晚一秒；LRU 新近度也可能滞后同样的窗口。新增、删除、重建键或因容量被省略的 owner、更新的 generation，以及新鲜、过期或上游应答始终走加锁路径。
 
 每个正应答 observation 在首次提交前固定绝对到期时间。等待发布与重试都会消耗原有寿命，不会重新开始计时；reload 被拒绝后也是如此。如果实际应用时已经到期，只清除所查询地址族的 owner，不插入可被后续 reload 预填的过期 owner。
 
