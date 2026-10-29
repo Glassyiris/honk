@@ -50,12 +50,7 @@ pub fn client_endpoint_with_owner_and_tasks<T>(
 where
     T: Send + Sync + 'static,
 {
-    let runtime = Arc::new(OwnedEndpointRuntime {
-        inner: quinn::default_runtime()
-            .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?,
-        tasks: Arc::downgrade(tasks),
-        parent: parent.map(Arc::downgrade),
-    });
+    let runtime = OwnedTaskRuntime::new(tasks, parent)?;
     client_endpoint_with_mtu_and_owner(ipv6, 1252, owner, Some(runtime))
 }
 
@@ -122,13 +117,27 @@ where
 }
 
 #[derive(Debug)]
-struct OwnedEndpointRuntime {
+pub(super) struct OwnedTaskRuntime {
     inner: Arc<dyn quinn::Runtime>,
     tasks: std::sync::Weak<crate::runtime::TaskOwner>,
     parent: Option<std::sync::Weak<crate::runtime::TaskOwner>>,
 }
 
-impl quinn::Runtime for OwnedEndpointRuntime {
+impl OwnedTaskRuntime {
+    pub(super) fn new(
+        tasks: &Arc<crate::runtime::TaskOwner>,
+        parent: Option<&Arc<crate::runtime::TaskOwner>>,
+    ) -> io::Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            inner: quinn::default_runtime()
+                .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?,
+            tasks: Arc::downgrade(tasks),
+            parent: parent.map(Arc::downgrade),
+        }))
+    }
+}
+
+impl quinn::Runtime for OwnedTaskRuntime {
     fn new_timer(&self, deadline: std::time::Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
         self.inner.new_timer(deadline)
     }
