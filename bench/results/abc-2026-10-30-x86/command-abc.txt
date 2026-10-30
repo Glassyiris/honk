@@ -1,0 +1,8 @@
+env -u RUST_LOG T=10.10.10.70 N=lab \
+HONK_BIN=/root/eries-bench-abc-20261030/bin/honk-core \
+HONK_CONFIG=/root/eries-bench-abc-20261030/honk-lab.dae \
+DAE_BIN=/root/eries-bench-abc-20261030/bin/dae \
+DAE_CONFIG=/root/eries-bench-abc-20261030/dae-lab.dae \
+SB_BIN=/root/eries-bench-abc-20261030/bin/sing-box \
+SB_CONFIG=/root/eries-bench-abc-20261030/sb-client.json \
+bash lab-bench.sh 'honk dae sing-box' 'hy2 tuic ss2022 trojan anytls-sb anytls-go'

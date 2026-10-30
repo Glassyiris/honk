@@ -1,0 +1,246 @@
+{
+	"start":	{
+		"connected":	[{
+				"socket":	4,
+				"local_host":	"172.19.0.1",
+				"local_port":	35006,
+				"remote_host":	"10.10.10.70",
+				"remote_port":	5201
+			}],
+		"version":	"iperf 3.22",
+		"system_info":	"Linux archlinux 7.2.3-arch1-3 #1 SMP PREEMPT_DYNAMIC Sun, 06 Sep 2026 13:01:04 +0000 x86_64",
+		"timestamp":	{
+			"time":	"Fri, 30 Oct 2026 13:23:19 GMT",
+			"timesecs":	1793366599,
+			"timemillisecs":	1793366599344
+		},
+		"connecting_to":	{
+			"host":	"10.10.10.70",
+			"port":	5201
+		},
+		"cookie":	"257gcdmvxy67dczxt5fmy4c66jnjwzdk3ino",
+		"target_bitrate":	10000000000,
+		"fq_rate":	0,
+		"sock_bufsize":	0,
+		"sndbuf_actual":	212992,
+		"rcvbuf_actual":	212992,
+		"test_start":	{
+			"protocol":	"UDP",
+			"num_streams":	1,
+			"blksize":	1200,
+			"omit":	0,
+			"duration":	8,
+			"bytes":	0,
+			"blocks":	0,
+			"reverse":	1,
+			"tos":	0,
+			"target_bitrate":	10000000000,
+			"bidir":	0,
+			"fqrate":	0,
+			"interval":	1,
+			"gso":	0,
+			"gro":	0
+		}
+	},
+	"intervals":	[{
+			"streams":	[{
+					"socket":	4,
+					"start":	0,
+					"end":	1.000581,
+					"seconds":	1.0005810260772705,
+					"bytes":	131180400,
+					"bits_per_second":	1048833800.2113545,
+					"jitter_ms":	0.016360306523631685,
+					"lost_packets":	596512,
+					"packets":	705829,
+					"lost_percent":	84.512254384560563,
+					"omitted":	false,
+					"sender":	false
+				}],
+			"sum":	{
+				"start":	0,
+				"end":	1.000581,
+				"seconds":	1.0005810260772705,
+				"bytes":	131180400,
+				"bits_per_second":	1048833800.2113545,
+				"jitter_ms":	0.016360306523631685,
+				"lost_packets":	596512,
+				"packets":	705829,
+				"lost_percent":	84.512254384560563,
+				"omitted":	false,
+				"sender":	false
+			}
+		}, {
+			"streams":	[{
+					"socket":	4,
+					"start":	1.000581,
+					"end":	2.000581,
+					"seconds":	1,
+					"bytes":	133922400,
+					"bits_per_second":	1071379200,
+					"jitter_ms":	0.0233300895722475,
+					"lost_packets":	607406,
+					"packets":	719008,
+					"lost_percent":	84.478336819618136,
+					"omitted":	false,
+					"sender":	false
+				}],
+			"sum":	{
+				"start":	1.000581,
+				"end":	2.000581,
+				"seconds":	1,
+				"bytes":	133922400,
+				"bits_per_second":	1071379200,
+				"jitter_ms":	0.0233300895722475,
+				"lost_packets":	607406,
+				"packets":	719008,
+				"lost_percent":	84.478336819618136,
+				"omitted":	false,
+				"sender":	false
+			}
+		}, {
+			"streams":	[{
+					"socket":	4,
+					"start":	2.000581,
+					"end":	3.000581,
+					"seconds":	1,
+					"bytes":	134157600,
+					"bits_per_second":	1073260800,
+					"jitter_ms":	0.02347810595378599,
+					"lost_packets":	609467,
+					"packets":	721265,
+					"lost_percent":	84.49973310780365,
+					"omitted":	false,
+					"sender":	false
+				}],
+			"sum":	{
+				"start":	2.000581,
+				"end":	3.000581,
+				"seconds":	1,
+				"bytes":	134157600,
+				"bits_per_second":	1073260800,
+				"jitter_ms":	0.02347810595378599,
+				"lost_packets":	609467,
+				"packets":	721265,
+				"lost_percent":	84.49973310780365,
+				"omitted":	false,
+				"sender":	false
+			}
+		}, {
+			"streams":	[{
+					"socket":	4,
+					"start":	3.000581,
+					"end":	4.000577,
+					"seconds":	0.9999960064888,
+					"bytes":	131250000,
+					"bits_per_second":	1050004193.2035055,
+					"jitter_ms":	0.038541987982147759,
+					"lost_packets":	610224,
+					"packets":	719599,
+					"lost_percent":	84.800562535523255,
+					"omitted":	false,
+					"sender":	false
+				}],
+			"sum":	{
+				"start":	3.000581,
+				"end":	4.000577,
+				"seconds":	0.9999960064888,
+				"bytes":	131250000,
+				"bits_per_second":	1050004193.2035055,
+				"jitter_ms":	0.038541987982147759,
+				"lost_packets":	610224,
+				"packets":	719599,
+				"lost_percent":	84.800562535523255,
+				"omitted":	false,
+				"sender":	false
+			}
+		}, {
+			"streams":	[{
+					"socket":	4,
+					"start":	4.000577,
+					"end":	5.000599,
+					"seconds":	1.0000220537185669,
+					"bytes":	131791200,
+					"bits_per_second":	1054306348.6245041,
+					"jitter_ms":	0.040135987321425669,
+					"lost_packets":	611460,
+					"packets":	721286,
+					"lost_percent":	84.773584957977832,
+					"omitted":	false,
+					"sender":	false
+				}],
+			"sum":	{
+				"start":	4.000577,
+				"end":	5.000599,
+				"seconds":	1.0000220537185669,
+				"bytes":	131791200,
+				"bits_per_second":	1054306348.6245041,
+				"jitter_ms":	0.040135987321425669,
+				"lost_packets":	611460,
+				"packets":	721286,
+				"lost_percent":	84.773584957977832,
+				"omitted":	false,
+				"sender":	false
+			}
+		}, {
+			"streams":	[{
+					"socket":	4,
+					"start":	5.000599,
+					"end":	6.001013,
+					"seconds":	1.00041401386261,
+					"bytes":	136105200,
+					"bits_per_second":	1088390991.041769,
+					"jitter_ms":	0.0341047947593046,
+					"lost_packets":	606777,
+					"packets":	720198,
+					"lost_percent":	84.25141419442987,
+					"omitted":	false,
+					"sender":	false
+				}],
+			"sum":	{
+				"start":	5.000599,
+				"end":	6.001013,
+				"seconds":	1.00041401386261,
+				"bytes":	136105200,
+				"bits_per_second":	1088390991.041769,
+				"jitter_ms":	0.0341047947593046,
+				"lost_packets":	606777,
+				"packets":	720198,
+				"lost_percent":	84.25141419442987,
+				"omitted":	false,
+				"sender":	false
+			}
+		}, {
+			"streams":	[{
+					"socket":	4,
+					"start":	6.001013,
+					"end":	7.000725,
+					"seconds":	0.99971199035644531,
+					"bytes":	133269600,
+					"bits_per_second":	1066463951.9026514,
+					"jitter_ms":	0.036920709412818734,
+					"lost_packets":	610894,
+					"packets":	721952,
+					"lost_percent":	84.616982846505024,
+					"omitted":	false,
+					"sender":	false
+				}],
+			"sum":	{
+				"start":	6.001013,
+				"end":	7.000725,
+				"seconds":	0.99971199035644531,
+				"bytes":	133269600,
+				"bits_per_second":	1066463951.9026514,
+				"jitter_ms":	0.036920709412818734,
+				"lost_packets":	610894,
+				"packets":	721952,
+				"lost_percent":	84.616982846505024,
+				"omitted":	false,
+				"sender":	false
+			}
+		}],
+	"end":	{
+	},
+	"error":	"SERVER ERROR - server test duration expired: ",
+	"error":	"server test duration expired: "
+}

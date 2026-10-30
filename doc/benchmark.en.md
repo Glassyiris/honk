@@ -185,6 +185,109 @@ Accept a candidate only when the framed point estimate improves and its 95%
 interval excludes a slowdown greater than 3%; the Direct point estimate may
 regress by at most 3%.
 
+## Results (2026-10-30, merged `main` A/B/C on the canonical `.70` fixture)
+
+honk `v0.1.0-beta.3-13-gc8bfa7a3` (built from `main` `c8bfa7a3`; static musl build with the embedded eBPF object) against the frozen upstream dae and sing-box binaries and the 2026-10-24 fixture. Same harness, `lab` namespace and 4 vCPU / 2 GiB engine host; binaries, configs, raw iperf3 JSON and stability samples are in `results/abc-2026-10-30-x86/`.
+
+### Six-protocol pass: TCP throughput, process CPU and RSS
+
+| engine | protocol | cold(s) | hot p50(s) | hot p95(s) | bw(Mbps) | cpu(cores) | rss(MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.001769 | - | - | 9403 | 0.00 | 67 |
+| honk | hy2 | 0.002026 | 0.001160 | 0.001412 | 4550 | 0.47 | 75 |
+| honk | tuic | 0.002303 | 0.001132 | 0.001415 | 3847 | 0.37 | 61 |
+| honk | ss2022 | 0.001400 | 0.001109 | 0.001323 | 9391 | 0.34 | 75 |
+| honk | trojan | 0.003263 | 0.000682 | 0.003749 | 9372 | 0.31 | 71 |
+| honk | anytls-sb | 0.002976 | 0.001645 | 0.002219 | 9385 | 0.38 | 50 |
+| honk | anytls-go | 0.003496 | 0.001615 | 0.003165 | 9379 | 0.40 | 63 |
+| dae | direct | 0.002329 | - | - | 9396 | 0.00 | 46 |
+| dae | hy2 | 0.009691 | 0.001493 | 0.002401 | 2736 | 0.58 | 58 |
+| dae | tuic | 0.007977 | 0.001700 | 0.002242 | 3423 | 0.67 | 58 |
+| dae | ss2022 | 0.003821 | 0.001657 | 0.002031 | 9392 | 0.37 | 59 |
+| dae | trojan | 0.008111 | 0.005817 | 0.007399 | 9374 | 0.43 | 59 |
+| dae | anytls-sb | 0.007265 | 0.000909 | 0.001209 | 9379 | 0.49 | 63 |
+| dae | anytls-go | 0.007606 | 0.001614 | 0.002552 | 9372 | 0.49 | 61 |
+| sing-box | direct | 0.002882 | - | - | 9408 | 0.37 | 62 |
+| sing-box | hy2 | 0.008529 | 0.001719 | 0.002644 | 1975 | 0.53 | 67 |
+| sing-box | tuic | 0.008670 | 0.001931 | 0.003128 | 3228 | 0.71 | 68 |
+| sing-box | ss2022 | 0.003568 | 0.002061 | 0.003032 | 9402 | 0.49 | 65 |
+| sing-box | trojan | 0.007664 | 0.006081 | 0.008469 | 9391 | 0.67 | 69 |
+| sing-box | anytls-sb | 0.007950 | 0.001584 | 0.002485 | 9389 | 0.76 | 78 |
+| sing-box | anytls-go | 0.007878 | 0.001613 | 0.002299 | 9370 | 0.92 | 78 |
+
+### Six-protocol pass: UDP
+
+| engine | protocol | echo RTT p50(s) | iperf3 -u -R (Mbps, loss) | cpu(cores) |
+| --- | --- | --- | --- | --- |
+| honk | hy2/udp | 0.000187 | 1036(84.6%) | 0.64 |
+| honk | tuic/udp | 0.000158 | 1191(82.4%) | 0.65 |
+| honk | ss2022/udp | 0.000119 | 2046(65.4%) | 0.73 |
+| honk | trojan/udp | 0.000194 | 1705(75.6%) | 0.70 |
+| honk | anytls-sb/udp | 0.000271 | 1671(74.2%) | 0.57 |
+| honk | anytls-go/udp | 0.000410 | 1717(74.6%) | 0.59 |
+| dae | hy2/udp | 0.000305 | 1179(82.9%) | 0.80 |
+| dae | tuic/udp | 0.000397 | 1225(82.2%) | 0.82 |
+| dae | ss2022/udp | 0.000216 | 2588(56.5%) | 1.24 |
+| dae | trojan/udp | 0.000102 | 2908(56.6%) | 1.08 |
+| dae | anytls-sb/udp | 0.000363 | 1746(72.9%) | 0.71 |
+| dae | anytls-go/udp | 0.000410 | 1711(74.6%) | 0.70 |
+| sing-box | hy2/udp | 0.000256 | 0(-) | 1.16 |
+| sing-box | tuic/udp | 0.000126 | 1076(84.4%) | 1.43 |
+| sing-box | ss2022/udp | 0.000334 | 2710(54.4%) | 1.38 |
+| sing-box | trojan/udp | 0.000106 | 3794(41.6%) | 1.57 |
+| sing-box | anytls-sb/udp | 0.000106 | 1406(77.4%) | 1.16 |
+| sing-box | anytls-go/udp | 0.000108 | 1324(76.2%) | 1.10 |
+
+### Six-protocol pass: loaded latency stability
+
+| engine | protocol | load(Mbps) | p50(ms) | p95(ms) | p99(ms) | max(ms) | failures |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 9400 | 2.148 | 2.644 | 3.241 | 3.332 | 0/200 |
+| honk | hy2 | 4000 | 1.427 | 1.711 | 3.896 | 4.606 | 0/200 |
+| honk | tuic | 3970 | 1.394 | 1.713 | 2.117 | 4.746 | 0/200 |
+| honk | ss2022 | 9397 | 2.258 | 3.288 | 4.950 | 6.008 | 0/200 |
+| honk | trojan | 9388 | 1.833 | 2.598 | 2.826 | 4.610 | 0/200 |
+| honk | anytls-sb | 9383 | 2.566 | 9.452 | 16.361 | 19.752 | 0/200 |
+| honk | anytls-go | 9374 | 2.706 | 8.889 | 14.603 | 16.091 | 0/200 |
+| dae | direct | 9402 | 3.097 | 3.780 | 4.629 | 1052.617 | 0/200 |
+| dae | hy2 | 2806 | 1.797 | 2.242 | 3.243 | 4.493 | 2/200 |
+| dae | tuic | 3442 | 1.805 | 2.176 | 2.857 | 3.799 | 0/200 |
+| dae | ss2022 | 9394 | 3.518 | 9.227 | 15.493 | 17.798 | 0/200 |
+| dae | trojan | 9365 | 5.738 | 12.367 | 18.518 | 21.713 | 0/200 |
+| dae | anytls-sb | 9385 | 2.429 | 6.716 | 10.852 | 14.897 | 0/200 |
+| dae | anytls-go | 9375 | 2.355 | 9.671 | 15.994 | 18.630 | 0/200 |
+| sing-box | direct | 9410 | 3.313 | 4.051 | 4.227 | 4.472 | 0/200 |
+| sing-box | hy2 | 2109 | 9.623 | 25.448 | 30.053 | 32.343 | 0/200 |
+| sing-box | tuic | 3323 | 1.873 | 2.176 | 2.554 | 4.199 | 0/200 |
+| sing-box | ss2022 | 9403 | 3.554 | 8.730 | 12.683 | 15.429 | 0/200 |
+| sing-box | trojan | 9389 | 5.719 | 12.493 | 17.777 | 21.095 | 0/200 |
+| sing-box | anytls-sb | 9384 | 2.523 | 7.130 | 13.681 | 16.895 | 0/200 |
+| sing-box | anytls-go | 9362 | 2.460 | 8.043 | 12.958 | 18.578 | 0/200 |
+
+### DNS Criterion bench (`dns`, PR base `b724ee27` vs merged main)
+
+Both sides build `cargo bench -p honk-core --features dns-bench --bench dns` (head from the merged bench branch `f833538c`); three interleaved baselines (`base1`, `head`, `base2`), 100 samples, 3 s warm-up, 5 s measurement. Full 43-row table in `results/abc-2026-10-30-x86/dns-bench-aba.tsv`.
+
+| benchmark | base1 | head | base2 | delta | drift | verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `dns_observability/best_effort_snapshot` | 2.04 | 2.47 | 2.01 | +22.35% | 1.58% | REGRESSION |
+| `dns_udp_validation_profile` | 29.85 | 31.85 | 29.96 | +6.49% | 0.38% | REGRESSION |
+| `dns_forwarder_warmed/nxdomain_hit` | 770.53 | 790.10 | 773.57 | +2.34% | 0.39% | PASS |
+| `dns_forwarder/cache_hit` | 815.44 | 827.15 | 812.73 | +1.61% | 0.33% | PASS |
+| `dns_parallel_families/a_and_aaaa` | 1160442.80 | 1173502.14 | 1158492.20 | +1.21% | 0.17% | PASS |
+| `dns_cache/get_hit` | 160.26 | 160.68 | 160.17 | +0.29% | 0.05% | PASS |
+| `dns_forwarder_warmed/positive_hit` | 882.02 | 885.84 | 888.62 | +0.06% | 0.74% | PASS |
+| `dns_observability/record_event` | 4.93 | 4.94 | 4.93 | +0.05% | 0.03% | PASS |
+| `dns_cache_concurrency/read_write/1` | 48859.67 | 48683.25 | 48741.77 | -0.24% | 0.24% | PASS |
+| `dns_cache_concurrency/same_shard/1` | 48324.18 | 48235.90 | 48700.73 | -0.57% | 0.78% | PASS |
+| `dns_singleflight/128_waiters` | 199994.73 | 198177.32 | 200474.85 | -1.03% | 0.24% | PASS |
+| `dns_cache/put` | 251.17 | 244.91 | 245.78 | -1.44% | 2.17% | PASS |
+
+Two rows persist under a 300-sample / 15 s confirmation run (`dns-bench-confirmation.tsv`):
+
+- `dns_observability/best_effort_snapshot` +19.9% (2.08 → 2.50 ns). The benchmark reads the DNS snapshot, which this change extends by five admission/pressure counters; the delta is the added atomic loads (~0.08 ns each).
+- `dns_udp_validation_profile` +6.5% (29.9 → 31.8 ns). `validate_exact_dns_query` is byte-identical between the two trees and records no statistics, so this is crate-level codegen movement (inlining/CGU layout) of the bench binary, not a change in that function. A same-source rebuild of the base tree reproduces 29.9 ns exactly, so it is not build nondeterminism; treat it as a 2 ns microbenchmark shift to confirm with a targeted profile if it ever matters.
+
 ## Results (2026-10-24, full-protocol A/B/C on the canonical `.70` fixture)
 
 The merged `bench` tree (`20286c3d`, which brings in `origin/main` at

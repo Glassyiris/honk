@@ -1,0 +1,24 @@
+Gnuplot not found, using plotters backend
+Benchmarking dns_udp_validation_profile
+Benchmarking dns_udp_validation_profile: Warming up for 5.0000 s
+Benchmarking dns_udp_validation_profile: Collecting 300 samples in estimated 15.000 s (474M iterations)
+Benchmarking dns_udp_validation_profile: Analyzing
+dns_udp_validation_profile
+                        time:   [31.733 ns 31.774 ns 31.812 ns]
+Found 15 outliers among 300 measurements (5.00%)
+  10 (3.33%) low mild
+  5 (1.67%) high mild
+
+DNS_WARMED_POSITIVE_ALLOCATIONS=12004 DNS_WARMED_POSITIVE_BYTES=646060
+DNS_WARMED_NXDOMAIN_ALLOCATIONS=11000 DNS_WARMED_NXDOMAIN_BYTES=479000
+Benchmarking dns_observability/best_effort_snapshot
+Benchmarking dns_observability/best_effort_snapshot: Warming up for 5.0000 s
+Benchmarking dns_observability/best_effort_snapshot: Collecting 300 samples in estimated 15.000 s (6.1B iterations)
+Benchmarking dns_observability/best_effort_snapshot: Analyzing
+dns_observability/best_effort_snapshot
+                        time:   [2.4976 ns 2.5042 ns 2.5106 ns]
+Found 10 outliers among 300 measurements (3.33%)
+  9 (3.00%) low mild
+  1 (0.33%) high severe
+
+DNS_ALLOC_10K_BYTES=2338832

@@ -1,0 +1,8 @@
+# host=archlinux arch=x86_64 kernel=7.2.3-arch1-3
+# honk_bin=/root/eries-bench-abc-20261030/bin/honk-core sha256=2b8261b120a9f15c32ab52b5bb58e9eddb3481b1861649e3966e31a17c310693
+# dae_bin=/root/eries-bench-abc-20261030/bin/dae sha256=a217bf5edf5a5cac371e086af952b5c676e6ecaf8d7b07ba491916b656b66122
+# sing_box_bin=/root/eries-bench-abc-20261030/bin/sing-box sha256=768d31fa7f68debc067bb4626539498a1e8751d36a7b99e1a54bee6a23815f93
+# lab-bench 2026-10-30T12:52:25Z engines=(honk dae sing-box) protos=(hy2 tuic ss2022 trojan anytls-sb anytls-go)
+# engine=honk
+# engine=dae
+# engine=sing-box

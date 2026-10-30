@@ -1,0 +1,393 @@
+Gnuplot not found, using plotters backend
+Benchmarking dns_endpoint_parse/udp
+Benchmarking dns_endpoint_parse/udp: Warming up for 3.0000 s
+Benchmarking dns_endpoint_parse/udp: Collecting 100 samples in estimated 5.0003 s (75M iterations)
+Benchmarking dns_endpoint_parse/udp: Analyzing
+dns_endpoint_parse/udp  time:   [66.014 ns 66.384 ns 66.924 ns]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+Benchmarking dns_endpoint_parse/dot
+Benchmarking dns_endpoint_parse/dot: Warming up for 3.0000 s
+Benchmarking dns_endpoint_parse/dot: Collecting 100 samples in estimated 5.0001 s (72M iterations)
+Benchmarking dns_endpoint_parse/dot: Analyzing
+dns_endpoint_parse/dot  time:   [69.281 ns 69.440 ns 69.623 ns]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+Benchmarking dns_endpoint_parse/doh
+Benchmarking dns_endpoint_parse/doh: Warming up for 3.0000 s
+Benchmarking dns_endpoint_parse/doh: Collecting 100 samples in estimated 5.0004 s (56M iterations)
+Benchmarking dns_endpoint_parse/doh: Analyzing
+dns_endpoint_parse/doh  time:   [89.487 ns 89.673 ns 89.876 ns]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking dns_endpoint_parse/doq
+Benchmarking dns_endpoint_parse/doq: Warming up for 3.0000 s
+Benchmarking dns_endpoint_parse/doq: Collecting 100 samples in estimated 5.0003 s (70M iterations)
+Benchmarking dns_endpoint_parse/doq: Analyzing
+dns_endpoint_parse/doq  time:   [71.075 ns 71.223 ns 71.383 ns]
+Benchmarking dns_endpoint_parse/h3
+Benchmarking dns_endpoint_parse/h3: Warming up for 3.0000 s
+Benchmarking dns_endpoint_parse/h3: Collecting 100 samples in estimated 5.0002 s (55M iterations)
+Benchmarking dns_endpoint_parse/h3: Analyzing
+dns_endpoint_parse/h3   time:   [90.997 ns 91.165 ns 91.334 ns]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking dns_cache/get_hit
+Benchmarking dns_cache/get_hit: Warming up for 3.0000 s
+Benchmarking dns_cache/get_hit: Collecting 100 samples in estimated 5.0006 s (31M iterations)
+Benchmarking dns_cache/get_hit: Analyzing
+dns_cache/get_hit       time:   [160.27 ns 160.32 ns 160.38 ns]
+                        thrpt:  [6.2350 Melem/s 6.2374 Melem/s 6.2393 Melem/s]
+Found 8 outliers among 100 measurements (8.00%)
+  5 (5.00%) high mild
+  3 (3.00%) high severe
+Benchmarking dns_cache/put
+Benchmarking dns_cache/put: Warming up for 3.0000 s
+Benchmarking dns_cache/put: Collecting 100 samples in estimated 5.0007 s (21M iterations)
+Benchmarking dns_cache/put: Analyzing
+dns_cache/put           time:   [251.56 ns 252.48 ns 253.38 ns]
+                        thrpt:  [3.9467 Melem/s 3.9608 Melem/s 3.9751 Melem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) low mild
+
+Benchmarking dns_force_restore_id
+Benchmarking dns_force_restore_id: Warming up for 3.0000 s
+Benchmarking dns_force_restore_id: Collecting 100 samples in estimated 5.0000 s (5.0B iterations)
+Benchmarking dns_force_restore_id: Analyzing
+dns_force_restore_id    time:   [991.68 ps 992.71 ps 993.77 ps]
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking dns_build_query_a
+Benchmarking dns_build_query_a: Warming up for 3.0000 s
+Benchmarking dns_build_query_a: Collecting 100 samples in estimated 5.0000 s (106M iterations)
+Benchmarking dns_build_query_a: Analyzing
+dns_build_query_a       time:   [47.366 ns 47.523 ns 47.721 ns]
+Found 8 outliers among 100 measurements (8.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+  4 (4.00%) high severe
+
+Benchmarking dns_forwarder/cache_hit
+Benchmarking dns_forwarder/cache_hit: Warming up for 3.0000 s
+Benchmarking dns_forwarder/cache_hit: Collecting 100 samples in estimated 5.0032 s (6.2M iterations)
+Benchmarking dns_forwarder/cache_hit: Analyzing
+dns_forwarder/cache_hit time:   [813.96 ns 815.11 ns 816.48 ns]
+                        thrpt:  [1.2248 Melem/s 1.2268 Melem/s 1.2286 Melem/s]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+
+Benchmarking dns_tcp_pool/exchange_reused
+Benchmarking dns_tcp_pool/exchange_reused: Warming up for 3.0000 s
+Benchmarking dns_tcp_pool/exchange_reused: Collecting 100 samples in estimated 5.0326 s (359k iterations)
+Benchmarking dns_tcp_pool/exchange_reused: Analyzing
+dns_tcp_pool/exchange_reused
+                        time:   [13.199 µs 13.628 µs 14.048 µs]
+                        thrpt:  [71.182 Kelem/s 73.376 Kelem/s 75.762 Kelem/s]
+
+Benchmarking dns_udp_pool/exchange
+Benchmarking dns_udp_pool/exchange: Warming up for 100.00 ms
+Benchmarking dns_udp_pool/exchange: Collecting 100 samples in estimated 108.99 ms (10k iterations)
+Benchmarking dns_udp_pool/exchange: Analyzing
+dns_udp_pool/exchange   time:   [10.734 µs 10.758 µs 10.788 µs]
+                        thrpt:  [92.695 Kelem/s 92.952 Kelem/s 93.165 Kelem/s]
+Found 7 outliers among 100 measurements (7.00%)
+  3 (3.00%) high mild
+  4 (4.00%) high severe
+
+Benchmarking dns_length_prefix_duplex
+Benchmarking dns_length_prefix_duplex: Warming up for 3.0000 s
+Benchmarking dns_length_prefix_duplex: Collecting 100 samples in estimated 5.0102 s (692k iterations)
+Benchmarking dns_length_prefix_duplex: Analyzing
+dns_length_prefix_duplex
+                        time:   [7.6574 µs 7.8470 µs 8.0803 µs]
+Found 23 outliers among 100 measurements (23.00%)
+  1 (1.00%) high mild
+  22 (22.00%) high severe
+
+Benchmarking dns_typed_key/build
+Benchmarking dns_typed_key/build: Warming up for 3.0000 s
+Benchmarking dns_typed_key/build: Collecting 100 samples in estimated 5.0004 s (58M iterations)
+Benchmarking dns_typed_key/build: Analyzing
+dns_typed_key/build     time:   [85.685 ns 85.780 ns 85.926 ns]
+Found 17 outliers among 100 measurements (17.00%)
+  10 (10.00%) low mild
+  3 (3.00%) high mild
+  4 (4.00%) high severe
+
+Benchmarking dns_udp_validation_profile
+Benchmarking dns_udp_validation_profile: Warming up for 3.0000 s
+Benchmarking dns_udp_validation_profile: Collecting 100 samples in estimated 5.0001 s (167M iterations)
+Benchmarking dns_udp_validation_profile: Analyzing
+dns_udp_validation_profile
+                        time:   [29.827 ns 29.880 ns 29.935 ns]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+DNS_WARMED_POSITIVE_ALLOCATIONS=12001 DNS_WARMED_POSITIVE_BYTES=646015
+DNS_WARMED_NXDOMAIN_ALLOCATIONS=11000 DNS_WARMED_NXDOMAIN_BYTES=479000
+Benchmarking dns_forwarder_warmed/positive_hit
+Benchmarking dns_forwarder_warmed/positive_hit: Warming up for 3.0000 s
+Benchmarking dns_forwarder_warmed/positive_hit: Collecting 100 samples in estimated 5.0016 s (5.6M iterations)
+Benchmarking dns_forwarder_warmed/positive_hit: Analyzing
+dns_forwarder_warmed/positive_hit
+                        time:   [882.00 ns 882.87 ns 883.80 ns]
+                        thrpt:  [1.1315 Melem/s 1.1327 Melem/s 1.1338 Melem/s]
+Benchmarking dns_forwarder_warmed/nxdomain_hit
+Benchmarking dns_forwarder_warmed/nxdomain_hit: Warming up for 3.0000 s
+Benchmarking dns_forwarder_warmed/nxdomain_hit: Collecting 100 samples in estimated 5.0033 s (6.5M iterations)
+Benchmarking dns_forwarder_warmed/nxdomain_hit: Analyzing
+dns_forwarder_warmed/nxdomain_hit
+                        time:   [770.39 ns 772.67 ns 776.71 ns]
+                        thrpt:  [1.2875 Melem/s 1.2942 Melem/s 1.2980 Melem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+
+Benchmarking dns_projection/hot_replacement
+Benchmarking dns_projection/hot_replacement: Warming up for 3.0000 s
+Benchmarking dns_projection/hot_replacement: Collecting 100 samples in estimated 5.0002 s (56M iterations)
+Benchmarking dns_projection/hot_replacement: Analyzing
+dns_projection/hot_replacement
+                        time:   [88.433 ns 88.470 ns 88.514 ns]
+Found 10 outliers among 100 measurements (10.00%)
+  4 (4.00%) low mild
+  2 (2.00%) high mild
+  4 (4.00%) high severe
+
+Benchmarking dns_projection/shared_ip/5000
+Benchmarking dns_projection/shared_ip/5000: Warming up for 3.0000 s
+Benchmarking dns_projection/shared_ip/5000: Collecting 100 samples in estimated 5.0003 s (50M iterations)
+Benchmarking dns_projection/shared_ip/5000: Analyzing
+dns_projection/shared_ip/5000
+                        time:   [99.158 ns 99.257 ns 99.360 ns]
+Found 14 outliers among 100 measurements (14.00%)
+  10 (10.00%) low mild
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking dns_projection/shared_ip/12000
+Benchmarking dns_projection/shared_ip/12000: Warming up for 3.0000 s
+Benchmarking dns_projection/shared_ip/12000: Collecting 100 samples in estimated 5.0010 s (9.3M iterations)
+Benchmarking dns_projection/shared_ip/12000: Analyzing
+dns_projection/shared_ip/12000
+                        time:   [549.51 ns 552.68 ns 556.61 ns]
+Found 16 outliers among 100 measurements (16.00%)
+  15 (15.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking dns_policy_evaluation/1
+Benchmarking dns_policy_evaluation/1: Warming up for 3.0000 s
+Benchmarking dns_policy_evaluation/1: Collecting 100 samples in estimated 5.0000 s (96M iterations)
+Benchmarking dns_policy_evaluation/1: Analyzing
+dns_policy_evaluation/1 time:   [52.561 ns 52.615 ns 52.665 ns]
+Benchmarking dns_policy_evaluation/32
+Benchmarking dns_policy_evaluation/32: Warming up for 3.0000 s
+Benchmarking dns_policy_evaluation/32: Collecting 100 samples in estimated 5.0001 s (42M iterations)
+Benchmarking dns_policy_evaluation/32: Analyzing
+dns_policy_evaluation/32
+                        time:   [119.49 ns 119.80 ns 120.27 ns]
+Found 12 outliers among 100 measurements (12.00%)
+  2 (2.00%) low severe
+  5 (5.00%) high mild
+  5 (5.00%) high severe
+Benchmarking dns_policy_evaluation/128
+Benchmarking dns_policy_evaluation/128: Warming up for 3.0000 s
+Benchmarking dns_policy_evaluation/128: Collecting 100 samples in estimated 5.0011 s (13M iterations)
+Benchmarking dns_policy_evaluation/128: Analyzing
+dns_policy_evaluation/128
+                        time:   [396.78 ns 397.06 ns 397.41 ns]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking dns_cache_concurrency/same_key/1
+Benchmarking dns_cache_concurrency/same_key/1: Warming up for 3.0000 s
+Benchmarking dns_cache_concurrency/same_key/1: Collecting 100 samples in estimated 5.1242 s (106k iterations)
+Benchmarking dns_cache_concurrency/same_key/1: Analyzing
+dns_cache_concurrency/same_key/1
+                        time:   [48.186 µs 48.307 µs 48.461 µs]
+                        thrpt:  [5.2825 Melem/s 5.2994 Melem/s 5.3127 Melem/s]
+Found 9 outliers among 100 measurements (9.00%)
+  4 (4.00%) low mild
+  2 (2.00%) high mild
+  3 (3.00%) high severe
+Benchmarking dns_cache_concurrency/same_shard/1
+Benchmarking dns_cache_concurrency/same_shard/1: Warming up for 3.0000 s
+Benchmarking dns_cache_concurrency/same_shard/1: Collecting 100 samples in estimated 5.1200 s (106k iterations)
+Benchmarking dns_cache_concurrency/same_shard/1: Analyzing
+dns_cache_concurrency/same_shard/1
+                        time:   [48.384 µs 48.409 µs 48.431 µs]
+                        thrpt:  [5.2859 Melem/s 5.2883 Melem/s 5.2910 Melem/s]
+Benchmarking dns_cache_concurrency/different_shards/1
+Benchmarking dns_cache_concurrency/different_shards/1: Warming up for 3.0000 s
+Benchmarking dns_cache_concurrency/different_shards/1: Collecting 100 samples in estimated 5.1466 s (106k iterations)
+Benchmarking dns_cache_concurrency/different_shards/1: Analyzing
+dns_cache_concurrency/different_shards/1
+                        time:   [48.534 µs 48.570 µs 48.603 µs]
+                        thrpt:  [5.2672 Melem/s 5.2708 Melem/s 5.2746 Melem/s]
+Found 10 outliers among 100 measurements (10.00%)
+  7 (7.00%) high mild
+  3 (3.00%) high severe
+Benchmarking dns_cache_concurrency/read_write/1
+Benchmarking dns_cache_concurrency/read_write/1: Warming up for 3.0000 s
+Benchmarking dns_cache_concurrency/read_write/1: Collecting 100 samples in estimated 5.1625 s (106k iterations)
+Benchmarking dns_cache_concurrency/read_write/1: Analyzing
+dns_cache_concurrency/read_write/1
+                        time:   [48.886 µs 48.977 µs 49.152 µs]
+                        thrpt:  [5.2083 Melem/s 5.2270 Melem/s 5.2367 Melem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+Benchmarking dns_cache_concurrency/same_key/16
+Benchmarking dns_cache_concurrency/same_key/16: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.3s, enable flat sampling, or reduce sample count to 60.
+Benchmarking dns_cache_concurrency/same_key/16: Collecting 100 samples in estimated 5.2693 s (5050 iterations)
+Benchmarking dns_cache_concurrency/same_key/16: Analyzing
+dns_cache_concurrency/same_key/16
+                        time:   [1.0598 ms 1.0674 ms 1.0776 ms]
+                        thrpt:  [3.8011 Melem/s 3.8375 Melem/s 3.8650 Melem/s]
+Found 8 outliers among 100 measurements (8.00%)
+  1 (1.00%) high mild
+  7 (7.00%) high severe
+Benchmarking dns_cache_concurrency/same_shard/16
+Benchmarking dns_cache_concurrency/same_shard/16: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.1s, enable flat sampling, or reduce sample count to 60.
+Benchmarking dns_cache_concurrency/same_shard/16: Collecting 100 samples in estimated 5.1386 s (5050 iterations)
+Benchmarking dns_cache_concurrency/same_shard/16: Analyzing
+dns_cache_concurrency/same_shard/16
+                        time:   [1.0499 ms 1.0513 ms 1.0525 ms]
+                        thrpt:  [3.8917 Melem/s 3.8961 Melem/s 3.9015 Melem/s]
+Benchmarking dns_cache_concurrency/different_shards/16
+Benchmarking dns_cache_concurrency/different_shards/16: Warming up for 3.0000 s
+Benchmarking dns_cache_concurrency/different_shards/16: Collecting 100 samples in estimated 5.7076 s (15k iterations)
+Benchmarking dns_cache_concurrency/different_shards/16: Analyzing
+dns_cache_concurrency/different_shards/16
+                        time:   [371.51 µs 373.07 µs 375.18 µs]
+                        thrpt:  [10.917 Melem/s 10.979 Melem/s 11.025 Melem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) high mild
+  5 (5.00%) high severe
+Benchmarking dns_cache_concurrency/read_write/16
+Benchmarking dns_cache_concurrency/read_write/16: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.3s, enable flat sampling, or reduce sample count to 60.
+Benchmarking dns_cache_concurrency/read_write/16: Collecting 100 samples in estimated 5.2764 s (5050 iterations)
+Benchmarking dns_cache_concurrency/read_write/16: Analyzing
+dns_cache_concurrency/read_write/16
+                        time:   [1.0453 ms 1.0490 ms 1.0539 ms]
+                        thrpt:  [3.8864 Melem/s 3.9045 Melem/s 3.9185 Melem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) low mild
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+Benchmarking dns_cache_concurrency/same_key/64
+Benchmarking dns_cache_concurrency/same_key/64: Warming up for 3.0000 s
+Benchmarking dns_cache_concurrency/same_key/64: Collecting 100 samples in estimated 5.1000 s (1200 iterations)
+Benchmarking dns_cache_concurrency/same_key/64: Analyzing
+dns_cache_concurrency/same_key/64
+                        time:   [4.3391 ms 4.3513 ms 4.3632 ms]
+                        thrpt:  [3.7551 Melem/s 3.7653 Melem/s 3.7759 Melem/s]
+Benchmarking dns_cache_concurrency/same_shard/64
+Benchmarking dns_cache_concurrency/same_shard/64: Warming up for 3.0000 s
+Benchmarking dns_cache_concurrency/same_shard/64: Collecting 100 samples in estimated 5.1583 s (1300 iterations)
+Benchmarking dns_cache_concurrency/same_shard/64: Analyzing
+dns_cache_concurrency/same_shard/64
+                        time:   [4.0885 ms 4.1074 ms 4.1264 ms]
+                        thrpt:  [3.9706 Melem/s 3.9889 Melem/s 4.0073 Melem/s]
+Benchmarking dns_cache_concurrency/different_shards/64
+Benchmarking dns_cache_concurrency/different_shards/64: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 7.4s, enable flat sampling, or reduce sample count to 50.
+Benchmarking dns_cache_concurrency/different_shards/64: Collecting 100 samples in estimated 7.4271 s (5050 iterations)
+Benchmarking dns_cache_concurrency/different_shards/64: Analyzing
+dns_cache_concurrency/different_shards/64
+                        time:   [1.4805 ms 1.4836 ms 1.4863 ms]
+                        thrpt:  [11.023 Melem/s 11.043 Melem/s 11.066 Melem/s]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking dns_cache_concurrency/read_write/64
+Benchmarking dns_cache_concurrency/read_write/64: Warming up for 3.0000 s
+Benchmarking dns_cache_concurrency/read_write/64: Collecting 100 samples in estimated 5.2227 s (1300 iterations)
+Benchmarking dns_cache_concurrency/read_write/64: Analyzing
+dns_cache_concurrency/read_write/64
+                        time:   [4.1624 ms 4.1817 ms 4.2014 ms]
+                        thrpt:  [3.8996 Melem/s 3.9181 Melem/s 3.9362 Melem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking dns_singleflight/128_waiters
+Benchmarking dns_singleflight/128_waiters: Warming up for 3.0000 s
+Benchmarking dns_singleflight/128_waiters: Collecting 10 samples in estimated 5.0023 s (25k iterations)
+Benchmarking dns_singleflight/128_waiters: Analyzing
+dns_singleflight/128_waiters
+                        time:   [199.94 µs 201.70 µs 205.28 µs]
+                        thrpt:  [623.55 Kelem/s 634.61 Kelem/s 640.21 Kelem/s]
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+
+Benchmarking dns_parallel_families/slower_aaaa_branch
+Benchmarking dns_parallel_families/slower_aaaa_branch: Warming up for 3.0000 s
+Benchmarking dns_parallel_families/slower_aaaa_branch: Collecting 20 samples in estimated 5.2473 s (4410 iterations)
+Benchmarking dns_parallel_families/slower_aaaa_branch: Analyzing
+dns_parallel_families/slower_aaaa_branch
+                        time:   [1.1819 ms 1.1858 ms 1.1909 ms]
+Benchmarking dns_parallel_families/a_and_aaaa
+Benchmarking dns_parallel_families/a_and_aaaa: Warming up for 3.0000 s
+Benchmarking dns_parallel_families/a_and_aaaa: Collecting 20 samples in estimated 5.1210 s (4410 iterations)
+Benchmarking dns_parallel_families/a_and_aaaa: Analyzing
+dns_parallel_families/a_and_aaaa
+                        time:   [1.1529 ms 1.1621 ms 1.1695 ms]
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) low mild
+
+Benchmarking dns_runtime_access/lease_acquire
+Benchmarking dns_runtime_access/lease_acquire: Warming up for 3.0000 s
+Benchmarking dns_runtime_access/lease_acquire: Collecting 100 samples in estimated 5.0000 s (141M iterations)
+Benchmarking dns_runtime_access/lease_acquire: Analyzing
+dns_runtime_access/lease_acquire
+                        time:   [35.305 ns 35.321 ns 35.339 ns]
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high severe
+Benchmarking dns_runtime_access/publish_swap
+Benchmarking dns_runtime_access/publish_swap: Warming up for 3.0000 s
+Benchmarking dns_runtime_access/publish_swap: Collecting 10 samples in estimated 5.0000 s (1.4M iterations)
+Benchmarking dns_runtime_access/publish_swap: Analyzing
+dns_runtime_access/publish_swap
+                        time:   [3.6780 µs 3.6875 µs 3.6921 µs]
+
+Benchmarking dns_observability/record_event
+Benchmarking dns_observability/record_event: Warming up for 3.0000 s
+Benchmarking dns_observability/record_event: Collecting 100 samples in estimated 5.0000 s (1.0B iterations)
+Benchmarking dns_observability/record_event: Analyzing
+dns_observability/record_event
+                        time:   [4.9312 ns 4.9327 ns 4.9345 ns]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+Benchmarking dns_observability/best_effort_snapshot
+Benchmarking dns_observability/best_effort_snapshot: Warming up for 3.0000 s
+Benchmarking dns_observability/best_effort_snapshot: Collecting 100 samples in estimated 5.0000 s (2.4B iterations)
+Benchmarking dns_observability/best_effort_snapshot: Analyzing
+dns_observability/best_effort_snapshot
+                        time:   [2.0534 ns 2.0686 ns 2.0868 ns]
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) low mild
+  1 (1.00%) high mild
+
+DNS_ALLOC_10K_BYTES=2338832
+Benchmarking dns_allocation_harness/cache_10k_entries
+Benchmarking dns_allocation_harness/cache_10k_entries: Warming up for 3.0000 s
+Benchmarking dns_allocation_harness/cache_10k_entries: Collecting 10 samples in estimated 5.0168 s (1815 iterations)
+Benchmarking dns_allocation_harness/cache_10k_entries: Analyzing
+dns_allocation_harness/cache_10k_entries
+                        time:   [2.7419 ms 2.7553 ms 2.7748 ms]
+                        thrpt:  [3.6038 Melem/s 3.6294 Melem/s 3.6472 Melem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+
