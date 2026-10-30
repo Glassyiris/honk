@@ -1,0 +1,36 @@
+global {
+    wan_interface: ens3
+    lan_interface: veth-lab
+    log_level: warn
+    dial_mode: ip
+    allow_insecure: true
+    check_interval: 3600s
+    udp_check_dns: '10.10.10.70:53539'
+}
+
+node {
+    hy2: 'hysteria2://testpass123@10.10.10.70:8443/?insecure=1'
+}
+
+group {
+    proxy {
+        filter: name('hy2')
+        policy: fixed(0)
+    }
+}
+
+dns {
+    bind: '192.168.222.1:15353'
+    upstream {
+        bench: 'udp://10.10.10.70:53539'
+    }
+    routing {
+        request {
+            fallback: bench
+        }
+    }
+}
+
+routing {
+    fallback: direct
+}

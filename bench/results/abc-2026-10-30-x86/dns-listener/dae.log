@@ -1,0 +1,2 @@
+[2026-10-30 15:14:30]  WARN so_mark_from_dae is unset; using internal socket mark 0x100 to prevent dae UDP self-capture
+[2026-10-30 15:14:31]  WARN AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.

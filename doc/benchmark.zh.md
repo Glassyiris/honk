@@ -265,6 +265,36 @@ Both sides build `cargo bench -p honk-core --features dns-bench --bench dns` (he
 - `dns_observability/best_effort_snapshot` +19.9%（2.08 → 2.50 ns）。该基准读取 DNS snapshot，而本次改动为其增加了五个准入/压力计数器，差值即新增的 atomic 读取（约 0.08 ns/个）。
 - `dns_udp_validation_profile` +6.5%（29.9 → 31.8 ns）。`validate_exact_dns_query` 在两棵树中逐字节相同且不记录统计，因此这是 bench 二进制层面的 codegen 变化（内联/CGU 布局），不是该函数行为改变。base 树同源重建可稳定复现 29.9 ns，说明不是构建不确定性；如需追究，可按 2 ns 级微基准做定向 profile。
 
+### DNS listener 对比：honk / dae / sing-box
+
+从 `lab` namespace 观测的客户端可见 DNS 服务，使用闭环 UDP 压测工具（`dns-listener/dnsload.rs`，每线程每次往返一个查询）。honk 与 dae 通过 `dns.bind` 监听 `192.168.222.1:15353`；sing-box 1.14.3 没有 DNS inbound，因此用 TUN + `{"port": 53, "action": "hijack-dns"}` 规则应答，客户端目标为 `1.1.1.1:53`。三者都经同一个 `.70:53539` fixture 解析，每轮先校验应答为 fixture 的 `192.0.2.42`。`cache` 复用同一 qname；`unique` 每次使用新 qname（每次都要一次上游交换）。每格 15 秒；CPU 取自该时段 `/proc/<pid>/stat`，RSS 取该格结束值。
+
+| 引擎 | 模式 | 线程 | qps | p50 (µs) | p95 (µs) | p99 (µs) | max (µs) | CPU 核 | RSS (MB) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| honk | cache | 1 | 65,899 | 15 | 16 | 19 | 1296 | 0.92 | 45 |
+| honk | cache | 8 | 271,117 | 23 | 58 | 102 | 6557 | 1.70 | 45 |
+| honk | unique | 1 | 12,513 | 76 | 99 | 141 | 3957 | 0.38 | 60 |
+| honk | unique | 8 | 81,613 | 85 | 172 | 231 | 2172 | 1.97 | 61 |
+| dae | cache | 1 | 65,182 | 14 | 18 | 21 | 2942 | 0.78 | 60 |
+| dae | cache | 8 | 211,247 | 30 | 72 | 125 | 4189 | 1.39 | 62 |
+| dae | unique | 1 | 11,544 | 82 | 112 | 190 | 4407 | 0.44 | 241 |
+| dae | unique | 8 | 63,084 | 108 | 227 | 387 | 9293 | 2.29 | 273 |
+| sing-box | cache | 1 | 66,362 | 13 | 17 | 39 | 4705 | 1.02 | 83 |
+| sing-box | cache | 8 | 112,354 | 57 | 111 | 375 | 4806 | 1.32 | 86 |
+| sing-box | unique | 1 | 9,556 | 98 | 140 | 222 | 4679 | 0.46 | 95 |
+| sing-box | unique | 8 | 36,724 | 188 | 392 | 556 | 5369 | 1.08 | 97 |
+| direct（无引擎） | cache | 1 | 18,481 | 51 | 72 | 92 | 2003 | 0.00 | - |
+| direct（无引擎） | cache | 8 | 187,290 | 40 | 52 | 76 | 4791 | 0.00 | - |
+| direct（无引擎） | unique | 1 | 18,574 | 50 | 71 | 129 | 2514 | 0.00 | - |
+| direct（无引擎） | unique | 8 | 183,355 | 41 | 53 | 76 | 4154 | 0.00 | - |
+
+- 直接上游对照（客户端直连 fixture，不经引擎）在 8 线程下约 185–187 kqps 饱和，因此 cache 模式中达到或超过该值的格子受客户端/CPU 限制，而不是引擎上限。
+- 缓存命中：honk 271 kqps（p50 23 µs），dae 211 kqps（30 µs），sing-box 112 kqps（57 µs）。
+- 唯一域名（每查询一次上游）路径：honk 81.6 kqps（p50 85 µs），dae 63.1 kqps（108 µs），sing-box 36.7 kqps（188 µs）；均低于 183 kqps 的直连上限，说明引擎相对裸 fixture 有可测的每查询成本。
+- dae 在唯一域名负载下 RSS 升至 247–280 MB（其名称缓存随不同域名增长）；honk 维持 62–63 MB，sing-box 98–100 MB。
+- sing-box 的数字包含 TUN 与用户态协议栈开销，因此不是纯 DNS 服务端对比；honk/dae 的 listener 是 veth 地址上的普通主机 socket。
+- 本节是客户端可见的 listener 数据，与上文的进程内 `dns` Criterion 表（只测 honk 内部）不同。
+
 ## 结果（2026-10-24，canonical `.70` fixture 全协议 A/B/C）
 
 合并后的 `bench` 树（`20286c3d`，回合了 `origin/main` 的 `3d4825f6`：BBRv3

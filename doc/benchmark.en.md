@@ -288,6 +288,36 @@ Two rows persist under a 300-sample / 15 s confirmation run (`dns-bench-confirma
 - `dns_observability/best_effort_snapshot` +19.9% (2.08 → 2.50 ns). The benchmark reads the DNS snapshot, which this change extends by five admission/pressure counters; the delta is the added atomic loads (~0.08 ns each).
 - `dns_udp_validation_profile` +6.5% (29.9 → 31.8 ns). `validate_exact_dns_query` is byte-identical between the two trees and records no statistics, so this is crate-level codegen movement (inlining/CGU layout) of the bench binary, not a change in that function. A same-source rebuild of the base tree reproduces 29.9 ns exactly, so it is not build nondeterminism; treat it as a 2 ns microbenchmark shift to confirm with a targeted profile if it ever matters.
 
+### DNS listener pass: honk vs dae vs sing-box
+
+Client-visible DNS service from the `lab` namespace, using a closed-loop UDP load tool (`dns-listener/dnsload.rs`, one query per round trip per thread). honk and dae expose `dns.bind` on `192.168.222.1:15353`; sing-box 1.14.3 has no DNS inbound, so it answers through its TUN with a `{"port": 53, "action": "hijack-dns"}` rule and the client targets `1.1.1.1:53`. All three resolve through the same `.70:53539` fixture, and every run first asserts the answer is the fixture's `192.0.2.42`. `cache` reuses one qname; `unique` uses a fresh qname per query (one upstream exchange each). 15 s per cell; CPU from `/proc/<pid>/stat` across the cell, RSS at its end.
+
+| engine | mode | threads | qps | p50 (µs) | p95 (µs) | p99 (µs) | max (µs) | cpu cores | rss (MB) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| honk | cache | 1 | 65,899 | 15 | 16 | 19 | 1296 | 0.92 | 45 |
+| honk | cache | 8 | 271,117 | 23 | 58 | 102 | 6557 | 1.70 | 45 |
+| honk | unique | 1 | 12,513 | 76 | 99 | 141 | 3957 | 0.38 | 60 |
+| honk | unique | 8 | 81,613 | 85 | 172 | 231 | 2172 | 1.97 | 61 |
+| dae | cache | 1 | 65,182 | 14 | 18 | 21 | 2942 | 0.78 | 60 |
+| dae | cache | 8 | 211,247 | 30 | 72 | 125 | 4189 | 1.39 | 62 |
+| dae | unique | 1 | 11,544 | 82 | 112 | 190 | 4407 | 0.44 | 241 |
+| dae | unique | 8 | 63,084 | 108 | 227 | 387 | 9293 | 2.29 | 273 |
+| sing-box | cache | 1 | 66,362 | 13 | 17 | 39 | 4705 | 1.02 | 83 |
+| sing-box | cache | 8 | 112,354 | 57 | 111 | 375 | 4806 | 1.32 | 86 |
+| sing-box | unique | 1 | 9,556 | 98 | 140 | 222 | 4679 | 0.46 | 95 |
+| sing-box | unique | 8 | 36,724 | 188 | 392 | 556 | 5369 | 1.08 | 97 |
+| direct (no engine) | cache | 1 | 18,481 | 51 | 72 | 92 | 2003 | 0.00 | - |
+| direct (no engine) | cache | 8 | 187,290 | 40 | 52 | 76 | 4791 | 0.00 | - |
+| direct (no engine) | unique | 1 | 18,574 | 50 | 71 | 129 | 2514 | 0.00 | - |
+| direct (no engine) | unique | 8 | 183,355 | 41 | 53 | 76 | 4154 | 0.00 | - |
+
+- The direct control (client to fixture, no engine) saturates near 185–187 kqps at 8 threads, so cache-mode cells at or above that are client/CPU-bound rather than engine ceilings.
+- Cache-hit answers: honk 271 kqps at p50 23 µs, dae 211 kqps at 30 µs, sing-box 112 kqps at 57 µs.
+- Unique-name (per-query upstream) path: honk 81.6 kqps at p50 85 µs, dae 63.1 kqps at 108 µs, sing-box 36.7 kqps at 188 µs; all remain below the 183 kqps direct ceiling, i.e. the engines add measurable per-query cost over the raw fixture.
+- dae's RSS rises to 247–280 MB under unique-name load (its name cache grows with distinct names); honk stays at 62–63 MB and sing-box at 98–100 MB.
+- sing-box figures include TUN and userspace-stack overhead and are therefore not a pure DNS-server comparison; the honk/dae listeners are plain host sockets on the veth address.
+- These are client-visible listener numbers, distinct from the in-process `dns` Criterion table above (which measures honk internals only).
+
 ## Results (2026-10-24, full-protocol A/B/C on the canonical `.70` fixture)
 
 The merged `bench` tree (`20286c3d`, which brings in `origin/main` at
