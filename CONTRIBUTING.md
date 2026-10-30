@@ -108,4 +108,12 @@ A human author who is already a domain expert in the affected area may use an LL
 
 The exception concerns only who originates the code. All conditions in §3, disclosure under §5, human maintainer approval under §4, and adversarial deep review under §6 still apply. The author retains responsibility for the design and its invariants; passing tests, LLM review, or relying on a maintainer to supply the missing understanding does not satisfy the exception.
 
+## Changelog
+
+A PR that changes `crates/`, `Cargo.toml`, `Cargo.lock`, `ci/fetch-doona.sh` or `.github/ci/pins.env` adds a fragment at `changes/<branch-slug>.md`. [changes/README.md](changes/README.md) gives the format, the exemptions and how fragments become `CHANGELOG.md`. CI fails without a fragment unless a maintainer applies the `no-changelog` label.
+
+## Release
+
+Follow the [release process](.agents/rules/release.md#release-process-standing-convention) to prepare a release.
+
 _No programmer tapes._

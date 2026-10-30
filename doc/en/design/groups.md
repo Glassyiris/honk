@@ -14,7 +14,7 @@ The scope is `GroupManager`, `AliveDialerSet`, the always-compiled Score scorer,
 
 A reload builds a complete replacement `GroupManager`, migrates surviving per-network Selector member identities via `migrate_selector_choices_from`, installs interrupt, warm-up and persistence callbacks before publication, and swaps the inner `Arc`. A removed node is not retargeted to a same-named replacement. Native/Clash selection writes serialize with this publication, so they cannot acknowledge a write to an already-replaced manager. Readers see either complete manager.
 
-Shared reload normalization in `control/reload/fingerprint.rs` preserves each configured group's UUID and `created_at` when its name is unchanged, regardless of insertion, deletion or reordering. A rename creates a new group rather than transferring the old identity; a programmatic rename carrying the old UUID receives a fresh one. This applies to SIGHUP, explicit activation and provider/runtime reloads, including no-op comparison, with or without native observation.
+Shared reload normalization in `control/reload/fingerprint.rs` preserves each configured group's UUID and `created_at` when its name is unchanged. Insertion, deletion and reordering do not affect this identity. A rename creates a new group rather than transferring the old identity; a programmatic rename carrying the old UUID receives a fresh one. This applies to SIGHUP, explicit activation and provider/runtime reloads, including no-op comparison, with or without native observation.
 
 The `src/group/` facade and its internals are split by responsibility:
 

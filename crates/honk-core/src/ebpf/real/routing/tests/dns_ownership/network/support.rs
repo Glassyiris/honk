@@ -1,4 +1,6 @@
 use super::*;
+use crate::ebpf::real::tests::fresh_netns;
+pub(super) use crate::ebpf::real::tests::in_netns;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use udp_group::{UdpGroup, lookup_cookie};
@@ -256,28 +258,6 @@ impl NetworkFixture {
         assert_udp_empty(&self.listeners.udp6);
         assert_tcp_empty(&self.listeners.tcp4);
         assert_tcp_empty(&self.listeners.tcp6);
-    }
-}
-
-fn fresh_netns() -> OwnedFd {
-    std::thread::spawn(|| {
-        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-        std::fs::File::open("/proc/thread-self/ns/net")
-            .map(OwnedFd::from)
-            .unwrap()
-    })
-    .join()
-    .unwrap()
-}
-
-pub(super) fn in_netns<T>(netns: &OwnedFd, f: impl FnOnce() -> T) -> T {
-    let current = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
-    nix::sched::setns(netns, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    nix::sched::setns(&current, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-    match result {
-        Ok(value) => value,
-        Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 

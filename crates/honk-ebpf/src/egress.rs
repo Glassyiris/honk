@@ -37,7 +37,7 @@ use crate::{
     socket_identity,
     transport::{
         ETH_HLEN, ETH_P_IP, IPPROTO_TCP, IPPROTO_UDP, PARSE_FRAGMENT, PASS_NDP_REDIRECT,
-        parse_packet,
+        is_vlan_tagged, parse_packet,
     },
 };
 
@@ -794,6 +794,10 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         && UdpDnsRoute::from_nfqueue_mark(unsafe { (*ctx.skb.skb).mark }).is_some()
     {
         return Err(TC_ACT_SHOT);
+    }
+    // After the carrier drop so a VLAN-tagged queue carrier is still shot.
+    if is_vlan_tagged(ctx, link_h_len) {
+        return Err(TC_ACT_UNSPEC);
     }
     if !crate::maps::datapath_ready() {
         return Err(TC_ACT_UNSPEC);

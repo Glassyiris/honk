@@ -199,8 +199,7 @@ async fn admitted_source_transport_timeout_still_demotes_health() {
             endpoint: Arc::clone(&endpoint),
             queue_rx,
             reply_socket: Arc::clone(endpoint.source_reply_socket()),
-            reply_socket_factory: Arc::new(SystemUdpReplySocketFactory),
-            reply_socket_slots: Arc::new(Semaphore::new(MAX_REPLY_SOCKETS_PER_ENDPOINT)),
+            foreign_replies: ForeignReplySockets::for_one_endpoint(),
             client_addr,
             client_dst: target,
             alive_set: Arc::clone(&alive),
@@ -863,7 +862,7 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
     for endpoint in &endpoints[..2] {
         endpoint.send_packet(b"bound", true).await.unwrap();
     }
-    endpoints[2].kill();
+    endpoints[2].kill(true);
     let mut replies = HashMap::new();
     let first = next_data_frame(&mut events, &mut replies).await;
     let second = next_data_frame(&mut events, &mut replies).await;

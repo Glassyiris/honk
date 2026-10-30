@@ -11,7 +11,7 @@ for path in "$dist"/*.tar.gz; do
   file=${path##*/}
   case $file in
     honk-core-*) ;;
-    doona-source-*) others+=("| \`$file\` | Corresponding source of the embedded doona UI (GPL-3.0 section 6) |"); continue ;;
+    doona-source-*) others+=("| \`$file\` | Corresponding source of both embedded doona UI editions (GPL-3.0 section 6) |"); continue ;;
     *) printf '::error::Unknown release archive: %s\n' "$file" >&2; exit 1 ;;
   esac
 
@@ -43,7 +43,7 @@ cat <<'EOF'
 Each build is named `{allocator}-{API}-{arch}-{libc}`:
 
 - `mimalloc` favours throughput; `stockalloc` uses the system allocator and keeps the memory peak lower on small devices.
-- `fullapi` has the Clash API, the native API and the embedded doona UI; `clashapi` has the Clash API only; `nativeapi` has the native API only, without the UI.
+- `fullapi` has the Clash API, the native API and both embedded doona UI editions; `ui: embedded-lite` selects the lighter doona lite edition (preview). `clashapi` has the Clash API only; `nativeapi` has the native API only, without the UI.
 - `musl` builds are static and suit gateways.
 
 Check a download with `sha256sum -c --ignore-missing SHA256SUMS`, and its origin with `gh attestation verify <file> -R daeuniverse/honk`.

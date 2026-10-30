@@ -6,6 +6,32 @@ mod grpc_headers;
 mod grpc_io;
 mod grpc_peer;
 
+#[test]
+fn uri_path_encoding_preserves_uri_syntax() {
+    for (path, expected) in [
+        ("/a b", "/a%20b"),
+        ("/a%20b", "/a%20b"),
+        ("/proxy?ed=2048&tag=a b", "/proxy?ed=2048&tag=a%20b"),
+        ("/雪/é", "/%E9%9B%AA/%C3%A9"),
+        ("/plain/path", "/plain/path"),
+        ("/!#$%&'()*+,-./:;=?@[]_~", "/!#$%&'()*+,-./:;=?@[]_~"),
+    ] {
+        assert_eq!(encode_uri_path(path).to_string(), expected, "{path:?}");
+    }
+}
+
+#[test]
+fn uri_path_encoding_escapes_controls_and_unsafe_punctuation() {
+    for byte in (0..=31).chain([127]) {
+        let path = format!("/{}", char::from(byte));
+        assert_eq!(encode_uri_path(&path).to_string(), format!("/%{byte:02X}"));
+    }
+    assert_eq!(
+        encode_uri_path("/ \"<>`{}|\\^").to_string(),
+        "/%20%22%3C%3E%60%7B%7D%7C%5C%5E",
+    );
+}
+
 fn transport_node(port: u16) -> Node {
     Node {
         name: "transport-node".into(),
@@ -17,13 +43,29 @@ fn transport_node(port: u16) -> Node {
     }
 }
 
-/// WebSocket transport: the mock server verifies the upgrade request
-/// (path + Host header) and echoes one binary message.
+#[tokio::test]
+async fn test_ws_transport_roundtrip() {
+    ws_transport_roundtrip("/ws-path", "/ws-path").await;
+}
+
+#[tokio::test]
+async fn ws_transport_encodes_path_and_preserves_query() {
+    for (path, expected) in [
+        (
+            "/proxyip=proxyip.cmliussss.net, cdn-all.xn--b6gac.eu.org",
+            "/proxyip=proxyip.cmliussss.net,%20cdn-all.xn--b6gac.eu.org",
+        ),
+        ("/existing%20path?ed=2048", "/existing%20path?ed=2048"),
+        ("/雪?q=a b", "/%E9%9B%AA?q=a%20b"),
+    ] {
+        ws_transport_roundtrip(path, expected).await;
+    }
+}
+
 // The accept callback's Result type (and its large Err variant) is
 // dictated by tungstenite's `Callback` trait.
 #[allow(clippy::result_large_err)]
-#[tokio::test]
-async fn test_ws_transport_roundtrip() {
+async fn ws_transport_roundtrip(path: &str, expected: &str) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
@@ -41,7 +83,7 @@ async fn test_ws_transport_roundtrip() {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if let Some(tx) = seen_tx.take() {
-                    let _ = tx.send((req.uri().path().to_string(), host));
+                    let _ = tx.send((req.uri().path_and_query().unwrap().to_string(), host));
                 }
                 Ok(resp)
             };
@@ -60,7 +102,7 @@ async fn test_ws_transport_roundtrip() {
     let mut node = transport_node(port);
     let transport = node.transport_mut().unwrap();
     transport.transport = "ws".into();
-    transport.ws_path = Some("/ws-path".into());
+    transport.ws_path = Some(path.into());
     transport.ws_host = Some("cdn.example.com".into());
 
     let mut stream = wrap_transport(&node, None, std::time::Duration::from_secs(3))
@@ -80,7 +122,7 @@ async fn test_ws_transport_roundtrip() {
     assert_eq!(&buf, b"pong");
 
     let (path, host) = seen_rx.await.unwrap();
-    assert_eq!(path, "/ws-path");
+    assert_eq!(path, expected);
     assert_eq!(host.as_deref(), Some("cdn.example.com"));
 
     server.await.unwrap();

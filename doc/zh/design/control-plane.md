@@ -4,9 +4,9 @@
 
 ## 范围
 
-控制平面负责透明代理入口、消费内核交接、用户态路由、嗅探、出站选择、中继、资源准入与运行时发布。向用户态交付流量的内核机制见[数据路径设计](./datapath.md)。组策略和健康状态驱动的选择见[组设计](./groups.md)，DNS 运行时行为见 [DNS 设计](./dns.md)。
+控制平面负责透明代理入口、内核交接、用户态路由、嗅探、出站选择、中继、资源准入与运行时发布。内核如何向用户态交付流量见[数据路径设计](./datapath.md)。组策略和健康状态如何驱动选择见[组设计](./groups.md)，DNS 运行时行为见 [DNS 设计](./dns.md)。
 
-主要实现在 `crates/honk-core/src/control/`。它消费 `EbpfBackend` 状态，并把 TCP 流或 `PacketTransport` UDP 契约交给 `honk-outbound`。
+主要实现在 `crates/honk-core/src/control/`。控制平面读取 `EbpfBackend` 状态，并把 TCP 流或 `PacketTransport` UDP 契约交给 `honk-outbound`。
 
 模块分工：
 
@@ -38,7 +38,7 @@
 3. 在网络刷新前恢复持久化订阅。只有没有有效已恢复正文的订阅才参与五秒首次拉取宽限期。
 4. 真实实例完成锁交接后，再探测固定 NFQUEUE 队列前置条件。mock/不带 `ebpf` 的模式或前置检查失败时记录 warning，仅在本进程关闭 NFQUEUE；前置检查不会拒绝保留的 nftables table，因为安装阶段会回收残留的自有状态。
 5. 在真实模式下，`src/daens.rs` 通过 rtnetlink 创建由 FD 持有的 `daens` 命名空间和 `dae0`/`dae0peer` 链路。引擎优先尝试 L2 netkit pair，仅在内核报告不支持 netkit 时回退到 veth。进程留在宿主命名空间；只有同步的 socket、链路和挂载操作通过 `daens::with_daens_netns` 进入 `daens`。
-6. 加载 BPF 对象并挂载真实数据路径。默认对象通过 `include_bytes!` 嵌入；`--bpf-object` 提供运行时覆盖。启用 `ebpf` feature 时，`build.rs` 定位对象，拒绝过期或无 BTF 的产物，在移除继承的 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS` 后用 nightly 重建，校验 `.BTF`，再复制到 `OUT_DIR` 供嵌入。
+6. 加载 BPF 对象并绑定真实数据路径挂钩。默认对象通过 `include_bytes!` 嵌入；`--bpf-object` 提供运行时覆盖。启用 `ebpf` feature 时，`build.rs` 定位对象，拒绝过期或无 BTF 的产物，在移除继承的 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS` 后用 nightly 重建，校验 `.BTF`，再复制到 `OUT_DIR` 供嵌入。`dae0` 就绪后，启动流程遵循[接口协调](./datapath.md#接口协调)，绑定顺序与失败条件由该节统一定义。`local_ip` 遵循[本地路由不变量](./overview.md#运行时不变量)。
 7. 复用或创建固定的 `UDP_DECISION_SEQUENCE` 分配器，并校验其 map ABI、BTF、加锁值、token 范围与耗尽状态。NFQUEUE 启动时再次检查加锁的分配器状态；若没有回滚安全的 generation，则保持暂存关闭。
 8. 构建用户态 Router、出站运行时 registry、DNS 运行时、GroupManager、cache DB、可选 Clash API 和控制平面 supervisor。
 9. 绑定透明 TCP/UDP listener，发布完整 listener FD 集，启动独立 DNS 和 UDP 接收循环；仅当生效开关仍开启时，才启动 NFQUEUE 服务及其 ingest actor、correlator、watchdog 和独立的队列压力采样器（每秒采样一次）。
@@ -49,7 +49,7 @@
 
 真实 backend 在 pin map 后启动失败时，启动 guard 只删除本次成功创建的临时 pin。未能替换的已有 pin 与无关的已有 pin 不归本次所有。`UDP_DECISION_SEQUENCE` 和 `ROUTING_GENERATION_SEQUENCE` 在启动失败和普通清理后都会保留；启动成功时，临时 pin 的所有权转交 backend 清理。
 
-关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
+关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher（等待进行中的批次完成）、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
 UDP receive-priority 辅助元数据不可用时，真实 backend 持有 receive-trace fallback 的 link 与 map。每个地址族都必须具备完整的 enter/exit 对：失败时卸载该对，不会禁用另一个地址族。两个地址族都依赖 `__skb_recv_udp` 上共享的 hook；它失败时两者都不可用。注册会检查 socket 地址族，因此缺少对应 hook 对的 listener 会报告不可用，而不是无证据地静默注册。每个 backend 只尝试一次 fallback，失败或部分成功也不例外。Listener 重载会重新检查原生辅助元数据支持和注册结果，但不会重试挂载；修改内核/BTF 支持后需重启。追踪缺失只影响已记录的内核路由证据，不改变路由或 UDP 交付。`cleanup()` 先卸载 ingress hook，join ring consumer，再于 BPF 对象释放前 drop `receive_trace`；即使 backend 自身仍存活，也会释放这些资源，不等到其 Drop。普通清理仍保留两个持久化 sequence pin。
 
@@ -149,7 +149,7 @@ source gate 准入后开始，并由 driver 保留到最终 I/O 结果分类完�
 
 SOCKS5 UDP 在 source association 整个生命周期内保持 TCP `UDP ASSOCIATE` 控制流，并把控制流 EOF 或意外控制数据视为 association 失败。其 connected UDP socket 向服务器物理 `BND.ADDR` relay 发送；若回复为域名则解析，若地址未指定则替换为控制连接对端 IP。每个请求头写入自己的目的地，每个应答返回其头部中的真实来源，域名来源仅投影为捕获的名称和端口。`PacketTransport::relay_addr()` 是第一个目的地，因此 SOCKS relay 本身不会被误认为远端 peer。
 
-回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通过 transport peer 校验后，按域名拨号的 endpoint 始终使用原始 IP、端口和地址族回复，即使远端 DNS 选择了其他地址。按 IP 拨号的 endpoint 保留其 original-destination socket。普通 flow 按 endpoint 缓存已接受的其他 full-cone 来源；共享 source 则由 receiver 为全部绑定 view 共用一个最多七个其他来源 socket 的缓存。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。来自其他来源的回复没有精确的 `REDIRECT_TRACK` 记录；`dae0_ingress` 改用仅含客户端的 `CLIENT_REPLY_TRACK` 帧信息把它送回客户端，而不经过主机转发，因此限制性的转发策略不会丢弃它。收到这类回复不会授权客户端随后向该来源发送的包：`lan_egress` 不会从来自 `dae0` 的包学习反向方向，该包仍走正常路由。
+回复使用在 `daens` 内创建、透明绑定到 packet 原始目的地址的 anyfrom socket。通过 transport peer 校验后，按域名拨号的 endpoint 始终使用原始 IP、端口和地址族回复，即使远端 DNS 选择了其他地址。按 IP 拨号的 endpoint 保留其 original-destination socket。普通 flow 与共享 source 的 receiver 共用一个进程级 full-cone 回复 socket 缓存，按 peer 地址索引，上限为每个 endpoint 容量七个，空闲超过一个 NAT 超时即被清理。超出上限的新 peer 会关闭最久未用的 socket；主回复 socket 在描述符预算耗尽时也这样处理，因此外来回复让位于新流。端口 53 回复另外共享每地址族一个透明 socket，并用 `IP_PKTINFO` 或 `IPV6_PKTINFO` 选择精确源 IP。从 TPROXY listener 回复会使用内部 `dae0` 源地址，因此不可用。来自其他来源的回复没有精确的 `REDIRECT_TRACK` 记录；`dae0_ingress` 改用仅含客户端的 `CLIENT_REPLY_TRACK` 帧信息把它送回客户端，而不经过主机转发，因此限制性的转发策略不会丢弃它。收到这类回复不会授权客户端随后向该来源发送的包：`lan_egress` 不会从来自 `dae0` 的包学习反向方向，该包仍走正常路由。
 
 Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获该 epoch 和 incarnation generation；若 cancellation 先于 `commit_ready` 线性化，则阻止发布。Reload 取消并排空 `Initializing` lease 及其保留资源，`Ready` endpoint 仍遵循既有生命周期。已有原始 UDP `Ready` 会话在语义分组名相同且符合该生命周期时可以保留，但 `Initializing` 不能跨 reload 存活。编译策略发布后，过期的排队路由元数据仍会被准入检查拒绝。每次 retirement（包括其 `Retiring` tombstone）和 acknowledgement 都指定 token 与 generation，因此延迟工作不能删除替代 mapping。
 编译后的流量计划成功变更，且旧策略或新策略包含直连 mark 时，才会退役直连 `Ready` endpoint，避免后续流量复用旧 socket mark；无变化、不相关重载，以及新旧策略均无直连 mark 的路由变更，都会保留这些端点。显式标记为用户态所有的 WAN UDP 决策（包括带 mark 的 `direct(must)`）会在 tuple/reader fence 下同时清理 token 为零的 conn state、handoff 与 redirect track；原生 LAN direct/offloaded 决策及更新的非零 token 保持不变。
@@ -161,8 +161,9 @@ Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获�
 每个 UDP 流最多保留 64 个 datagram，包括首包。所有流共享精确的 8 MiB payload permit 预算。准入在复制前取得每流 slot 和全局 byte permit；FIFO 饱和时丢弃最新 datagram。NFQUEUE 有独立 ingest actor，限制为 256 个条目和 8 MiB 排队 payload。
 
 启动时，`honk-core` 尝试提升软 `RLIMIT_NOFILE`，只快照一次活动值，并把预算
-输入上限设为 1,048,576。在剩余描述符决定 UDP endpoint 数量之前，先按
-`min(after_dials / 8, 8192)` 分出 VLESS carrier 容量。在上限处固定分区为：
+输入上限设为 1,048,576。DNS socket 先独立分出 `min(transient_dials, 256)`，
+同时受剩余描述符约束。随后按 `min(after_dns / 8, 8192)` 分配 VLESS carrier，
+再以剩余预算决定 UDP endpoint 数量。在上限处固定分区为：
 
 | 所有者 | 容量 | 描述符记账 |
 | --- | ---: | ---: |
@@ -170,14 +171,20 @@ Reload 在等待前推进 cancellation epoch。Initializer 在 await 前捕获�
 | 已接受 TCP 流 | 16,384 | 每个 6 = 98,304 |
 | 保留 TCP pool | 2048 | 每个 1 = 2048 |
 | 临时出站 dial | 1024 | 每个 1 = 1024 |
+| DNS 自有 socket | 256 | 每 socket 一个额度；endpoint 网络 bootstrap 预留两个（原始代理节点的 resolver socket 不计入，见 [DNS 准入](./dns.md#解析管线)） |
 | VLESS 物理 carrier | 8192 | 每个 1 = 8192 |
-| UDP endpoint | 8192 | 每个 10 = 81,920 |
-| **合计** |  | **191,744** |
+| UDP endpoint | 32,768 | 每个 10 = 327,680 |
+| **合计** |  | **437,760** |
 
-一个 UDP endpoint 为 relay socket、可能存在的 SOCKS5 控制流和全部八个
-anyfrom reply socket 记账。一个 TCP 流为 accepted/outbound socket 和两组
-各含两个 FD 的 splice pipe 记账。更小限制使用相同的饱和分区；VLESS carrier
-结果为零时保持零。
+一个 UDP endpoint 为 relay socket、可能存在的 SOCKS5 控制流，以及它自己的
+anyfrom reply socket 加进程级外来池的一份记账；每个 endpoint 容量共八个回复
+socket。一个 TCP 流为 accepted/outbound socket 和两组各含两个 FD 的 splice pipe
+记账。更小限制使用相同的饱和分区；VLESS carrier 结果为零时保持零。
+
+启动时还把 UDP endpoint 限制在 `MemTotal` 的四分之一以内，每个 endpoint 按
+64 KiB 计：2 GiB 为 8,192，8 GiB 起达到 32,768 硬上限。实测一个 Shadowsocks
+共享 source 约 35 KiB，每多一个目的地约 11 KiB，因此该预算为每流状态更多的
+transport 留有余量。不读取 cgroup 内存限制。
 
 进程 VLESS-carrier semaphore 由 traffic generation 与 DNS runtime fork 共享。
 carrier 在 actual I/O 的 provisional、active、draining 与 idle 状态中始终持有
@@ -195,10 +202,15 @@ memory 或 scheduler capacity。TCP 从描述符导出的 floor 开始，封顶 
 | 准入 | 上限 |
 | --- | ---: |
 | TCP 流 permit | 描述符导出的 floor，加上对观测到的 idle non-TCP headroom 的有界借用 |
-| VLESS 物理 carrier | 启动时固定的 `min(after_dials / 8, 8192)` 进程 gate |
+| VLESS 物理 carrier | 启动时固定的 `min(after_dns / 8, 8192)` 进程 gate |
 | 冷 non-DNS UDP slow path | `min(udp_endpoints, 256)` |
-| 端口 53 入口 slow path | `min(transient_dials, 256)` |
+| UDP DNS 客户端生命周期 | 进程级 `min(1536, MemTotal / 4 / 256 KiB)`，跨 reload 共用 |
+| 所有 controller DNS 查询生命周期 | 每代 2,048，TCP 与 UDP 共用 |
+| DNS 自有 socket / endpoint 网络 bootstrap | 独立描述符分区支持的进程 gate，最多 256 个额度，跨 reload 共享 |
+| DNS 代理 stream / 非原始 UDP 的 packet 准备 | 不超过 DNS socket 上限的进程级保守逻辑 lease；不是所有代理 FD 的总上限 |
 | NFQUEUE ingest actor | 256 个条目和 8 MiB |
+
+代理 carrier 的所有权仍独立管理；查询与 socket 的准入约束见 [DNS 准入](./dns.md#解析管线)。
 
 TCP accept 使用描述符导出的流预算，没有独立的 256 项上限。[Joined removal worker](./datapath.md#用户空间维护与计数) 处理 TCP、UDP 与 expiry hint；UDP 保留 1024 条消息的 channel 和去重 `removal_dirty` 补偿。只有自有 I/O 和后端退役完成后才确认精确 tombstone。
 
@@ -230,9 +242,11 @@ I/O 完成后，joined retirement worker 持有已准入 TCP 退役、socket、t
 
 NFQUEUE 冷 cell 重建在同一读锁 guard 内保留 conn-state 快照，并调用 backend 自有的 UDP 准入校验。无法解决的 retirement 所有权或超出 allocator 范围的身份不能重建 ActiveDirect 放行；已准入的 fast follower 仍保留既有无查询路径。
 
-真实 relay 完成后，TCP owner 先按实际结果恰一次结算 Score 与 relay-error 统计，再传播退役失败。退役失败不会把成功 relay 证据改成取消。TCP 补池仍要求 relay 成功且退役已确认；主动取消保留独立的中性路径。
+真实 relay 完成后，TCP owner 先按实际结果结算一次 Score 与 relay-error 统计，再传播退役失败。退役失败不会把成功 relay 证据改成取消。TCP 补池仍要求 relay 成功且退役已确认；主动取消保留独立的中性路径。
 
-`splice.rs` 的 `relay_splice` 与 `vision.rs` 共用双向引擎。**不得恢复单向 splice**，它曾导致超时；空闲排空期限可防止无数据传输的对端使任务和套接字长期停留在 CLOSE-WAIT。
+`splice.rs` 的 `relay_splice` 在普通 `TcpStream` 之间使用双向零拷贝 `splice(2)`，并传播半关闭。每个方向的首次 splice 都会探测能力。在任何字节进入管道前，EINVAL/ENOSYS/EXDEV/EPERM 会触发无损 copy 回退，并设置进程级禁用标志；创建管道失败也会回退到 copy，但不设置该标志。**不得恢复单向 splice**，它曾导致超时。
+
+`relay_auto` 对 TLS 或协议封装的流使用同一个基于 select 的 copy loop。`vision.rs` 将 Direct Vision carrier 的 socket 借给同一个双向引擎。两条路径都会在首次 EOF 时半关闭对端，剩余排空时间只受空闲期限 `DRAIN_DEADLINE` 限制：连续 30 秒没有字节进展才结束，不会截断仍在传输的另一方向。这样可防止无数据传输的对端使任务和套接字长期停留在 CLOSE-WAIT。UDP 使用 `UdpEndpointPool`。
 
 ## Reload 与运行时 generation
 
@@ -248,7 +262,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
    停止 warm coordinator 会取消可能依赖另一 coordinator 的 retention-reconciliation 等待；coordinator 退出前仍会 abort 并 join 自己派发的子任务。QUIC warm 释放与终止关闭在 client 槽位上串行化，即使未启用原生任务所有权也一样；取消释放不会提前清空槽位，终止关闭仍能取得 client。
 5. 开放 pending 准入，最后重开 NFQUEUE。规则派生 feature bit 存在 policy descriptor 中，不再单独发布到静态 flag map。
 
-`control/reload/transaction.rs` 在候选准备与提交外层持有 `reload_lock`。新代发布依次取得 `router` → `config` → `datapath_flags.publication()`（仅原生显式源激活）→ `ebpf`，随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`；provider 的 DNS publication guard 在这些 guard 内准备。原生 no-op 激活取得 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 独立 mode/fence 更新按 flags mutex → `ebpf`；`reset_for_activation` 不重新取得这两者，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 外运行。这只是记录既有锁边，不授权新增锁边；变更仍须遵守 CONTRIBUTING §2/§11 与人工审查。
+`control/reload/transaction.rs` 在候选准备与提交外层持有 `reload_lock`。新代发布依次取得 `router` → `config` → `datapath_flags.publication()`（仅原生显式源激活）→ `ebpf`，随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`。在这些 guard 内，provider 的 DNS publication guard 延后到 backend staging 完成后、紧接着在 registry 权限替换之前取得，仍持有到原有 DNS pointer 提交点。因此 backend staging 不再占用 provider 准入锁，而 registry 转移、回调安装和 Score 权限发布仍阻止新的旧代 DNS 准入。原生 no-op 激活取得 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 独立 mode/fence 更新按 flags mutex → `ebpf`；`reset_for_activation` 不重新取得这两者，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 外运行。这只是记录既有锁边，不授权新增锁边；变更仍须遵守 CONTRIBUTING §2/§11 与人工审查。
 
 `RoutingPushPlan::compile` 是唯一用户态 lowering 路径；调用方不选择 slot，也没有独立 domain-publication handshake。`routing_policy.rs` ABI 分别为 `RoutingInput` 128 字节、`RoutingDecision` 24 字节与 `RoutingPolicyDescriptor` 24 字节。真实 eBPF 要求 Linux 6.12+；生成的进程名匹配代码在固定偏移读取前检查 `pname_len`，以符合 6.12 verifier。已加载路由 slot 的 BTF 必须暴露当前输出布局。
 
@@ -346,7 +360,7 @@ Selector 写入由同一 control/reload owner 序列化，TCP/UDP 分开保存�
 
 Probe worker 拥有有界准备/排队/执行/清理，DNS 诊断使用真实 generation 与精确缓存 owner，provider refresh 由 SubscriptionSupervisor 拉取并等待 revision-fenced publication；GET 不伪造这些 producer。Routing trace 只模拟当前 compiled predicate，不 DNS/探测/选组；当前规则字典只在 parser 来源可用时提供脱敏 source location。Runtime settings 由一个 owner 先校验全量 merge 再发布，native+Clash mode 共用 `DatapathFlagsHandle`。Native 启用时模式不恢复/持久化；显式接受配置激活（含 no-op）重置 Rule 与 settings，provider/network refresh 不重置。
 
-自动诊断采集由 `native_api/settings.rs` 持有相互独立的需求：成功的 flow GET 或显式 flow-event kind/`flow_id` 开启 flows，logs stream 开启 logs，成功的 DNS-log GET 开启 DNS log。普通 events 只维持自己的 attachment，不开启这三个 recorder。准入失败及普通 API/validation 请求不增加诊断需求。每个 stream lease 只释放其实际取得的集合；每类 recorder 独立保有最后需求释放后的六十秒 grace，不由其他读取/stream 续期。配置许可与显式 runtime On/Off 仍有优先权；显式激活重置 override，provider/network refresh 保留。
+`native_api/settings.rs` 分别管理各类自动诊断采集需求：成功的 flow GET 或显式 flow-event kind/`flow_id` 开启 flows，logs stream 开启 logs，成功的 DNS-log GET 开启 DNS log。普通 events 只维持自己的 attachment，不开启这三个 recorder。准入失败及普通 API/validation 请求不增加诊断需求。每个 stream lease 只释放自己取得的集合；每类 recorder 独立保有最后需求释放后的六十秒 grace，不由其他读取/stream 续期。配置许可与显式 runtime On/Off 仍有优先权；显式激活重置 override，provider/network refresh 保留。
 
 Probe 准备阶段将捕获的计划消费为具体地址的可执行尝试或明确的家族地址不可用结果。DNS-owned resolver 保留代次及 canonical accepted-positive 应答资格；即使另一家族有地址，终止性 packet refusal 也拒绝整个准备。健康 ticket 与探测配置在同一发布屏障内捕获。
 

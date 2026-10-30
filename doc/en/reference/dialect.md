@@ -1,6 +1,6 @@
 # The honk dialect of dae configuration
 
-honk reads dae configuration syntax as a dialect: where honk and dae interpret the same text differently, honk's documented behavior is the contract. This page describes the source-backed parser's current rules. The dae column covers only its grammar (`dae_config.g4`), not value conversion.
+honk reads a dialect of dae configuration syntax. Where the same text has different meanings in honk and dae, honk's documented behavior is the contract. The dae column covers only its grammar (`dae_config.g4`), not value conversion.
 
 ## Lexical rules
 

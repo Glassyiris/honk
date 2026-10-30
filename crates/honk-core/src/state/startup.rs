@@ -313,6 +313,13 @@ mod state_claim_tests {
     #[cfg(feature = "native-api")]
     #[tokio::test(flavor = "current_thread")]
     async fn a_native_bind_failure_rolls_back_started_owners_before_returning() {
+        const CHILD: &str = "HONK_NATIVE_BIND_ROLLBACK_CHILD";
+        const NAME: &str = "state::startup::state_claim_tests::a_native_bind_failure_rolls_back_started_owners_before_returning";
+        // Startup installs a process-wide data directory, unlike the other state fixtures.
+        if crate::test_support::run_exact_in_child(CHILD, NAME) {
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt as _;
 
         let directory = tempfile::tempdir().unwrap();
@@ -335,43 +342,24 @@ mod state_claim_tests {
         let cli =
             crate::Cli::parse_from(["honk-core", "--mock-ebpf", "-c", config.to_str().unwrap()]);
 
-        #[derive(Clone, Default)]
-        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Capture {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self {
-                self.clone()
-            }
-        }
-        let capture = Capture::default();
-        let _logs = tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(capture.clone())
-                .with_ansi(false)
-                .finish(),
-        );
-
-        let error = crate::run(cli).await.unwrap_err();
+        let error = crate::run(cli)
+            .await
+            .expect_err("an occupied native listener must refuse startup");
         assert!(
             error
                 .to_string()
                 .contains("native API listener bind failed"),
             "{error:#}"
         );
-        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            logs.contains("Control plane stopped"),
-            "startup failure must finish joined rollback before returning: {logs}"
-        );
+        let _lock = nix::fcntl::Flock::lock(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .expect("startup rollback retained the instance lock");
         crate::TEST_INSTANCE_LOCK.with(|path| *path.borrow_mut() = None);
     }
 }

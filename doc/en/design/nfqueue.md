@@ -4,7 +4,7 @@ The NFQUEUE path holds ambiguous LAN-forwarded UDP originals until userspace rea
 
 ## Activation and scope
 
-The path is enabled by default through `global.nfqueue_enable`. Set that key to `false` to disable it:
+`global.nfqueue_enable` enables this path by default. Set it to `false` to disable the path:
 
 ```dae
 global {

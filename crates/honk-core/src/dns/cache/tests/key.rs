@@ -242,7 +242,7 @@ fn combined_exact_lookup_preserves_precedence_and_counts_once() {
     let before = service.counters();
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative { hit, .. } if hit.rcode == 2
+        ExactLookup::Negative { rcode: 2, .. }
     ));
     let after_negative = service.counters();
     assert_eq!(after_negative.hits, before.hits + 1);
@@ -302,7 +302,7 @@ fn exact_negative_hit_promotes_before_same_shard_eviction() {
     for _ in 0..3 {
         assert!(matches!(
             service.lookup_exact(&negative, true),
-            ExactLookup::Negative { hit, .. } if hit.rcode == 3
+            ExactLookup::Negative { rcode: 3, .. }
         ));
     }
 
@@ -310,7 +310,7 @@ fn exact_negative_hit_promotes_before_same_shard_eviction() {
 
     assert!(matches!(
         service.lookup_exact(&negative, true),
-        ExactLookup::Negative { hit, .. } if hit.rcode == 3
+        ExactLookup::Negative { rcode: 3, .. }
     ));
     assert!(matches!(
         service.lookup_exact(&positive, true),
@@ -368,7 +368,7 @@ fn conditional_publication_rejects_stale_revision_after_each_publication() {
     let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative { hit, .. } if hit.rcode == 2
+        ExactLookup::Negative { rcode: 2, .. }
     ));
 
     // Restored entries require compatibility-mode lookup.
@@ -469,14 +469,14 @@ fn matching_revision_nxdomain_removes_positive_and_keeps_negative() {
     let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative { hit, .. } if hit.rcode == 3
+        ExactLookup::Negative { rcode: 3, .. }
     ));
 
     // The old token must not mutate the negative-only slot either.
     let _ = service.put_negative_if_current(epoch, key.clone(), 60, 2, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative { hit, .. } if hit.rcode == 3
+        ExactLookup::Negative { rcode: 3, .. }
     ));
 
     service.insert_expired_negative_exact_for_test(key.clone(), 3);

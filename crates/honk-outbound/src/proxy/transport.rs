@@ -17,6 +17,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use honk_config::node::Node;
+use percent_encoding::{AsciiSet, CONTROLS, PercentEncode, utf8_percent_encode};
 use tokio::net::TcpStream;
 
 use crate::proxy::transport::grpc::wrap_grpc;
@@ -246,6 +247,22 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     Ok(MaybeTls::Plain(Box::new(tcp)))
 }
 
+fn encode_uri_path(path: &str) -> PercentEncode<'_> {
+    // Paths may already contain escapes and query delimiters; preserve both.
+    const ENCODE_SET: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'<')
+        .add(b'>')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}')
+        .add(b'|')
+        .add(b'\\')
+        .add(b'^');
+    utf8_percent_encode(path, ENCODE_SET)
+}
+
 /// Upgrade an already-connected (optionally TLS-wrapped) stream to
 /// WebSocket, then bridge through a duplex so the caller gets a
 /// plain `AsyncRead + AsyncWrite` handle.
@@ -267,7 +284,12 @@ async fn wrap_ws(
     // handshake header set (Sec-WebSocket-Key, Upgrade, ...); a bare
     // `http::Request` passed to `client_async` is sent as-is and real
     // servers reject the missing key.
-    let uri = format!("ws://{}:{}{}", node.host(), node.port, ws_path);
+    let uri = format!(
+        "ws://{}:{}{}",
+        node.host(),
+        node.port,
+        encode_uri_path(ws_path)
+    );
     let mut request = uri
         .into_client_request()
         .map_err(|e| anyhow::anyhow!("WebSocket request build failed: {}", e))?;

@@ -81,6 +81,26 @@ fn udp_nfqueue_toggle_requires_restart() {
     );
 }
 
+/// Lazy binding only reconciles one fixed list of entries: changing either
+/// list is never applied by a reload.
+#[test]
+fn lan_and_wan_interface_changes_stay_restart_required() {
+    let current = Config::default();
+    let mut lan = current.clone();
+    lan.global.lan_interface = vec!["eth1".to_string()];
+    assert_eq!(
+        restart_required_changes(&current, &lan),
+        vec!["global.lan_interface"]
+    );
+    let mut wan = current.clone();
+    wan.global.wan_interface = vec!["auto".to_string(), "eth2".to_string()];
+    assert_eq!(
+        restart_required_changes(&current, &wan),
+        vec!["global.wan_interface"]
+    );
+    assert!(restart_required_changes(&lan, &lan.clone()).is_empty());
+}
+
 #[test]
 fn native_api_settings_require_restart() {
     let current = Config::default();

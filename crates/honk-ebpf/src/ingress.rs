@@ -49,8 +49,8 @@ use crate::{
     route::{OUTBOUND_BLOCK, OUTBOUND_CONTROL_PLANE_ROUTING, OUTBOUND_DIRECT},
     sk,
     transport::{
-        ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, PARSE_FRAGMENT, parse_packet,
-        udp_has_quic_long_header,
+        ETH_HLEN, ETH_P_IP, ETH_P_IPV6, IPPROTO_TCP, IPPROTO_UDP, PARSE_FRAGMENT, PASS_UNSUPPORTED,
+        is_vlan_tagged, parse_packet, udp_has_quic_long_header,
     },
 };
 const AF_INET: u8 = 2;
@@ -481,6 +481,9 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if !crate::maps::datapath_ready() {
         return Err(TC_ACT_UNSPEC);
     }
+    if is_vlan_tagged(ctx, link_h_len) {
+        return Err(TC_ACT_UNSPEC);
+    }
     // Bridge master/slave double attachment must not reclassify either an
     // already-final packet or a held packet carrying its unique queue token.
     if unsafe { (*ctx.skb.skb).mark } & (CLASSIFIED_MARK | NFQUEUE_PENDING_MARK) != 0 {
@@ -491,6 +494,12 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if ret != 0 {
         if ret == PARSE_FRAGMENT as c_long && crate::fragment::condemned(pkt) {
             return Err(TC_ACT_SHOT);
+        }
+        // Non-IP and unsupported-L4 frames carry no classification: leave them
+        // unmarked so an upper device (macsec, vlan) still classifies its own
+        // frame. `pkt.ethh` is not written on failure; do not read it here.
+        if ret == PASS_UNSUPPORTED {
+            return Err(TC_ACT_UNSPEC);
         }
         return pass_through_classified(ctx);
     }

@@ -1,6 +1,6 @@
 # DNS configuration reference
 
-`dns { ... }` configures DNS in dae syntax. This reference covers its fields and runtime semantics.
+`dns { ... }` configures DNS in dae syntax.
 
 ## Top-level keys
 
@@ -63,9 +63,18 @@ SIGHUP builds a new snapshot. Any unreadable source or invalid custom rule abort
 
 ## EDNS Client Subnet (`client_subnet`)
 
-`client_subnet` applies only to named upstreams. An IPv4 address is a `/32`; an IPv4 CIDR is normalized to its network. `auto` sends bypass-marked UDP probes toward `1.1.1.1:33434`, while `auto(IPv4)` changes only that probe target. It uses the route-selected public local address when available; otherwise it checks at most 12 TTLs with three independent UDP flows per TTL and selects the first public ICMP hop as a `/24`. The probe needs neither DNS nor an HTTP service. Startup, SIGHUP, and route/link/address changes resolve a new immutable value for the replacement DNS generation. A bounded failure disables generated ECS for that generation.
+ECS reveals an approximate client network to upstream authoritative servers. Leave `client_subnet` empty unless CDN locality requires it. The setting applies only to named upstreams.
 
-honk never overrides client-supplied ECS, including `/0`. Generated ECS follows the resolved dial route after both explicit `-> tag` selection and ordinary traffic routing: direct attempts, including `-> direct`, are eligible; attempts with a proxy leaf omit it. UDP address retries are judged separately, so ECS from a failed direct attempt cannot reach a proxied retry. For an eligible named-upstream query without ECS, honk adds the configured option after cache/singleflight admission, validates any echoed ECS, and removes only its injected state before caching or replying. The effective prefix partitions DNS policy identity, so answers cannot cross a changed automatic prefix. `asis` requests remain byte-for-byte unchanged. ECS reveals an approximate client network to upstream authoritative servers; leave the field empty unless CDN locality requires it.
+- Explicit value: an IPv4 address is a `/32`; honk normalizes an IPv4 CIDR to its network.
+- Automatic value: `auto` sends bypass-marked UDP probes toward `1.1.1.1:33434`; `auto(IPv4)` changes only that probe target. honk uses the route-selected public local address when available. Otherwise, it checks at most 12 TTLs with three independent UDP flows per TTL, then selects the first public ICMP hop as a `/24`. The probe needs neither DNS nor an HTTP service.
+- Refresh: startup, SIGHUP and route/link/address changes resolve a new immutable value for the replacement DNS generation. A bounded failure disables generated ECS for that generation.
+
+honk never overrides client-supplied ECS, including `/0`. For generated ECS:
+
+- The resolved dial route applies after both explicit `-> tag` selection and ordinary traffic routing. Direct attempts, including `-> direct`, are eligible; attempts with a proxy leaf omit ECS.
+- honk judges each UDP address retry separately. ECS from a failed direct attempt cannot reach a proxied retry.
+- For an eligible named-upstream query without ECS, honk adds the configured option after cache/singleflight admission, validates any echoed ECS, and removes only its injected state before caching or replying.
+- The effective prefix partitions DNS policy identity, so answers cannot cross a changed automatic prefix. `asis` requests remain byte-for-byte unchanged.
 
 ## Upstreams
 
@@ -169,7 +178,7 @@ Native `direct(must)` bypass differs from `asis` re-querying; see [DNS source/NA
 
 NXDOMAIN and SERVFAIL bypass response routing and are returned directly, without applying response rules or fallback.
 
-A response traversal has a maximum re-query depth of three upstreams, including the initial upstream; a fourth exchange is rejected. Re-query cycles are also rejected.
+A response traversal allows at most three upstreams, including the initial upstream. The planner rejects a fourth exchange and any re-query cycle.
 
 ### Legacy conversion
 

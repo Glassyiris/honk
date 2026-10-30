@@ -4,13 +4,13 @@ honk does not synthesize application keepalives. Keeping a transport carrier ope
 
 ## UDP: replies keep the endpoint alive
 
-An endpoint retires after **120 s without a reply**; successful sends and carrier keepalives do not reset that timer. Pure-uplink flows expire even while sending, and the next packet may create a new endpoint if admission permits; old packets are not replayed. A never-replied flow settles Score as timeout; after a delivered reply, later idle retirement is health-neutral and settles Score as success.
+An endpoint retires after **120 s without a reply**; successful sends and carrier keepalives do not reset that timer. Pure-uplink flows expire even while sending. The next packet may create a new endpoint if admission permits; old packets are not replayed. A never-replied flow settles Score as timeout. After a delivered reply, later idle retirement is health-neutral and settles Score as success.
 
 Each ordinary no-reply expiry counts as a `DataUdp` health failure. After a node's 60 s registration grace, 50 consecutive counted failures make it unavailable for that probe domain/address family. Delivered replies or successful probes for the same key reset the run, not sends alone. A shared UDP association reports one no-reply health failure only if it sent data and never received a reply: once another destination has replied, an unreplied view can still expire with a Score timeout, but neither demotes nor retires the whole source. See [health and Score](../design/groups.md).
 
 Kernel state has independent [UDP idle-renewal rules](../design/datapath.md#udp-lifetime-renewal); a fresh kernel entry does not prevent userspace reply-idle expiry. Userspace does not keep silent kernel entries fresh; kernel-state reclamation also retires the owning endpoint, so the next packet needs a new one. Transport keepalives do not configure external NAT/conntrack.
 
-New mappings drop at the process-wide **8192-endpoint hard cap** (both families combined), or the lower startup descriptor budget; existing mappings are not evicted and rejected datagrams are not queued. NFQUEUE originals drop too. Check `udp.capacity.rejected` in authenticated Clash `GET /stats`; raising the service `RLIMIT_NOFILE` can help only below the hard cap. [Slow-path/queue budgets](../design/control-plane.md#queue-and-descriptor-budgets) can reject work earlier.
+New mappings drop at the process-wide **32,768-endpoint hard cap** (both families combined), or the lower startup descriptor or memory budget (a quarter of `MemTotal` at 64 KiB per endpoint, 8,192 at 2 GiB); existing mappings are not evicted and rejected datagrams are not queued. NFQUEUE originals drop too. Check `udp.capacity.rejected` in authenticated Clash `GET /stats`; raising the service `RLIMIT_NOFILE` helps only while descriptors are the smaller limit. [Slow-path/queue budgets](../design/control-plane.md#queue-and-descriptor-budgets) can reject work earlier.
 
 ## TCP: idle is not a relay deadline
 

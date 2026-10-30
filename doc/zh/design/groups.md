@@ -4,7 +4,7 @@ honk 将组解析为叶子出站，跟踪其健康状态，并限制预热资源
 
 ## 范围
 
-本页涵盖 `GroupManager`、`AliveDialerSet`、始终编译的 Score 评分器、冷启动 URLTest 准备流程与预热资源 coordinator。组字段和策略语法见[组参考](../reference/groups.md)；进程级健康检查、预热与拨号配置键见[全局参考](../reference/global.md)。
+组运行时包括 `GroupManager`、`AliveDialerSet`、始终编译的 Score 评分器、冷启动 URLTest 准备流程与预热资源协调器。组字段和策略语法见[组参考](../reference/groups.md)；进程级健康检查、预热与拨号配置键见[全局参考](../reference/global.md)。
 
 ## 组管理器与选择流水线
 
@@ -156,7 +156,7 @@ Clash 将 Score 组表示为 `type: "url_test"`，在 `now` 中报告当前聚�
 
 `next = (previous + sample) / 2`
 
-第一个样本初始化平均值。这就是 dae `min_moving_avg` 语义：近期变化能较快生效，同时不让单次抖动成为权威值。
+第一个样本初始化平均值。该算法遵循 dae `min_moving_avg` 语义：近期变化能较快生效，单次抖动不会成为权威值。
 
 `SelectionNetwork::Tcp` 与 `SelectionNetwork::Udp` 分别保留胜者。TCP 使用 TCP 探测平均值；若组配置了自定义目标，则使用 `(member tag, check_url)` 平均值。UDP 先使用 `DataUdp`，再使用 `DnsUdp`；如果在当前地址族下，所有合格候选在这两个域保留的移动平均值中都没有真实 UDP 排名依据，则沿用 TCP 选择。仅有拨号失败产生的合成样本不会停用这一回退；真实样本被历史环形缓冲区淘汰后，保留的排名依据仍然有效。因此有效回退顺序是 `DataUdp → DnsUdp → TCP`。
 
@@ -275,8 +275,8 @@ eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族�
 Selector 与 UDP ownership 是 reusable node runtime 上相互独立的 bit。
 `WarmRequirement::Session` 跟随 TCP path，`WarmRequirement::Udp` 跟随 UDP path，
 因此仅 UDP 的 VLESS pool 不改变 direct-TCP warming 或 bare-TCP eligibility。移除
-一个 owner 时，另一个 owner 仍可保留共享 pool；最后一个适用 owner 释放后才排空未来
-reuse。active flow 不会被切断，startup preconnect 仍只是一颗 pool seed。
+一个 owner 时，另一个 owner 仍可保留共享 pool；最后一个适用 owner 释放后才停止后续
+复用并排空资源。active flow 不会被切断，启动预连接只向池中提供初始连接。
 
 重载时，配置不变的节点将现有 `NodeRuntime` 转移给 replacement，包括 AnyTLS、
 VLESS pool/source key 与 QUIC 状态；配置变化时得到 fresh runtime。现有 outbound

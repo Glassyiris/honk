@@ -174,13 +174,21 @@ fn default_tproxy_port() -> u16 {
     12345
 }
 
+/// Whether a configured interface entry means "the default-route interface":
+/// empty, or `auto` ignoring surrounding whitespace and ASCII case.
+pub fn is_auto_interface(name: &str) -> bool {
+    let name = name.trim();
+    name.is_empty() || name.eq_ignore_ascii_case("auto")
+}
+
 /// Host CIDRs (`addr/32`, `addr/128`) for every global-scoped address on
-/// `iface`. The literal `auto` resolves through the lowest-metric IPv4
-/// default route. Missing or unresolved interfaces yield an empty list.
+/// `iface`. An auto entry (see [`is_auto_interface`]) resolves through the
+/// lowest-metric IPv4 default route. Missing or unresolved interfaces yield an
+/// empty list.
 fn interface_host_cidrs(iface: &str) -> Vec<String> {
     let iface = iface.trim();
     let owned;
-    let iface = if iface.eq_ignore_ascii_case("auto") {
+    let iface = if is_auto_interface(iface) {
         owned = default_route_interface().unwrap_or_default();
         if owned.is_empty() {
             return Vec::new();
@@ -264,6 +272,27 @@ pub fn default_route_interface_from(text: &str) -> Option<String> {
         }
     }
     best.map(|(_, interface)| interface)
+}
+
+#[cfg(test)]
+mod default_route_tests {
+    use super::default_route_interface_from;
+
+    #[test]
+    fn default_route_parser_waits_for_a_real_default_and_uses_lowest_metric() {
+        let header = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n";
+        let no_default = format!("{header}campus0 0000A8C0 00000000 0001 0 0 10 00FFFFFF 0 0 0\n");
+        assert_eq!(default_route_interface_from(&no_default), None);
+
+        let routes = format!(
+            "{header}ethernet0 00000000 00000000 0003 0 0 600 00000000 0 0 0\n\
+             wifi0 00000000 00000000 0003 0 0 100 00000000 0 0 0\n"
+        );
+        assert_eq!(
+            default_route_interface_from(&routes).as_deref(),
+            Some("wifi0")
+        );
+    }
 }
 
 fn default_tproxy_mark() -> u32 {
@@ -1442,6 +1471,16 @@ fn yaml_has_global_nfqueue_enable(content: &str) -> bool {
 #[cfg(test)]
 mod builtin_nodes_tests {
     use super::*;
+
+    #[test]
+    fn test_is_auto_interface_trims_and_ignores_ascii_case() {
+        for auto in ["auto", "AUTO", "Auto", " auto ", "\tAuTo\n", "", "  "] {
+            assert!(is_auto_interface(auto), "{auto:?}");
+        }
+        for named in ["eth0", "auto0", "au to", "autó", "lo"] {
+            assert!(!is_auto_interface(named), "{named:?}");
+        }
+    }
 
     #[test]
     fn test_validate_accepts_supported_dns_bind() {

@@ -1,6 +1,6 @@
 # honk 的 dae 配置方言
 
-honk 读取 dae 配置语法，形成自己的方言：两者对同一段文本的解析结果不同时，以 honk 文档规定的行为为准。本页描述基于源文本的解析器当前采用的规则。dae 一栏只描述其文法（`dae_config.g4`），不涉及值转换。
+honk 使用 dae 配置语法的方言。两者对同一段文本的解析结果不同时，以 honk 文档规定的行为为准。本页列出基于源文本的解析器当前采用的规则；dae 一栏只描述其文法（`dae_config.g4`），不涉及值转换。
 
 ## 词法规则
 
@@ -42,7 +42,7 @@ honk 读取 dae 配置语法，形成自己的方言：两者对同一段文本�
 | 带引号的订阅链接后接块：`paid: 'url' {` 之后各占一行的 `ua: …`、`interval: …`、`cache: …` 或 `route: …` 与 `}` | `ID ':' literal` 已结束声明 | honk 扩展：条目选项；未设置的项取 `assets.subscription` 与 `assets.route`。`route` 取代旧块形式中的 `download_detour`，同时设置两者时报 `conflicting-subscription-route`。 | |
 | `node` 里冒号前带空格的裸标签，`edge : 'socks5://…'` | 标签为 `edge` | 冒号两侧的空白会被规范化：保留节点，标签为 `edge`，并产生 `entry-tag-normalized` 信息级诊断。仍接受 `edge: …` 和带引号的标签。 | [dialect-entries-05-spaced-tag](../../../crates/honk-config/conformance/cases/dialect/dialect-entries-05-spaced-tag.dae) |
 | VLESS 分享链接或扁平序列化 VLESS 节点中的 `vless_mode` | 旧 VLESS mode 选择器 | 已移除，不作为别名接受。分享链接须使用独立的 `udp=`、`packetEncoding=` 与 `mux=` query。扁平 VLESS 节点会拒绝 `vless_mode` 的任何存在形式（包括 `null`），改用 `network`、`packet_encoding` 与 `multiplex`。 | |
-| 扁平序列化非 VLESS 节点上的 `vless_mode: legacy` | VLESS 之外的旧字段 | 仅作为 wire adapter 输出并读取的兼容 placeholder，不选择任何行为。这是唯一的非 VLESS 序列化例外，不是文档支持的 dae 或分享链接语法。 | |
+| 扁平序列化非 VLESS 节点上的 `vless_mode: legacy` | VLESS 之外的旧字段 | 仅作为序列化适配器输出并读取的兼容占位字段，不影响行为。这是唯一的非 VLESS 序列化例外，不是文档支持的 dae 或分享链接语法。 | |
 
 ## 路由
 

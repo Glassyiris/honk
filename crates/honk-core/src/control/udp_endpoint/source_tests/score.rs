@@ -113,8 +113,7 @@ impl ScoreSourceFixture {
             client_dst: endpoint.relay_addr,
             endpoint: Arc::clone(&endpoint),
             queue_rx,
-            reply_socket_factory: Arc::new(SystemUdpReplySocketFactory),
-            reply_socket_slots: Arc::new(Semaphore::new(MAX_REPLY_SOCKETS_PER_ENDPOINT)),
+            foreign_replies: ForeignReplySockets::for_one_endpoint(),
             client_addr: self.client_addr,
             alive_set: Arc::clone(&self.alive),
             outbound_tracker: self
@@ -373,7 +372,7 @@ async fn unaccepted_source_send_cannot_reconcile_delivered_reply() {
                 if disposition == "failed" {
                     owner.fail(ScoreOutcome::NodeFailure);
                 } else {
-                    endpoint.kill();
+                    endpoint.kill(true);
                 }
                 if disposition == "cancelled" {
                     drop(driver);

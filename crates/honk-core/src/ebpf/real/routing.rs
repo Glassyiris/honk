@@ -615,7 +615,7 @@ impl RealEbpfBackend {
             bpf: Some(bpf),
             pin_root: PathBuf::new(),
             pinned_maps: Vec::new(),
-            interface_links: Vec::new(),
+            bindings: Default::default(),
             cgroup_sock_links: Vec::new(),
             cgroup_sock_addr_links: Vec::new(),
             pname_mode: process_name::PnameCaptureMode::Argv0,
@@ -650,6 +650,47 @@ impl RealEbpfBackend {
             udp_staging_quiesce_incomplete: false,
             aux_deletes: Default::default(),
         })
+    }
+
+    pub(crate) fn test_interface_chain(
+        ifindex: u32,
+        direction: crate::ebpf::interface::Direction,
+    ) -> std::io::Result<Vec<u32>> {
+        Ok(bindings::query_chain(ifindex, direction)?.links)
+    }
+
+    pub(crate) fn test_local_ip(lan: &[&str], wan: &[&str]) -> u32 {
+        let owned = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let (_, plan) = crate::ebpf::interface::read_and_plan(&owned(lan), &owned(wan)).unwrap();
+        crate::ebpf::interface::local_ip(&plan)
+    }
+
+    /// Preload TC variants if needed; every requested binding must succeed.
+    pub(crate) fn bind_test_interfaces(
+        &mut self,
+        lan: &[&str],
+        wan: &[&str],
+    ) -> crate::ebpf::interface::ApplyReport {
+        let owned = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        let (lan, wan) = (owned(lan), owned(wan));
+        if self.bindings.programs().is_empty() {
+            self.bindings = bindings::InterfaceBindings::preload(self.bpf_mut().unwrap()).unwrap();
+        }
+        let (topology, plan) = crate::ebpf::interface::read_and_plan(&lan, &wan).unwrap();
+        let report = self.bind_interfaces(&plan, &topology);
+        assert!(report.failed.is_empty(), "bind failed: {:?}", report.failed);
+        assert!(!report.topology_changed);
+        report
     }
 
     pub(crate) fn run_routing_test(

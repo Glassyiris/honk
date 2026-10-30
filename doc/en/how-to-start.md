@@ -1,6 +1,6 @@
 # honk Quick Start
 
-honk is an experimental eBPF transparent proxy engine for Linux. Follow this guide to install, configure, and start it. Links at the end cover configuration fields and implementation details.
+Install, configure, and start honk, an experimental eBPF transparent proxy engine for Linux.
 
 > **Warning**
 >
@@ -58,7 +58,15 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
-cgroup v2 with `CONFIG_CGROUP_BPF` is required. The real datapath attaches socket-identity hooks and the TCP `sock_ops` program `honk_tcp_passive` to the root cgroup and refuses to start without them. A legacy (flags=0) program already holding the root cgroup's `sock_ops` slot, for example one attached with `bpftool cgroup attach`, also makes startup fail. `honk_tcp_passive` is entered for every TCP `sock_ops` callback on the host, a few per connection, and returns at once unless the socket belongs to honk's namespace. TCP ownership proof needs no in-kernel BTF, no ftrace and no built-in IPv6, so a kernel that only has an external raw BTF file can run it. Startup always loads raw BTF (the eBPF loader's target BTF, plus the process-name and receive-trace offsets), from the file named by `HONK_VMLINUX_BTF`, else `/sys/kernel/btf/vmlinux`, else `/usr/lib/debug/boot/vmlinux` (where OpenWrt's `vmlinux-btf` package installs it).
+cgroup v2 with `CONFIG_CGROUP_BPF` is required. The real datapath attaches socket-identity hooks and the TCP `sock_ops` program `honk_tcp_passive` to the root cgroup. Startup fails if either is unavailable. A legacy program with flags=0 already occupying the root cgroup's `sock_ops` slot also prevents startup, including one attached with `bpftool cgroup attach`.
+
+`honk_tcp_passive` receives every host TCP `sock_ops` callback, a few per connection. It returns immediately for sockets outside honk's namespace. TCP ownership proof requires neither in-kernel BTF, ftrace nor built-in IPv6; an external raw BTF file is sufficient.
+
+Startup always loads raw BTF for the eBPF loader's target BTF and the process-name and receive-trace offsets. It selects the file in this order:
+
+1. The file specified by `HONK_VMLINUX_BTF`.
+2. `/sys/kernel/btf/vmlinux` when no override is set.
+3. `/usr/lib/debug/boot/vmlinux` when the preceding default path is unreadable. OpenWrt's `vmlinux-btf` package installs this file.
 
 Only the optional `native-api` UDP receive-trace fallback, used when UDP receive-priority ancillary metadata is unavailable, attaches fentry/fexit programs. It needs the in-kernel BTF (`HONK_VMLINUX_BTF` does not substitute) and ftrace, and degrades without them:
 
@@ -98,9 +106,16 @@ Download the package matching the device architecture from [GitHub Releases](htt
 | clash-api | `-clash-api` | `clashapi` | Clash API only; no native API and no embedded UI (musl only) |
 | native-api | `-native-api` | `nativeapi` | Native API only; no Clash API and no embedded UI (musl only) |
 
-The musl packages are static binaries intended for gateways. Packages without the `-stock` suffix use mimalloc for throughput (label `mimalloc`); `-stock` packages use the system allocator and suit small devices where the RSS high-water mark matters more (label `stockalloc`). The Downloads section of each release lists every archive with its `{allocator}-{API}-{arch}-{libc}` label.
+The musl packages are static binaries intended for gateways.
 
-The lean variants fail closed: enabling `experimental.native_api` on `-clash-api`, or `ui: embedded` without `native-ui`, fails startup. `--store db` and native configuration administration require `native-api`.
+| Allocator variant | Release label | Intended use |
+| --- | --- | --- |
+| No `-stock` suffix: mimalloc | `mimalloc` | Prioritize throughput. |
+| `-stock`: system allocator | `stockalloc` | Small devices where the RSS high-water mark matters more. |
+
+Each release's Downloads section lists every archive with its `{allocator}-{API}-{arch}-{libc}` label.
+
+The lean variants fail closed: enabling `experimental.native_api` on `-clash-api`, or `ui: embedded` or `ui: embedded-lite` without `native-ui`, fails startup. `--store db` and native configuration administration require `native-api`. `embedded-lite` selects the lighter doona lite edition (preview).
 
 ```shell
 pkg=honk-core-<version>-<target>-full   # or -stock-full, -clash-api, -stock-native-api, as downloaded
@@ -116,7 +131,7 @@ Release binaries embed the eBPF object, so `honk-ebpf` does not need to be insta
 
 ### Build from source
 
-A source build requires:
+The real-eBPF source build below uses:
 
 - the stable Rust version in the root `rust-toolchain.toml` (`rustfmt`, `clippy`);
 - the nightly in `crates/honk-ebpf/rust-toolchain.toml` (`rust-src`, `llvm-tools`);
@@ -197,7 +212,7 @@ sudo install -d -m 0700 /etc/honk /var/lib/honk
 sudo install -m 0600 /path/to/config.dae /etc/honk/config.dae
 ```
 
-The default runtime root is `/var/lib/honk`. Existing artifacts under the legacy `/var/share/honk` root remain usable through the documented per-path fallback. honk does not automatically relocate them; writable state remains active in place. Custom `data_dir` values use the same fallback order. Relative caches, subscription stores, ECH/UI and other read-only dependencies check the configured directory, then `/var/share/honk`, then their caller-specific legacy path. Relative logs are created only below the configured directory.
+The default runtime root is `/var/lib/honk`. Existing artifacts under the legacy `/var/share/honk` root remain usable through the documented per-path fallback. Legacy cache and subscription imports copy eligible state into `state/honk.db`. Custom `data_dir` values use the same fallback order. Relative caches, subscription stores, ECH/UI and other read-only dependencies check the configured directory, then `/var/share/honk`, then their caller-specific legacy path. Relative logs are created only below the configured directory.
 
 Start honk in the foreground:
 
@@ -205,7 +220,12 @@ Start honk in the foreground:
 sudo /usr/local/bin/honk-core --config /etc/honk/config.dae
 ```
 
-After `honk-core is running` appears, verify connectivity from a real LAN client before adding nodes, subscriptions, groups, routing, and DNS. The following is the smallest proxy structure; replace the address with a real node:
+After `honk-core is running` appears, verify connectivity from a real LAN client before adding nodes, subscriptions, groups, routing, and DNS. To apply the minimal proxy example:
+
+1. Keep the direct-only configuration's `global` section.
+2. Add the example's `node` and `group` sections.
+3. Replace the entire `routing { fallback: direct }` section with `routing { fallback: proxy }`. Do not append a second `routing` section.
+4. Replace the example address and credentials with a real node.
 
 ```dae
 node {
@@ -232,6 +252,87 @@ bootstrap_resolver: '1.1.1.1:53'
 
 See the [configuration guide](configuration.md) for the complete configuration flow. The repository's `config.dae`, `config.min.dae`, and `example.dae` contain example interfaces or nodes and must be adapted before deployment.
 
+### Single-arm gateways
+
+On a single-arm gateway, also called a bypass router, `lan_interface` and the WAN are the same interface or bridge: clients use the honk host as their gateway, and the host sends their traffic back out through that interface to the upstream router. Set the three kernel parameters below on such a host. honk does not set these three, and `auto_config_kernel_parameter` does not change that (see the [global reference](reference/global.md)).
+
+- With `send_redirects` on, the kernel sends clients ICMP redirects that point them at the upstream router, and their traffic then bypasses honk. The kernel sends redirects when either the `all` or the interface value is `1`, so set both to `0`.
+- honk sets `rp_filter` to `0` only on the first bound LAN interface, but the kernel applies the higher of the `all` and interface values, so a value of `1` or `2` under `all` overrides it. Set `all` to `0`.
+
+Replace `br-lan` with the interface named in `lan_interface`, then load the file:
+
+```shell
+sudo tee /etc/sysctl.d/60-honk-single-arm.conf <<'EOF'
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.br-lan.send_redirects = 0
+net.ipv4.conf.all.rp_filter = 0
+EOF
+sudo sysctl -p /etc/sysctl.d/60-honk-single-arm.conf
+```
+
+The file is also applied at every boot. Check the values; each should be `0`:
+
+```shell
+sysctl net.ipv4.conf.all.send_redirects net.ipv4.conf.br-lan.send_redirects net.ipv4.conf.all.rp_filter
+```
+
+A client that already received a redirect may keep the learned route for a while; reconnect it to the network before testing.
+
+### Web UI and APIs
+
+Add one of the following blocks to the configuration, then restart honk. These examples listen only on the local machine. See the [experimental reference](reference/experimental.md) for all other fields and reverse-proxy requirements.
+
+**doona (native API).** The example below uses a `full` release, which embeds the UI. A build with `native-api` can instead serve a separately installed doona directory: set `ui` to that directory's path.
+
+```dae
+experimental {
+    native_api {
+        enabled: true
+        listen: '127.0.0.1:9527'
+        password_auth: true
+        config_write: true
+        ui: 'embedded'
+    }
+}
+```
+
+Open `http://127.0.0.1:9527/ui/` after startup.
+
+- `enabled` starts the native API listener; `listen` sets its address and port.
+- `password_auth` enables password login. On the first visit, create the administrator account; honk stores it under `data_dir` in `state/honk.db`, not in the configuration file.
+- `config_write` permits authenticated configuration writes and reloads. Sources containing listener credentials remain read-only.
+- `ui: 'embedded'` serves the standard doona bundled in the binary; it does not download a dashboard at startup.
+
+**doona lite.** The embedded example uses the same build requirements, address and login procedure. This lighter edition is a preview. Choose this block instead of the standard doona block:
+
+```dae
+experimental {
+    native_api {
+        enabled: true
+        listen: '127.0.0.1:9527'
+        password_auth: true
+        config_write: true
+        ui: 'embedded-lite'
+    }
+}
+```
+
+**Clash API for Clash dashboards.** Use a build with `clash-api` enabled, such as the `full` or `clash-api` release. Replace the secret with a long random string:
+
+```dae
+experimental {
+    clash_api {
+        external_controller: '127.0.0.1:9090'
+        external_ui: 'zashboard'
+        secret: '<a long random string>'
+    }
+}
+```
+
+`external_controller` starts the Clash listener. `external_ui` selects the dashboard directory; honk downloads zashboard on first start when that directory is missing or empty. Open `http://127.0.0.1:9090/ui/` and use the configured `secret` to connect the dashboard to the API. The API uses the secret for authentication; static UI files are public.
+
+Both APIs can run together in a build that includes both features, such as `full`. Put `native_api` and `clash_api` beside each other inside one `experimental` block; keep their separate listen ports.
+
 ### GeoIP and Geosite
 
 Download these files only when the configuration references `geoip:` or `geosite:`:
@@ -243,7 +344,17 @@ sudo curl -fL --retry 3 -o /var/lib/honk/geoip.dat \
   https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
 ```
 
-The engine selects the first existing regular file in this order: `$DAE_LOCATION_ASSET/<name>`, `<data_dir>/<name>`, `/var/share/honk/<name>`, `./<name>`, `/usr/local/share/honk/<name>`, `/usr/share/honk/<name>`, `/usr/local/share/dae/<name>`, `/usr/share/dae/<name>`, then `/etc/dae/<name>`.
+The engine selects the first existing regular file in this order:
+
+1. `$DAE_LOCATION_ASSET/<name>`
+2. `<data_dir>/<name>`
+3. `/var/share/honk/<name>`
+4. `./<name>`
+5. `/usr/local/share/honk/<name>`
+6. `/usr/share/honk/<name>`
+7. `/usr/local/share/dae/<name>`
+8. `/usr/share/dae/<name>`
+9. `/etc/dae/<name>`
 
 ## Run with systemd
 
@@ -287,6 +398,17 @@ Do not add strict capability bounding, a read-only `/proc/sys`, or `NoNewPrivile
 
 A running process does not prove that the datapath is usable. The logs should show that the real eBPF backend, interface hooks, listeners, and control plane are all ready.
 
+Interface binding produces the following logs:
+
+| Interface state | Log level and frequency | Message |
+| --- | --- | --- |
+| Hooks are ready | `info`, once on binding | `configured interface is bound` |
+| Interface is absent, or `auto` has no default route | One warning, then `debug` | `configured interface is not bound yet` |
+| Attachment fails | One warning, then `debug` | `configured interface attach failed; retrying` |
+| Link type is unsupported | One error | `configured interface is not supported` |
+
+`GET /runtime` reports unbound interfaces through the `interface_binding` degradation. See the [API reference](./reference/api.md#native-api).
+
 ```shell
 ip link show dae0
 sudo bpftool prog show
@@ -312,7 +434,7 @@ sudo systemctl reload honk-core
 sudo /usr/local/bin/honk-core reload
 ```
 
-Use the running process logs and their `applied` or `rejected` result to determine whether the reload succeeded. Changes to interfaces, TPROXY settings, `data_dir`, the NFQUEUE switch, DNS bind, the Clash API listener/secret, cache settings, and other process-scoped fields require a restart.
+Use the running process logs and their `applied` or `rejected` result to determine whether the reload succeeded. Changes to interfaces, TPROXY settings, `data_dir`, the NFQUEUE switch, DNS bind, the Clash API listener/secret, cache settings, and other process-scoped fields require a restart. An interface that appears or disappears at runtime needs no reload: the watcher binds and releases it.
 
 Stop normally with:
 
@@ -367,7 +489,9 @@ cargo run --release -p honk-core -- \
 | Pinning a map returns `Invalid argument` | `/sys/fs/bpf` is not bpffs; mount it as shown above. |
 | Mock mode starts but traffic bypasses honk | This is expected. Build with the `ebpf` feature and run as root. |
 | NFQUEUE is disabled or queue 320 is busy | Check nftables/NFQUEUE kernel support, the queue owner, and stale honk instances. Set `nfqueue_enable: false` only when staging is intentionally unnecessary. |
-| LAN traffic is not intercepted | `lan_interface` is empty or names the wrong interface. honk does not substitute `lo`. |
+| LAN traffic is not intercepted | `lan_interface` is empty or names the wrong interface. honk does not substitute `lo`. If the interface is named correctly, see the next row. |
+| `GET /runtime` shows an `interface_binding` degradation | A configured interface is not bound yet; the logs name it. `pending`: it does not exist or an `auto` entry has no IPv4 default route. `unsupported_type`: the link type is refused (for example `lo`, a VRF device or `dae0`); name a supported interface or a member. `attach_failed`: the TCX link could not be created, updated or verified; see the warning in the logs. See the [native API reference](./reference/api.md#native-api) for interface-state fields. |
+| On a single-arm gateway, clients bypass honk or forwarded traffic is dropped | Set `send_redirects` to `0` for `all` and the LAN interface, and `net.ipv4.conf.all.rp_filter` to `0`. See [Single-arm gateways](#single-arm-gateways). |
 | VLESS/VMess reports `No handler for protocol` | The build lacks `rprx`; use the default features or add `rprx` explicitly. |
 | A Geo rule fails to load | Put `geoip.dat`/`geosite.dat` in the configured `data_dir`, or verify the documented legacy/share search locations; remove unused Geo rules if not needed. |
 | A GNU binary does not execute on VyOS or a minimal system | Use the musl release for the same architecture. |
@@ -385,6 +509,27 @@ cargo run --release -p honk-core -- \
 
 ## Check parser changes
 
-From the repository root, run `just parser-ci` with the pinned stable Rust compiler, Go 1.26 or newer, Python 3.11 or newer, and network access. How to write a case is in `crates/honk-config/conformance/README.md`; the oracle and its licence are described in `tools/dae-parse/README.md`. It builds the pinned dae oracle, fetches upstream examples with manifest SHA256 checks, compares decoded structure and recorded dialect differences, then replays saved fuzz inputs. `just fuzz-replay` needs only stable Rust after Cargo dependencies are cached; it uses the same assertions as the fuzz targets. A replay failure prints the input path, and a hung input fails after five seconds.
+From the repository root, run `just parser-ci` with the pinned stable Rust compiler, Go 1.26 or newer, Python 3.11 or newer, and network access. Case instructions are in `crates/honk-config/conformance/README.md`; oracle and licence details are in `tools/dae-parse/README.md`.
 
-The `parser` CI lane runs for config code, the oracle, fuzz inputs, corpus source documents and their build inputs, or with `ci:full`. Ordinary workspace commands do not enable `conformance` or `fuzz-checks` and need neither Go nor nightly. The weekly job uses the nightly channel in `crates/honk-ebpf/rust-toolchain.toml` and cargo-fuzz pinned in `.github/ci/pins.env`. It runs `document`, `share_link`, and `lexer` for 480 seconds each with two workers and uploads findings and corpus files. Add a retained finding under `fuzz/artifacts/<target>/` to replay it on stable. Sanitizer-only findings still require the nightly fuzz target.
+The command performs these checks in order:
+
+1. Build the pinned dae oracle.
+2. Fetch upstream examples and verify their manifest SHA256 values.
+3. Compare decoded structure and recorded dialect differences.
+4. Replay saved fuzz inputs.
+
+With Cargo dependencies cached, `just fuzz-replay` needs only stable Rust. It uses the same assertions as the fuzz targets. A replay failure prints the input path; a hung input fails after five seconds.
+
+The `parser` CI lane runs when configuration code, the oracle, fuzz inputs, corpus source documents or their build inputs change. It also runs with `ci:full`. Ordinary workspace commands enable neither `conformance` nor `fuzz-checks`, so they require neither Go nor nightly.
+
+The weekly fuzz job uses:
+
+| Setting | Value |
+| --- | --- |
+| Rust channel | Nightly pinned in `crates/honk-ebpf/rust-toolchain.toml` |
+| cargo-fuzz version | Pinned in `.github/ci/pins.env` |
+| Targets | `document`, `share_link`, `lexer` |
+| Duration and concurrency | 480 seconds per target, two workers |
+| Uploaded artifacts | Findings and corpus files |
+
+Place a retained finding under `fuzz/artifacts/<target>/` to replay it on stable. Sanitizer-only findings still require the nightly fuzz target.

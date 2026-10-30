@@ -53,7 +53,6 @@ pub(in crate::control) enum UdpTerminal {
     PacketRejected,
     QuicSniffIncomplete,
     ReplyFamilyMismatch,
-    ReplySocketCapacity,
     ReplySocketFailed,
     SetupFailed,
     SpecialAddressSkipped,
@@ -93,7 +92,6 @@ impl UdpTerminal {
             Self::PacketRejected => (Failed, "packet_rejected"),
             Self::QuicSniffIncomplete => (Failed, "quic_sniff_incomplete"),
             Self::ReplyFamilyMismatch => (Failed, "reply_family_mismatch"),
-            Self::ReplySocketCapacity => (Failed, "reply_socket_capacity"),
             Self::ReplySocketFailed => (Failed, "reply_socket_failed"),
             Self::SetupFailed => (Failed, "setup_failed"),
             Self::SpecialAddressSkipped => (Failed, "special_address_skipped"),
@@ -114,6 +112,7 @@ impl UdpTerminal {
 }
 
 mod admission;
+mod foreign_reply;
 #[cfg_attr(not(feature = "native-api"), path = "observation/inert.rs")]
 mod observation;
 mod retirement;
@@ -124,6 +123,7 @@ mod source_quic_tests;
 mod source_shared_tests;
 #[cfg(all(test, feature = "rprx"))]
 mod source_tests;
+use foreign_reply::ForeignReplySockets;
 use retirement::{EndpointIoGuard, RetirementIo};
 pub(crate) use retirement::{EndpointRemoval, RemovalReason};
 pub(in crate::control) use source::{SourceAttachment, SourcePath, SourcePreparation};
@@ -144,8 +144,9 @@ const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(30);
 /// to grow the pool (and with it sockets, reply tasks and memory) without
 /// bound — at the cap new mappings are refused and the datagram is dropped,
 /// which UDP tolerates by design.
-pub(crate) const MAX_ENDPOINTS: usize = 8192;
-/// Total reply sockets retained by one endpoint, including the eagerly-created primary.
+pub(crate) const MAX_ENDPOINTS: usize = 32_768;
+/// Reply sockets budgeted per endpoint: its eager primary plus a share of the
+/// process-wide foreign pool.
 pub(in crate::control) const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
 enum EndpointTransport {
     Flow(Arc<dyn honk_outbound::proxy::PacketTransport>),
@@ -422,7 +423,7 @@ impl UdpEndpoint {
         self.ref_count.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub fn kill(&self) {
+    pub fn kill(&self, fence_peer: bool) {
         // A retirement ordered before `begin_send_attempt` must prevent the
         // transport call; an attempt already admitted remains ambiguous.
         let _send_gate = self.send_gate.lock();
@@ -431,7 +432,7 @@ impl UdpEndpoint {
         }
         match &self.transport {
             EndpointTransport::Flow(_) => self.dead.store(true, Ordering::Release),
-            EndpointTransport::Source(source) => source.retire(&self.dead),
+            EndpointTransport::Source(source) => source.retire(&self.dead, fence_peer),
         }
     }
 
@@ -695,9 +696,8 @@ pub struct UdpEndpointPool {
     endpoints: DashMap<EndpointKey, EndpointEntry>,
     endpoint_slots: Arc<Semaphore>,
     global_payload_bytes: Arc<Semaphore>,
-    /// Lifetime-held across active and retiring ordinary/source reply sockets.
-    /// The fixed 8× endpoint budget prevents teardown overlap from doubling FDs.
-    reply_socket_slots: Arc<Semaphore>,
+    /// Every reply socket: primaries and the process-wide foreign pool.
+    foreign_replies: Arc<ForeignReplySockets>,
     sources: DashMap<SourceScope, Arc<SourceOwner>>,
     source_slots: Arc<Semaphore>,
     next_source_owner: AtomicU64,
@@ -719,7 +719,6 @@ pub struct UdpEndpointPool {
     terminal: AtomicBool,
     slow_tasks: Mutex<TaskRegistry>,
     drivers: Mutex<TaskRegistry>,
-    reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
     /// Sink notified whenever an endpoint is removed; the control plane uses
     /// it to retire conntrack and tracker state exactly once.
     remove_sink: Mutex<Option<tokio::sync::mpsc::Sender<EndpointRemoval>>>,
@@ -750,9 +749,9 @@ impl UdpEndpointPool {
         )
     }
 
-    /// Dependency injection seam for synchronous anyfrom creation. The first
-    /// socket is created before the driver starts; accepted alternate reply
-    /// sources use the same factory lazily in the driver.
+    /// Dependency injection seam for synchronous anyfrom creation. The primary
+    /// socket is created before the driver starts; foreign reply sources use
+    /// the same factory lazily through the shared pool.
     pub(super) fn with_reply_socket_factory(
         capacity_limit: usize,
         reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
@@ -762,8 +761,9 @@ impl UdpEndpointPool {
             endpoints: DashMap::new(),
             endpoint_slots: Arc::new(Semaphore::new(capacity_limit)),
             global_payload_bytes: Arc::new(Semaphore::new(GLOBAL_PAYLOAD_CAPACITY)),
-            reply_socket_slots: Arc::new(Semaphore::new(
-                capacity_limit.saturating_mul(MAX_REPLY_SOCKETS_PER_ENDPOINT),
+            foreign_replies: Arc::new(ForeignReplySockets::new(
+                capacity_limit,
+                reply_socket_factory,
             )),
             sources: DashMap::new(),
             source_slots: Arc::new(Semaphore::new(capacity_limit)),
@@ -779,7 +779,6 @@ impl UdpEndpointPool {
             terminal: AtomicBool::new(false),
             slow_tasks: Mutex::new(TaskRegistry::default()),
             drivers: Mutex::new(TaskRegistry::default()),
-            reply_socket_factory,
             remove_sink: Mutex::new(None),
             removal_dirty: Mutex::new(HashSet::new()),
             active_retirements: AtomicUsize::new(0),
@@ -792,11 +791,7 @@ impl UdpEndpointPool {
     }
 
     pub(super) fn create_reply_socket(&self, source: SocketAddr) -> io::Result<ReplySocket> {
-        ReplySocket::create(
-            self.reply_socket_factory.as_ref(),
-            &self.reply_socket_slots,
-            source,
-        )
+        self.foreign_replies.create_primary(source)
     }
 
     #[cfg(test)]

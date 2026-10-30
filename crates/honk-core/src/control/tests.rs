@@ -16,6 +16,8 @@ use support::{
 };
 
 mod admission;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod bond_binding;
 mod diagnostics;
 mod dns_tcp_ownership;
 mod dns_udp_ownership;
@@ -28,6 +30,8 @@ mod tcp_binding;
 mod tcp_tuple_reuse;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod udp_fullcone;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod vlan_frames;
 
 #[tokio::test]
 async fn health_push_re_resolves_after_reload_writer() {
@@ -4469,8 +4473,7 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
     use std::sync::atomic::Ordering;
     let backend = crate::ebpf::mock::MockEbpfBackend::new();
     let detach = backend.detach_calls.clone();
-    let dyn_attach = backend.dynamic_attach_calls.clone();
-    let dyn_forget = backend.dynamic_forget_calls.clone();
+    let commits = backend.binding_commits.clone();
     let mut cp = link_lifecycle_cp(backend);
     cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
         crate::mode::ModeState::new("Rule", "Proxy"),
@@ -4495,8 +4498,11 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
         0,
         "reload/merge must never detach datapath hooks"
     );
-    assert_eq!(dyn_attach.load(Ordering::Relaxed), 0);
-    assert_eq!(dyn_forget.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        commits.load(Ordering::Relaxed),
+        0,
+        "reload/merge must never reconcile interface bindings"
+    );
     cp.datapath_flags.as_ref().unwrap().disable().await.unwrap();
 }
 
@@ -4878,6 +4884,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
         }
         netlink.add_veth_pair("honk-lan0", "honk-c0")?;
         netlink.add_veth_pair("honk-wan0", "honk-s0")?;
+        let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair()?;
         let (lan, _) = netlink.get_link("honk-lan0")?;
         let (client_peer, _) = netlink.get_link("honk-c0")?;
         let (wan, _) = netlink.get_link("honk-wan0")?;
@@ -4915,15 +4922,17 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
         runtime.block_on(async move {
             let pin_root = std::path::Path::new("/sys/fs/bpf")
                 .join(format!("honk-nfq-e2e-{}", std::process::id()));
+            let local_ip =
+                crate::ebpf::real::RealEbpfBackend::test_local_ip(&["honk-lan0"], &["honk-wan0"]);
             let mut backend = crate::ebpf::real::RealEbpfBackend::load(
                 crate::DEFAULT_BPF_OBJECT,
                 &pin_root,
                 12345,
-                Some("honk-lan0"),
-                "honk-wan0",
-                false,
+                &dae0_setup,
+                local_ip,
             )
             .await?;
+            backend.bind_test_interfaces(&["honk-lan0"], &["honk-wan0"]);
             let tcp_listener = TcpListener::bind("0.0.0.0:0").await?;
             let udp_listener = UdpSocket::bind("0.0.0.0:0").await?;
             let udp_fds = vec![udp_listener.as_raw_fd(); 4];

@@ -11,7 +11,7 @@ use serde_json::Value;
 
 // api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f, copied from
 // doona contract/api-standardize/openapi.yaml with its read_only_reason extension.
-// SHA-256: ef3e1ce08392c26d256b70277318d61a7ec932f4f5825ac8117d839944a33646.
+// SHA-256: 9f780ba92f13218ed7bc52e9a9af79a960d241ce6552a45522b41c30fc04faa0.
 const CONTRACT: &str = include_str!("../fixtures/native_api_openapi.yaml");
 const CONTRACT_URL: &str = "https://contract.honk.invalid/openapi.json";
 
@@ -21,21 +21,7 @@ const KNOWN_DRIFT: &[(&str, &str, u16, &str)] = &[];
 
 /// Values the contract rejects inside otherwise conforming responses, awaiting
 /// an owner decision: (label, instance path, reason).
-const KNOWN_VALUE_DRIFT: &[(&str, &str, &str)] = &[
-    (
-        "GET /api/v1/groups/{group_id} 200",
-        "/config/check_url",
-        MASKED_URL,
-    ),
-    (
-        "GET /api/v1/groups/{group_id}/config 200",
-        "/config/check_url",
-        MASKED_URL,
-    ),
-];
-
-const MASKED_URL: &str = "a masked listener secret leaves `<redacted>` in the URL, which \
-    SafeHttpUrl's `format: uri` rejects; the contract does not say how a masked URL is spelled";
+const KNOWN_VALUE_DRIFT: &[(&str, &str, &str)] = &[];
 
 static DOCUMENT: LazyLock<Value> = LazyLock::new(|| serde_yaml::from_str(CONTRACT).unwrap());
 

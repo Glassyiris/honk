@@ -38,6 +38,34 @@ pub mod stats;
 pub mod subscription;
 mod sysctl;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) fn run_exact_in_child(env: &str, name: &str) -> bool {
+        if std::env::var(env).as_deref() == Ok(name) {
+            return false;
+        }
+        let executable = std::env::current_exe().unwrap();
+        let listed = std::process::Command::new(&executable)
+            .args(["--exact", name, "--list", "--format", "terse"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert_eq!(
+            String::from_utf8(listed.stdout).unwrap().trim(),
+            format!("{name}: test")
+        );
+        assert!(
+            std::process::Command::new(executable)
+                .args(["--exact", name, "--test-threads=1", "--nocapture"])
+                .env(env, name)
+                .status()
+                .unwrap()
+                .success()
+        );
+        true
+    }
+}
+
 pub use honk_outbound::alive as outbound;
 pub use honk_outbound::group;
 pub use honk_outbound::proxy;
@@ -103,55 +131,18 @@ fn raise_nofile_rlimit() -> anyhow::Result<usize> {
         .min(control::MAX_EFFECTIVE_NOFILE))
 }
 
-#[cfg(feature = "ebpf")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConfiguredInterfaces {
-    pub(crate) lan: Vec<String>,
-    pub(crate) wan: Vec<String>,
-    pub(crate) single_homed: bool,
-}
-
-#[cfg(feature = "ebpf")]
-pub(crate) fn configured_interfaces(config: &honk_config::Config) -> ConfiguredInterfaces {
-    let default_interface = detect_default_interface();
-    let lan = resolve_configured_interface_names(
-        &config.global.lan_interface,
-        default_interface.as_deref(),
-    );
-    let wan = resolve_configured_interface_names(
-        &config.global.wan_interface,
-        default_interface.as_deref(),
-    );
-    let single_homed = !wan.is_empty() && lan.iter().any(|name| wan.contains(name));
-    ConfiguredInterfaces {
-        lan,
-        wan,
-        single_homed,
-    }
-}
-
-/// Resolve an interface list against one default-route snapshot. An unresolved
-/// `auto` entry stays pending instead of binding the datapath to loopback.
-#[cfg(feature = "ebpf")]
-pub(crate) fn resolve_configured_interface_names(
-    configured: &[String],
-    default_interface: Option<&str>,
-) -> Vec<String> {
-    let mut resolved = Vec::with_capacity(configured.len());
-    for name in configured {
-        let name = if name == "auto" || name.is_empty() {
-            let Some(default_interface) = default_interface else {
-                continue;
-            };
-            default_interface
-        } else {
-            name.as_str()
-        };
-        if !resolved.iter().any(|existing| existing == name) {
-            resolved.push(name.to_string());
-        }
-    }
-    resolved
+// ponytail: MemTotal ignores cgroup memory.max; read it if limited containers appear.
+fn total_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(kib.saturating_mul(1024))
 }
 
 /// Detect the interface used by the IPv4 default route.
@@ -976,7 +967,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             1_024
         }
     };
-    let resource_budget = control::ResourceBudget::for_nofile(effective_nofile);
+    let mut resource_budget = control::ResourceBudget::for_nofile(effective_nofile);
+    match total_memory_bytes() {
+        Some(memory) => resource_budget = resource_budget.with_memory(memory),
+        None => warn!(
+            "Failed to read MemTotal; using descriptor-only UDP endpoints and the default DNS query ceiling"
+        ),
+    }
+    let dns_socket_budget = dns::transport::DnsSocketBudget::new(resource_budget.dns_sockets);
     let tcp_flow_max = resource_budget.active_tcp_flows.saturating_mul(2);
     if tcp_flow_max < 256 {
         warn!(
@@ -1054,35 +1052,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         config.routing.rules.len()
     );
 
-    #[cfg(feature = "ebpf")]
-    let configured_ifaces = configured_interfaces(&config);
-    #[cfg(feature = "ebpf")]
-    if !mock_mode
-        && detect_default_interface().is_none()
-        && config
-            .global
-            .lan_interface
-            .iter()
-            .chain(&config.global.wan_interface)
-            .any(|name| name == "auto" || name.is_empty())
-    {
-        warn!(
-            "default route unavailable; auto interface binding is pending until a network route appears"
-        );
-    }
-
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
     // a healthy restart into a permanently degraded process.
     prepare_nfqueue_startup(&mut config, mock_mode);
 
-    // Create the dae0 link pair before eBPF load so PARAM.dae0_ifindex is correct.
-    // dae0peer stays in the host namespace during the dae0 attach, then moves
-    // to the daens netns during namespace setup.
     #[cfg(feature = "ebpf")]
-    let _dae0_guard: Option<daens::Dae0Guard>;
-    #[cfg(not(feature = "ebpf"))]
-    let _dae0_guard: Option<()>;
+    let _dae0_guard;
     if !mock_mode {
         // QUIC socket headroom: the default 208 KiB rmem/wmem caps a
         // ~1ms-RTT QUIC path at ~2 Gbps (setsockopt is clamped to 2×max).
@@ -1097,36 +1073,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 warn!("failed to set {}={}: {}", key, val, e);
             }
         }
-        #[cfg(feature = "ebpf")]
-        {
-            if let Some(lan_ifname) = configured_ifaces.lan.first() {
-                let _ = sysctl::set_sysctl(&format!("net.ipv4.conf.{}.rp_filter", lan_ifname), "0");
-            }
-            _dae0_guard = Some(daens::create_dae0_link()?);
-            for wan_ifname in &configured_ifaces.wan {
-                sysctl::enable_wan_accept_ra(wan_ifname);
-            }
-            info!(
-                "dae0 link created before eBPF load (ifindex={})",
-                _dae0_guard.as_ref().unwrap().ifindex
-            );
-        }
-        #[cfg(not(feature = "ebpf"))]
-        {
-            _dae0_guard = None;
-        }
-    } else {
-        _dae0_guard = None;
     }
 
     #[cfg(feature = "ebpf")]
-    let mut attached_ifaces: ebpf::real::AttachedMap = Default::default();
+    let mut interface_handoff = None;
     let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
+        #[cfg(feature = "ebpf")]
+        {
+            _dae0_guard = None;
+        }
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
     } else {
         #[cfg(feature = "ebpf")]
         {
+            // PARAM.dae0_ifindex must describe the pair before eBPF load.
+            let (guard, dae0_setup) = daens::create_dae0_link()?;
+            info!(
+                "dae0 link created before eBPF load (ifindex={})",
+                dae0_setup.ifindex()
+            );
+            _dae0_guard = Some(guard);
             let bpf_object_bytes = match &cli.bpf_object {
                 Some(path) => {
                     info!("Loading real eBPF backend from {}", path.display());
@@ -1139,103 +1106,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     DEFAULT_BPF_OBJECT.to_vec()
                 }
             };
-            let lan_ifnames = &configured_ifaces.lan;
-            let wan_ifnames = &configured_ifaces.wan;
-            let single_homed = configured_ifaces.single_homed;
-            let primary_lan = lan_ifnames.first().map(String::as_str);
-            let primary_wan = wan_ifnames.first().map(String::as_str).unwrap_or("");
-            let mut backend = ebpf::real::RealEbpfBackend::load(
+            let (backend, handoff) = ebpf::real::start_interfaces(
                 &bpf_object_bytes,
                 &cli.bpf_pin_root,
                 config.global.tproxy_port,
-                primary_lan,
-                primary_wan,
-                single_homed,
+                &dae0_setup,
+                &config.global.lan_interface,
+                &config.global.wan_interface,
+                &degradations,
+                ebpf::interface::read_topology,
             )
             .await?;
-
-            if let Some(primary_lan) = primary_lan
-                && let Ok(i) = netlink::ifindex_of(primary_lan)
-            {
-                attached_ifaces.insert(
-                    primary_lan.to_string(),
-                    ebpf::real::AttachedInterface {
-                        ifindex: i,
-                        role: if single_homed {
-                            ebpf::IfaceRole::LanWan
-                        } else {
-                            ebpf::IfaceRole::Lan
-                        },
-                        hooks: ebpf::DynamicHooks {
-                            ingress: true,
-                            egress: true,
-                        },
-                    },
-                );
-            }
-            if !single_homed
-                && !primary_wan.is_empty()
-                && let Ok(i) = netlink::ifindex_of(primary_wan)
-            {
-                attached_ifaces.insert(
-                    primary_wan.to_string(),
-                    ebpf::real::AttachedInterface {
-                        ifindex: i,
-                        role: ebpf::IfaceRole::Wan,
-                        hooks: ebpf::DynamicHooks {
-                            ingress: true,
-                            egress: true,
-                        },
-                    },
-                );
-            }
-            for extra_lan in lan_ifnames.iter().skip(1) {
-                match backend.attach_lan(extra_lan, single_homed) {
-                    Ok(hooks) => {
-                        if let Ok(i) = netlink::ifindex_of(extra_lan) {
-                            attached_ifaces.insert(
-                                extra_lan.clone(),
-                                ebpf::real::AttachedInterface {
-                                    ifindex: i,
-                                    role: if single_homed && wan_ifnames.contains(extra_lan) {
-                                        ebpf::IfaceRole::LanWan
-                                    } else {
-                                        ebpf::IfaceRole::Lan
-                                    },
-                                    hooks,
-                                },
-                            );
-                        }
-                    }
-                    Err(e) => warn!("Failed to attach LAN programs to {}: {}", extra_lan, e),
-                }
-            }
-            for extra_wan in wan_ifnames.iter().skip(1) {
-                let egress = backend.attach_wan_egress(extra_wan);
-                if let Err(e) = &egress {
-                    warn!("Failed to attach WAN egress to {}: {}", extra_wan, e);
-                }
-                let ingress = backend.attach_wan_ingress(extra_wan);
-                if let Err(e) = &ingress {
-                    warn!("Failed to attach WAN ingress to {}: {}", extra_wan, e);
-                }
-                let hooks = ebpf::DynamicHooks {
-                    ingress: ingress.is_ok(),
-                    egress: egress.is_ok(),
-                };
-                if (hooks.ingress || hooks.egress)
-                    && let Ok(i) = netlink::ifindex_of(extra_wan)
-                {
-                    attached_ifaces.insert(
-                        extra_wan.clone(),
-                        ebpf::real::AttachedInterface {
-                            ifindex: i,
-                            role: ebpf::IfaceRole::Wan,
-                            hooks,
-                        },
-                    );
-                }
-            }
+            interface_handoff = Some(handoff);
 
             Box::new(backend)
         }
@@ -1345,6 +1227,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             honk_outbound::bootstrap::BootstrapResolver::parse(&config.global.bootstrap_resolver),
             config.dns.strategy,
         )?
+        .with_socket_budget(dns_socket_budget.clone())
         .with_client_subnet(dns_client_subnet)
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
@@ -1370,6 +1253,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             dns_cache,
             dns_router,
         )
+        .with_socket_budget(dns_socket_budget)
         .with_configured_upstreams(&config.dns)
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
@@ -1407,19 +1291,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .await;
     control_plane.set_log_file_override(cli.log_file.clone(), log_file_path);
     #[cfg(feature = "ebpf")]
-    let iface_watcher = if !cli.mock_ebpf {
+    control_plane.set_iface_watcher(interface_handoff.map(|handoff| {
         ebpf::real::IfaceWatcher::spawn(
             control_plane.ebpf_handle(),
             control_plane.config_handle(),
             control_plane.command_sender(),
-            attached_ifaces,
             Arc::clone(&degradations),
+            handoff,
         )
-    } else {
-        None
-    };
-    #[cfg(feature = "ebpf")]
-    control_plane.set_iface_watcher(iface_watcher);
+    }));
 
     // Wire GroupManager into DNS outbound selection (Selector/URLTest/…).
     dns_upstream_pool.set_group_manager(Some(control_plane.group_manager()));
