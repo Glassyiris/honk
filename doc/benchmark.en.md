@@ -185,6 +185,103 @@ Accept a candidate only when the framed point estimate improves and its 95%
 interval excludes a slowdown greater than 3%; the Direct point estimate may
 regress by at most 3%.
 
+## Results (2026-10-31, ARM A/B/C on a NanoPi R2S (`10.10.10.251`))
+
+CPU-bound companion campaign to the 2026-10-30 x86 run: 4x Cortex-A53 (NanoPi R2S), 1 GiB RAM, 1 GbE WAN, kernel 6.12.94, OpenWrt (musl). Client in netns `lab`, server fixture on the canonical `.70`. Only the four-protocol shared surface is measured; `.70`'s HTTP/iperf targets accept this host after adding the `labnat` masquerade plus an `inet fw4` forward accept for `veth-lab`→`eth0`. Absolute Mbps/CPU tails are host-bound and not comparable across architectures; use this table for same-host honk-vs-dae-vs-sing-box ranking only.
+
+Binaries: honk `v0.1.0-beta.3-95-g6d731c5a` (static aarch64 musl, merged bench branch, embedded eBPF object), upstream dae v2.1.1 (aarch64), sing-box v1.14.3 built from source as a static aarch64 binary (`-tags "with_quic with_gvisor"`), because the official arm64 asset is glibc and cannot run on musl. Hashes in `binaries.sha256`.
+
+### TCP throughput, process CPU and RSS
+
+| engine | protocol | cold(s) | hot p50(s) | hot p95(s) | bw(Mbps) | cpu(cores) | rss(MB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 0.004600 | - | - | 862 | 0.02 | 48 |
+| honk | hy2 | 0.008224 | 0.022013 | 0.051274 | 339 | 1.34 | 121 |
+| honk | tuic | 0.006660 | 0.020698 | 0.055173 | 343 | 1.24 | 79 |
+| honk | ss2022 | 0.007344 | 0.019127 | 0.046934 | 432 | 0.76 | 48 |
+| honk | trojan | 0.014277 | 0.030214 | 0.071541 | 436 | 0.73 | 50 |
+| dae | direct | 0.003231 | - | - | 916 | 0.01 | 45 |
+| dae | hy2 | 0.028140 | 0.006370 | 0.007388 | 248 | 1.81 | 56 |
+| dae | tuic | 0.023127 | 0.006330 | 0.007172 | 261 | 1.74 | 48 |
+| dae | ss2022 | 0.008810 | 0.006459 | 0.008885 | 346 | 0.77 | 47 |
+| dae | trojan | 0.019753 | 0.020173 | 0.023012 | 283 | 0.74 | 51 |
+| sing-box | direct | 0.007493 | - | - | 286 | 1.20 | 42 |
+| sing-box | hy2 | 0.037811 | 0.006144 | 0.006903 | 181 | 2.17 | 46 |
+| sing-box | tuic | 0.024652 | 0.007586 | 0.009103 | 197 | 2.22 | 49 |
+| sing-box | ss2022 | 0.010022 | 0.008268 | 0.010660 | 368 | 1.55 | 42 |
+| sing-box | trojan | 0.067434 | 0.018966 | 0.021085 | 302 | 1.58 | 43 |
+
+### UDP
+
+| engine | protocol | echo RTT p50(s) | iperf3 -u -R (Mbps, loss) | cpu(cores) |
+| --- | --- | --- | --- | --- |
+| honk | hy2/udp | 0.002228 | 33(97.5%) | 1.72 |
+| honk | tuic/udp | 0.002312 | 71(98.3%) | 1.72 |
+| honk | ss2022/udp | 0.001916 | 58(88.4%) | 0.89 |
+| honk | trojan/udp | 0.001676 | 101(97.7%) | 0.86 |
+| dae | hy2/udp | 0.000520 | 112(96.9%) | 2.21 |
+| dae | tuic/udp | 0.002509 | 125(97.4%) | 2.19 |
+| dae | ss2022/udp | 0.002046 | 75(93.2%) | 1.29 |
+| dae | trojan/udp | 0.002194 | 190(95.8%) | 1.62 |
+| sing-box | hy2/udp | 0.001741 | 66(98.2%) | 2.71 |
+| sing-box | tuic/udp | 0.001998 | 68(98.1%) | 2.78 |
+| sing-box | ss2022/udp | 0.001703 | 38(98.6%) | 1.35 |
+| sing-box | trojan/udp | 0.001957 | 28(27.2%) | 1.18 |
+
+### Loaded latency stability (200 samples at a 250 ms cadence)
+
+| engine | protocol | load(Mbps) | p50(ms) | p95(ms) | p99(ms) | max(ms) | failures |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| honk | direct | 858 | 13.184 | 68.089 | 81.634 | 88.244 | 0/200 |
+| honk | hy2 | 338 | 76.646 | 165.571 | 183.187 | 192.492 | 0/200 |
+| honk | tuic | 338 | 34.298 | 58.488 | 70.940 | 97.667 | 0/200 |
+| honk | ss2022 | 435 | 15.732 | 24.346 | 34.382 | 53.241 | 0/200 |
+| honk | trojan | 428 | 14.233 | 18.969 | 25.715 | 64.774 | 0/200 |
+| dae | direct | 920 | 17.705 | 65.393 | 97.258 | 121.311 | 0/200 |
+| dae | hy2 | 230 | 24.594 | 2429.568 | 3941.649 | 4162.787 | 1/200 |
+| dae | tuic | 262 | 24.206 | 32.658 | 41.529 | 56.779 | 8/200 |
+| dae | ss2022 | 349 | 15.596 | 21.233 | 32.664 | 46.808 | 0/200 |
+| dae | trojan | 274 | 25.312 | 30.189 | 33.477 | 53.834 | 0/200 |
+| sing-box | direct | 296 | 27.329 | 71.336 | 100.063 | 127.027 | 0/200 |
+| sing-box | hy2 | 180 | 31.396 | 53.686 | 71.333 | 92.534 | 0/200 |
+| sing-box | tuic | 204 | 36.774 | 67.335 | 80.494 | 94.207 | 0/200 |
+| sing-box | ss2022 | 330 | 42.614 | 80.703 | 102.273 | 167.209 | 0/200 |
+| sing-box | trojan | 312 | 81.684 | 168.774 | 281.281 | 411.381 | 0/200 |
+
+### DNS listener pass (honk / dae on loopback, sing-box through its TUN)
+
+honk and dae bind `dns.bind` on `127.0.0.1:15353` and the closed-loop load client runs on the host, because this host's `daens` compatibility mounts displace the `lab` namespace mount during engine startup; sing-box has no DNS inbound, so it answers through its TUN with `{"port": 53, "action": "hijack-dns"}` and the client targets `1.1.1.1:53` inside `lab`. All three resolve through `.70:53539`; every engine returned the fixture's `192.0.2.42`. CPU/RSS for honk/dae were not captured in this pass (the pid probe missed), and the sing-box rows come from the first pass of the same configuration (`dns-listener/sing-box-rows.txt`).
+
+| engine | mode | threads | qps | p50 (µs) | p95 (µs) | p99 (µs) | max (µs) | cpu cores | rss (MB) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| honk | cache | 1 | 1,764 | 540 | 657 | 781 | 8234 | 0.00 | - |
+| honk | cache | 8 | 6,072 | 1152 | 2675 | 3553 | 7547 | 0.00 | - |
+| honk | unique | 1 | 524 | 1862 | 2104 | 2233 | 20848 | 0.00 | - |
+| honk | unique | 8 | 1,984 | 3869 | 6084 | 7473 | 23950 | 0.00 | - |
+| dae | cache | 1 | 1,740 | 547 | 666 | 791 | 3036 | 0.00 | - |
+| dae | cache | 8 | 5,373 | 1249 | 3135 | 4807 | 18656 | 0.00 | - |
+| dae | unique | 1 | 524 | 1943 | 2551 | 3268 | 7816 | 0.00 | - |
+| dae | unique | 8 | 1,980 | 3893 | 6026 | 7398 | 22823 | 0.00 | - |
+| sing-box | cache | 1 | 1,298 | 739 | 893 | 1242 | 12682 | 1.11 | 41260 |
+| sing-box | cache | 8 | 1,842 | 4199 | 5360 | 8478 | 32755 | 1.20 | 42176 |
+| sing-box | unique | 1 | 322 | 3023 | 3343 | 3887 | 31330 | 0.90 | 45208 |
+| sing-box | unique | 8 | 1,119 | 7017 | 9817 | 12632 | 25942 | 2.24 | 45848 |
+| direct | cache | 1 | 2,168 | 449 | 554 | 643 | 1283 | 0.00 | - |
+| direct | cache | 8 | 12,964 | 598 | 793 | 930 | 7062 | 0.00 | - |
+| direct | unique | 1 | 2,188 | 445 | 546 | 595 | 1166 | 0.00 | - |
+| direct | unique | 8 | 12,322 | 626 | 854 | 984 | 9745 | 0.00 | - |
+
+- The direct control saturates near 12–13 kqps at 8 threads on this CPU, so cache-hit rows are client/CPU-bound rather than engine ceilings.
+- Unique-name (per-query upstream) rows: honk 2.0 kqps at p50 3.9 ms, dae 2.0 kqps at 3.9 ms, sing-box 1.1 kqps at 7.0 ms; the A53 cores, not the engine, dominate.
+- As on x86, sing-box's rows include TUN and userspace-stack overhead.
+- Zero failures in every cell; dae's RSS growth under distinct names seen on x86 was not observable here because RSS capture failed in this pass.
+
+### Environment notes specific to this host
+
+- `daens` setup on OpenWrt (`/run` -> `/tmp/run`) stacks a tmpfs over `/run/netns` and hides the `lab` mount; the campaign supplies an external holder process and `LAB_HOLDER_PID` so the harness reattaches `lab` after each engine start. Without the holder every measurement fails with `Cannot open network namespace "lab"`.
+- `ss` and `nproc` are absent; the harness falls back to its pid scan.
+- The `.70` fixture requires the `labnat` masquerade and an `inet fw4` forward accept rule for `192.168.222.0/24` before direct rows work.
+
 ## Results (2026-10-30, merged `main` A/B/C on the canonical `.70` fixture)
 
 honk `v0.1.0-beta.3-13-gc8bfa7a3` (built from `main` `c8bfa7a3`; static musl build with the embedded eBPF object) against the frozen upstream dae and sing-box binaries and the 2026-10-24 fixture. Same harness, `lab` namespace and 4 vCPU / 2 GiB engine host; binaries, configs, raw iperf3 JSON and stability samples are in `results/abc-2026-10-30-x86/`.

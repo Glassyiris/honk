@@ -1,0 +1,6 @@
+# sing-box DNS listener rows, captured from the first 2026-10-31 loop run (17:45Z),
+# before the honk/dae rerun truncated results-loop.tsv. Same host/config/client.
+sing-box|cache 1 1298 19475 0 739 893 1242 12682|1.11|41260
+sing-box|cache 8 1842 27629 0 4199 5360 8478 32755|1.20|42176
+sing-box|unique 1 322 4827 0 3023 3343 3887 31330|0.90|45208
+sing-box|unique 8 1119 16792 0 7017 9817 12632 25942|2.24|45848

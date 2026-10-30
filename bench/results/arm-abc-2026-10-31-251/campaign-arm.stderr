@@ -1,0 +1,8 @@
+# host=OpenWrt arch=aarch64 kernel=6.12.94
+# honk_bin=/tmp/eries-bench-arm-20261030/bin/honk-core sha256=414859c023b4a8ff251d1e03bec307812540a1fd39748c53a8f2992365b856ac
+# dae_bin=/tmp/eries-bench-arm-20261030/bin/dae sha256=e9a9cff0cc17f1445819f9e0062dec5a8f520a10885eb6deccec6fffa80842cb
+# sing_box_bin=/tmp/eries-bench-arm-20261030/bin/sing-box sha256=14ce2002735178b8c20b9dcb085e4345bb99b5781e9ee1ab7445afdc3c38ac57
+# lab-bench 2026-10-30T16:52:20Z engines=(honk dae sing-box) protos=(hy2 tuic ss2022 trojan)
+# engine=honk
+# engine=dae
+# engine=sing-box

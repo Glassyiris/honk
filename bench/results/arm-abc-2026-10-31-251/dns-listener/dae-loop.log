@@ -1,0 +1,6 @@
+[2026-10-31 01:49:31]  WARN so_mark_from_dae is unset; using internal socket mark 0x100 to prevent dae UDP self-capture
+[2026-10-31 01:49:36]  WARN Network is not reachable yet (Get "http://www.qualcomm.cn/generate_204": context deadline exceeded (Client.Timeout exceeded while awaiting headers)); retrying for up to 5m0s.
+[2026-10-31 01:50:01]  WARN Kernel does not support bpf_get_current_task helper: FnGetCurrentTask for program type CGroupSockAddr not supported; process names may be truncated or less accurate (degraded to bpf_get_current_comm)
+[2026-10-31 01:50:05]  WARN AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.
+[2026-10-31 01:50:05] ERROR Failed to start DNS listener: failed to bind DNS UDP listener on 127.0.0.1:15353: listen udp 127.0.0.1:15353: bind: address already in use
+[2026-10-31 01:50:05] FATAL bind LAN interface veth-lab: attach interface veth-lab: send_directs on veth-lab is on: /proc/sys/net/ipv4/conf/veth-lab/send_redirects; see docs of dae for help

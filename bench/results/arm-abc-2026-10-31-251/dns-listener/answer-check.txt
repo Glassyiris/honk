@@ -1,0 +1,3 @@
+honk answered A=192.0.2.42
+dae answered A=192.0.2.42
+sing-box answered A=192.0.2.42

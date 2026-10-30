@@ -1,0 +1,27 @@
+[2026-10-31 01:14:56]  INFO Include config files: [/tmp/eries-bench-arm-20261030/dae-lab.dae]
+[2026-10-31 01:14:56]  WARN so_mark_from_dae is unset; using internal socket mark 0x100 to prevent dae UDP self-capture
+[2026-10-31 01:14:56]  INFO purging stale TC filters before startup
+[2026-10-31 01:14:56]  INFO Waiting for network...
+[2026-10-31 01:14:56]  INFO Network online.
+[2026-10-31 01:14:56]  INFO Network check took 60.064368ms (1 attempt(s))
+[2026-10-31 01:14:56]  INFO Building control plane and routing rules...
+[2026-10-31 01:14:56]  INFO Kernel v6.12.94 supports Netkit, attempting to create Netkit device pair
+[2026-10-31 01:14:56]  INFO Successfully created Netkit device pair dae0 <-> dae0peer via netlink API (scrub=true)
+[2026-10-31 01:14:56]  INFO Successfully created Netkit device pair dae0 <-> dae0peer using netlink API
+[2026-10-31 01:14:56]  INFO Successfully created Netkit device pair (performance mode)
+[2026-10-31 01:14:56]  INFO Loading eBPF programs and maps into the kernel...
+[2026-10-31 01:14:56]  INFO The loading process takes about 120MB free memory, which will be released after loading. Insufficient memory will cause loading failure.
+[2026-10-31 01:14:56]  WARN Kernel does not support bpf_get_current_task helper: FnGetCurrentTask for program type CGroupSockAddr not supported; process names may be truncated or less accurate (degraded to bpf_get_current_comm)
+[2026-10-31 01:14:58]  INFO Loaded eBPF programs and maps
+[2026-10-31 01:14:58]  WARN AllowInsecure is enabled, but it is not recommended. Please make sure you have to turn it on.
+[2026-10-31 01:14:58]  INFO Optimizing and loading routing rules (this may take a while for large rule sets)...
+[2026-10-31 01:14:58]  INFO Building routing matcher...
+[2026-10-31 01:14:58]  INFO Loading routing rules into kernel space (BPF)...
+[2026-10-31 01:14:58]  INFO Routing match set len: 25/1024
+[2026-10-31 01:14:58]  INFO Building userspace routing matcher...
+[2026-10-31 01:14:58]  INFO Health check will only verify 7 outbounds referenced by routing rules: [proxy-hy2 proxy-tuic proxy-ss2022 proxy-trojan proxy-anytls-sb proxy-anytls-go direct]
+[2026-10-31 01:14:58]  INFO Memory usage after routing build: Alloc=5MiB, Sys=37MiB, HeapObjects=15171
+[2026-10-31 01:14:58]  INFO Bind to LAN: veth-lab
+[2026-10-31 01:14:58]  INFO Bind to WAN: eth0
+[2026-10-31 01:14:59]  INFO Control plane built in 3.106266846s
+[2026-10-31 01:14:59]  INFO Total startup time: 3.167825472s
