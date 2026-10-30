@@ -311,7 +311,7 @@ Client-visible DNS service from the `lab` namespace, using a closed-loop UDP loa
 | direct (no engine) | unique | 1 | 18,574 | 50 | 71 | 129 | 2514 | 0.00 | - |
 | direct (no engine) | unique | 8 | 183,355 | 41 | 53 | 76 | 4154 | 0.00 | - |
 
-- The direct control (client to fixture, no engine) saturates near 185–187 kqps at 8 threads, so cache-mode cells at or above that are client/CPU-bound rather than engine ceilings.
+- The direct control (client to fixture, no engine) tops out near 185–187 kqps at 8 threads. honk's cache-hit path deliberately exceeds that (it answers from its own cache), so cache-mode rows measure each engine's local answer path; the unique-name rows stay below the direct ceiling and are the upstream-bound comparison.
 - Cache-hit answers: honk 271 kqps at p50 23 µs, dae 211 kqps at 30 µs, sing-box 112 kqps at 57 µs.
 - Unique-name (per-query upstream) path: honk 81.6 kqps at p50 85 µs, dae 63.1 kqps at 108 µs, sing-box 36.7 kqps at 188 µs; all remain below the 183 kqps direct ceiling, i.e. the engines add measurable per-query cost over the raw fixture.
 - dae's RSS rises to 247–280 MB under unique-name load (its name cache grows with distinct names); honk stays at 62–63 MB and sing-box at 98–100 MB.

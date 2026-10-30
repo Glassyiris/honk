@@ -288,7 +288,7 @@ Both sides build `cargo bench -p honk-core --features dns-bench --bench dns` (he
 | direct（无引擎） | unique | 1 | 18,574 | 50 | 71 | 129 | 2514 | 0.00 | - |
 | direct（无引擎） | unique | 8 | 183,355 | 41 | 53 | 76 | 4154 | 0.00 | - |
 
-- 直接上游对照（客户端直连 fixture，不经引擎）在 8 线程下约 185–187 kqps 饱和，因此 cache 模式中达到或超过该值的格子受客户端/CPU 限制，而不是引擎上限。
+- 直接上游对照（客户端直连 fixture，不经引擎）在 8 线程下上限约 185–187 kqps。honk 的缓存命中路径有意超过该值（由自身缓存应答），因此 cache 行衡量的是各引擎的本地应答路径；unique 行低于直连上限，才是受上游限制的对比。
 - 缓存命中：honk 271 kqps（p50 23 µs），dae 211 kqps（30 µs），sing-box 112 kqps（57 µs）。
 - 唯一域名（每查询一次上游）路径：honk 81.6 kqps（p50 85 µs），dae 63.1 kqps（108 µs），sing-box 36.7 kqps（188 µs）；均低于 183 kqps 的直连上限，说明引擎相对裸 fixture 有可测的每查询成本。
 - dae 在唯一域名负载下 RSS 升至 247–280 MB（其名称缓存随不同域名增长）；honk 维持 62–63 MB，sing-box 98–100 MB。
