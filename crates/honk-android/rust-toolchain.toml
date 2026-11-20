@@ -1,0 +1,6 @@
+# Same compiler as the workspace (the root rust-toolchain.toml).
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-linux-android"]
+profile = "minimal"

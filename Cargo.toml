@@ -12,7 +12,7 @@ members = [
     "crates/honk-core",
     "crates/honk-tool",
 ]
-exclude = ["crates/honk-ebpf", "fuzz"]
+exclude = ["crates/honk-ebpf", "crates/honk-android", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"
