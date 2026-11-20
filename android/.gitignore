@@ -1,0 +1,8 @@
+tunbench/.gradle/
+tunbench/build/
+tunbench/app/build/
+tunbench/app/.cxx/
+tunbench/local.properties
+scripts/out/
+scripts/runs/
+*.apk
