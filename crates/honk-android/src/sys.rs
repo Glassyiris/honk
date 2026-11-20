@@ -64,6 +64,24 @@ pub fn log_error(msg: &str) {
     log(6, msg);
 }
 
+/// Routes the `log` crate, where jni's error policies write, to logcat under the same tag. It
+/// runs when the library is loaded, from `.init_array` as a C constructor does, so the library
+/// needs no `JNI_OnLoad` export.
+#[cfg(target_os = "android")]
+#[used]
+// SAFETY: `.init_array` holds `extern "C" fn()` pointers, which the dynamic linker calls once.
+#[unsafe(link_section = ".init_array")]
+static ROUTE_LOG: extern "C" fn() = {
+    extern "C" fn route_log() {
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_tag("HonkEngine")
+                .with_max_level(log::LevelFilter::Warn),
+        );
+    }
+    route_log
+};
+
 // ---- fds ----
 
 pub fn set_nonblocking(fd: RawFd) -> io::Result<()> {

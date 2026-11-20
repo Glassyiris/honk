@@ -1,84 +1,108 @@
 //! honk's Android VpnService integration: honk-netstack as a transparent TCP terminator on the
 //! tun fd, relaying every flow to one fixed upstream. JNI surface of `dev.tunbench.HonkEngine`,
 //! plus thread helpers (affinity, naming, /proc telemetry) that the hev path uses as well.
+//!
+//! Each native method is declared with `native_method!`, which checks it against its Java
+//! signature and catches panics; errors are logged and the Java side gets the default value
+//! (false, 0, null), as it did before. The macro's ABI check in jni-macros 0.22.4 expands to
+//! `AtomicBool::fetch_update`, deprecated since Rust 1.99, hence `allow(deprecated)` on each.
 
 pub mod engine;
 pub mod sys;
 
-use jni::JNIEnv;
-use jni::objects::{JClass, JString};
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlongArray, jstring};
-use std::ptr;
+use jni::errors::{LogErrorAndDefault, Result};
+use jni::objects::{JClass, JLongArray, JString};
+use jni::sys::jint;
+use jni::{Env, NativeMethod, native_method};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
 
 static ENGINE: Mutex<Option<engine::Handle>> = Mutex::new(None);
 
-fn get_string(env: &mut JNIEnv, s: &JString) -> String {
-    if s.is_null() {
-        return String::new();
-    }
-    env.get_string(s).map(Into::into).unwrap_or_default()
+/// A Java string argument; null (or unreadable) reads as empty.
+fn get_string(env: &Env, s: &JString) -> String {
+    s.try_to_string(env).unwrap_or_default()
 }
 
-fn new_string(env: &mut JNIEnv, s: &str) -> jstring {
-    env.new_string(s).map_or(ptr::null_mut(), |s| s.into_raw())
-}
+#[allow(deprecated)]
+const _: NativeMethod = native_method! {
+    java_type = "dev.tunbench.HonkEngine",
+    static fn start(
+        tun_fd: jint,
+        mtu: jint,
+        target_host: JString,
+        target_port: jint,
+        cpu_list: JString,
+    ) -> jboolean,
+    export = "Java_dev_tunbench_HonkEngine_start",
+    error_policy = LogErrorAndDefault,
+};
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tunbench_HonkEngine_start<'l>(
-    mut env: JNIEnv<'l>,
-    _class: JClass<'l>,
+fn start<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
     tun_fd: jint,
     mtu: jint,
-    target_host: JString<'l>,
+    target_host: JString<'local>,
     target_port: jint,
-    cpu_list: JString<'l>,
-) -> jboolean {
-    let host = get_string(&mut env, &target_host);
-    let cpus = get_string(&mut env, &cpu_list);
+    cpu_list: JString<'local>,
+) -> Result<bool> {
+    let host = get_string(env, &target_host);
+    let cpus = get_string(env, &cpu_list);
     let mut slot = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
     if slot.is_some() {
         sys::log_error("start: already running");
-        return JNI_FALSE;
+        return Ok(false);
     }
     match engine::Params::parse(tun_fd, mtu, &host, target_port, &cpus).and_then(engine::start) {
         Ok(handle) => {
             *slot = Some(handle);
-            JNI_TRUE
+            Ok(true)
         }
         Err(e) => {
             sys::log_error(&format!("start: {e}"));
-            JNI_FALSE
+            Ok(false)
         }
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tunbench_HonkEngine_stop<'l>(_env: JNIEnv<'l>, _class: JClass<'l>) {
+#[allow(deprecated)]
+const _: NativeMethod = native_method! {
+    java_type = "dev.tunbench.HonkEngine",
+    static fn stop() -> void,
+    export = "Java_dev_tunbench_HonkEngine_stop",
+    error_policy = LogErrorAndDefault,
+};
+
+fn stop<'local>(_env: &mut Env<'local>, _class: JClass<'local>) -> Result<()> {
     let handle = ENGINE.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(h) = handle {
         h.stop();
     }
+    Ok(())
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tunbench_HonkEngine_isRunning<'l>(
-    _env: JNIEnv<'l>,
-    _class: JClass<'l>,
-) -> jboolean {
-    if engine::SHARED.running.load(Relaxed) {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
-    }
+#[allow(deprecated)]
+const _: NativeMethod = native_method! {
+    java_type = "dev.tunbench.HonkEngine",
+    static fn is_running() -> jboolean,
+    export = "Java_dev_tunbench_HonkEngine_isRunning",
+    error_policy = LogErrorAndDefault,
+};
+
+fn is_running<'local>(_env: &mut Env<'local>, _class: JClass<'local>) -> Result<bool> {
+    Ok(engine::SHARED.running.load(Relaxed))
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tunbench_HonkEngine_stats<'l>(
-    env: JNIEnv<'l>,
-    _class: JClass<'l>,
-) -> jlongArray {
+#[allow(deprecated)]
+const _: NativeMethod = native_method! {
+    java_type = "dev.tunbench.HonkEngine",
+    static fn stats() -> jlong[],
+    export = "Java_dev_tunbench_HonkEngine_stats",
+    error_policy = LogErrorAndDefault,
+};
+
+fn stats<'local>(env: &mut Env<'local>, _class: JClass<'local>) -> Result<JLongArray<'local>> {
     let s = &engine::SHARED;
     let values = [
         s.tx_packets.load(Relaxed) as i64,
@@ -86,45 +110,59 @@ pub extern "system" fn Java_dev_tunbench_HonkEngine_stats<'l>(
         s.rx_packets.load(Relaxed) as i64,
         s.rx_bytes.load(Relaxed) as i64,
     ];
-    let Ok(array) = env.new_long_array(values.len() as i32) else {
-        return ptr::null_mut();
-    };
-    if env.set_long_array_region(&array, 0, &values).is_err() {
-        return ptr::null_mut();
-    }
-    array.into_raw()
+    let array = env.new_long_array(values.len())?;
+    array.set_region(env, 0, &values)?;
+    Ok(array)
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tunbench_HonkEngine_workerTid<'l>(
-    _env: JNIEnv<'l>,
-    _class: JClass<'l>,
-) -> jint {
-    engine::SHARED.tid.load(Relaxed)
+#[allow(deprecated)]
+const _: NativeMethod = native_method! {
+    java_type = "dev.tunbench.HonkEngine",
+    static fn worker_tid() -> jint,
+    export = "Java_dev_tunbench_HonkEngine_workerTid",
+    error_policy = LogErrorAndDefault,
+};
+
+fn worker_tid<'local>(_env: &mut Env<'local>, _class: JClass<'local>) -> Result<jint> {
+    Ok(engine::SHARED.tid.load(Relaxed))
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tunbench_HonkEngine_workerAffinity<'l>(
-    mut env: JNIEnv<'l>,
-    _class: JClass<'l>,
-) -> jstring {
+#[allow(deprecated)]
+const _: NativeMethod = native_method! {
+    java_type = "dev.tunbench.HonkEngine",
+    static fn worker_affinity() -> JString,
+    export = "Java_dev_tunbench_HonkEngine_workerAffinity",
+    error_policy = LogErrorAndDefault,
+};
+
+fn worker_affinity<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+) -> Result<JString<'local>> {
     let a = engine::SHARED
         .affinity
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    new_string(&mut env, &a)
+    env.new_string(a)
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tunbench_HonkEngine_prepareThread<'l>(
-    mut env: JNIEnv<'l>,
-    _class: JClass<'l>,
-    cpu_list: JString<'l>,
-    name: JString<'l>,
-) -> jstring {
-    let cpus = get_string(&mut env, &cpu_list);
-    let name = get_string(&mut env, &name);
+#[allow(deprecated)]
+const _: NativeMethod = native_method! {
+    java_type = "dev.tunbench.HonkEngine",
+    static fn prepare_thread(cpu_list: JString, name: JString) -> JString,
+    export = "Java_dev_tunbench_HonkEngine_prepareThread",
+    error_policy = LogErrorAndDefault,
+};
+
+fn prepare_thread<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    cpu_list: JString<'local>,
+    name: JString<'local>,
+) -> Result<JString<'local>> {
+    let cpus = get_string(env, &cpu_list);
+    let name = get_string(env, &name);
     let result = sys::parse_cpu_list(&cpus)
         .and_then(|list| {
             if list.is_empty() {
@@ -146,34 +184,51 @@ pub extern "system" fn Java_dev_tunbench_HonkEngine_prepareThread<'l>(
             format!("error: sched_setaffinity({cpus}): {e}")
         }
     };
-    new_string(&mut env, &out)
+    env.new_string(out)
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tunbench_HonkEngine_gettid<'l>(
-    _env: JNIEnv<'l>,
-    _class: JClass<'l>,
-) -> jint {
-    sys::gettid()
+#[allow(deprecated)]
+const _: NativeMethod = native_method! {
+    java_type = "dev.tunbench.HonkEngine",
+    static fn gettid() -> jint,
+    export = "Java_dev_tunbench_HonkEngine_gettid",
+    error_policy = LogErrorAndDefault,
+};
+
+fn gettid<'local>(_env: &mut Env<'local>, _class: JClass<'local>) -> Result<jint> {
+    Ok(sys::gettid())
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tunbench_HonkEngine_findThread<'l>(
-    mut env: JNIEnv<'l>,
-    _class: JClass<'l>,
-    name: JString<'l>,
+#[allow(deprecated)]
+const _: NativeMethod = native_method! {
+    java_type = "dev.tunbench.HonkEngine",
+    static fn find_thread(name: JString, exclude: jint) -> jint,
+    export = "Java_dev_tunbench_HonkEngine_findThread",
+    error_policy = LogErrorAndDefault,
+};
+
+fn find_thread<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    name: JString<'local>,
     exclude: jint,
-) -> jint {
-    let name = get_string(&mut env, &name);
-    sys::find_thread(&name, exclude).unwrap_or(0)
+) -> Result<jint> {
+    let name = get_string(env, &name);
+    Ok(sys::find_thread(&name, exclude).unwrap_or(0))
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tunbench_HonkEngine_telemetry<'l>(
-    mut env: JNIEnv<'l>,
-    _class: JClass<'l>,
+#[allow(deprecated)]
+const _: NativeMethod = native_method! {
+    java_type = "dev.tunbench.HonkEngine",
+    static fn telemetry(tid: jint) -> JString,
+    export = "Java_dev_tunbench_HonkEngine_telemetry",
+    error_policy = LogErrorAndDefault,
+};
+
+fn telemetry<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
     tid: jint,
-) -> jstring {
-    let line = sys::telemetry(tid);
-    new_string(&mut env, &line)
+) -> Result<JString<'local>> {
+    env.new_string(sys::telemetry(tid))
 }
