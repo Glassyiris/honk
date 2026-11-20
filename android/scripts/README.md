@@ -33,6 +33,7 @@ results are not a performance gate.
   `android/tunbench/local.properties`).
 - rustup with the repository's toolchain and the `aarch64-linux-android` target:
   `rustup target add aarch64-linux-android`.
+- cargo-ndk 4.1.2: `cargo install cargo-ndk --version 4.1.2 --locked`.
 - The hev submodule: `git submodule update --init --recursive`.
 - On the phone, for the VpnService runs: USB debugging, Termux with `openssh`, `iperf3` and
   `tmux`, and a SOCKS5 redirector for hev. The redirector serves SOCKS5 and connects every
@@ -40,17 +41,19 @@ results are not a performance gate.
 
 ## Build
 
-`android-env.sh` sets the NDK linker variables for cargo. Source it, then build:
-
 ```sh
-. android/scripts/android-env.sh
-android/scripts/build-netstack-bench.sh       # tcp_bulk, tcp_bulk-native, netstack-criterion -> android/scripts/out/
 (cd android/tunbench && ./gradlew assembleDebug)
+android/scripts/build-netstack-bench.sh       # tcp_bulk, tcp_bulk-native, netstack-criterion -> android/scripts/out/
 ```
 
-The Gradle build runs the `buildHonkEngine` task, which calls `crates/honk-android/build-android.sh`
-to build `libhonkengine.so`. It builds hev with ndk-build. The APK is
-`android/tunbench/app/build/outputs/apk/debug/app-debug.apk`.
+The Gradle build takes the NDK from the Android Gradle plugin and needs no environment script.
+`build-netstack-bench.sh` sources `android-env.sh` itself, which sets the NDK linker variables for
+cargo: set `ANDROID_HOME` (default `$HOME/Android/Sdk`) and, on a non-Linux host, `NDK_HOST_TAG`
+before running it.
+
+The Gradle build runs the `buildHonkEngine` task, which runs `cargo ndk` in `crates/honk-android`
+with the Android Gradle plugin's NDK to build `libhonkengine.so`. It builds hev with ndk-build.
+The APK is `android/tunbench/app/build/outputs/apk/debug/app-debug.apk`.
 
 `crates/honk-android` is not a workspace member and has its own `Cargo.lock`. Its relay test runs
 on the build host: `cd crates/honk-android && cargo test --release`.

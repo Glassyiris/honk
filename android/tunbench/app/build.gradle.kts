@@ -1,27 +1,27 @@
-import java.util.Properties
-
 plugins {
     id("com.android.application")
 }
 
 val ndkVer = "30.0.16248370"
-val sdkDir: String = Properties().run {
-    rootProject.file("local.properties").takeIf { it.exists() }?.reader()?.use { load(it) }
-    getProperty("sdk.dir") ?: System.getenv("ANDROID_HOME") ?: error("set sdk.dir or ANDROID_HOME")
-}
 
-// libhonkengine.so (Rust, crates/honk-android) is built by cargo and packaged as a prebuilt jniLib.
+// libhonkengine.so (Rust, crates/honk-android) is built by cargo-ndk and packaged as a prebuilt jniLib.
 val honkEngineDir = rootProject.file("../../crates/honk-android")
 val honkJniLibs = layout.buildDirectory.dir("honk-jniLibs").get().asFile
+val cargoBin = (System.getenv("CARGO_HOME") ?: "${System.getProperty("user.home")}/.cargo") + "/bin"
+// rustup's default location when present, so a Gradle daemon started without cargo on PATH works.
+val cargo = File(cargoBin, "cargo").takeIf { it.canExecute() }?.path ?: "cargo"
+val ndkDir = androidComponents.sdkComponents.ndkDirectory
 val buildHonkEngine = tasks.register<Exec>("buildHonkEngine") {
-    description = "Builds libhonkengine.so for arm64-v8a with cargo and the NDK."
-    workingDir = honkEngineDir
+    description = "Builds libhonkengine.so for arm64-v8a with cargo-ndk and the NDK."
+    workingDir = honkEngineDir // rustup reads rust-toolchain.toml from the working directory
     commandLine(
-        "bash", honkEngineDir.resolve("build-android.sh").absolutePath,
-        honkJniLibs.absolutePath, "$sdkDir/ndk/$ndkVer",
+        cargo, "ndk", "-t", "arm64-v8a", "--platform", "29",
+        "-o", honkJniLibs.absolutePath, "build", "--release", "--locked",
     )
+    environment("PATH", cargoBin + File.pathSeparator + System.getenv("PATH"))
+    doFirst { environment("ANDROID_NDK_HOME", ndkDir.get().asFile.absolutePath) }
     outputs.dir(honkJniLibs)
-    // cargo tracks its own inputs (including the honk-netstack path dependency).
+    // Always runs: Cargo decides what to rebuild (it tracks the honk-netstack path dependency).
     outputs.upToDateWhen { false }
 }
 tasks.named("preBuild") { dependsOn(buildHonkEngine) }
