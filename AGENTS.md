@@ -47,6 +47,7 @@ Maintaining this guide: a rule that binds every change goes in this file; a subs
 ├── doc/                      # en/ + zh/ doc trees: guide, design/, reference/, operations/; migration/{en,zh}/<tag>.md
 ├── ci/                       # zigcc/zigcxx: zig cc/c++ wrappers for cross builds (strip CMake's clang-style --target from boring-sys ASM rules + rustc's aarch64 errata linker args; used by build-musl and the release workflow); zig-bindgen-env: derive BINDGEN_EXTRA_CLANG_ARGS from `zig cc -E -v` for cross bindgen
 ├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release
+├── android/                  # tunbench/: TunBench VpnService benchmark app (Gradle; hev-socks5-tunnel submodule); scripts/: build and adb drivers, README
 └── crates/
     ├── honk-config           # Config schema + dae-syntax parser + share links (workspace member)
     ├── honk-ebpf-common      # no_std shared eBPF/userspace types (workspace member)
@@ -57,7 +58,8 @@ Maintaining this guide: a rule that binds every change goes in this file; a subs
     ├── honk-outbound         # Proxy handlers, groups, health checks (workspace member)
     ├── honk-core             # eBPF proxy engine, library + `honk-core` binary (workspace member)
     ├── honk-tool             # `honk-tool` CLI toolbox: `sub` subscription/node probing (workspace member)
-    └── honk-ebpf             # Kernel eBPF programs (EXCLUDED from workspace, own Cargo.lock)
+    ├── honk-ebpf             # Kernel eBPF programs (EXCLUDED from workspace, own Cargo.lock)
+    └── honk-android          # Android VpnService integration on honk-netstack (JNI, libhonkengine.so; EXCLUDED from workspace, own Cargo.lock)
 ```
 
 Notable absences (referenced by older docs but **not in this tree**): `Makefile`, `scripts/`, `plan.md`, `run_tests.sh`, `test-honk.sh`, `log/`, and the vendored reference checkouts (`honk/`, `outbound/`, `sing-box/` — these paths are `.gitignore`d). The old `run` / `deploy` / `docker*` recipes were removed with those missing files; use `run-debug`, `run-dae`, and `deploy-vyos`. `test-routing` and its dependent `test-netns` share one complete disposable-VM gate; prepare its toolchain, objects and environment through `honk-real-ebpf-tests` rather than attaching root-cgroup hooks on a shared host.
