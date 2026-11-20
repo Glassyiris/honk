@@ -1,4 +1,10 @@
-//! Thin libc wrappers: fds, epoll, timers, sockets, affinity, logcat and /proc telemetry.
+//! Thin libc wrappers: fds, epoll, timers, sockets, affinity, logcat and clocks; `task` adds the
+//! per-thread /proc readings. Every `unsafe` block of the crate is here, each with its SAFETY
+//! comment. Any thread may call these; they block only as far as the fd they are given does.
+
+mod task;
+
+pub use task::{Thread, ThreadSample, cpuset, telemetry};
 
 use std::ffi::CString;
 use std::fmt::Write as _;
@@ -307,6 +313,26 @@ pub fn so_error(fd: RawFd) -> io::Result<i32> {
     Ok(v)
 }
 
+/// Waits without a timeout until the connect `tcp_connect` started on `fd` ends; Err if it
+/// failed. A shutdown of the socket from another thread ends it.
+pub fn wait_connected(fd: RawFd) -> io::Result<()> {
+    let mut p = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: p is valid for the call and describes one fd.
+    while let Err(e) = cvt(unsafe { libc::poll(&mut p, 1, -1) }) {
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    match so_error(fd)? {
+        0 => Ok(()),
+        e => Err(io::Error::from_raw_os_error(e)),
+    }
+}
+
 pub fn shutdown_write(fd: RawFd) {
     // SAFETY: plain syscall.
     unsafe { libc::shutdown(fd, libc::SHUT_WR) };
@@ -378,21 +404,30 @@ pub fn set_affinity(cpus: &[usize]) -> io::Result<()> {
     Ok(())
 }
 
-/// The calling thread's affinity as a CPU list ("0-1,7").
-pub fn affinity_list() -> io::Result<String> {
+/// The CPUs thread `tid` of this process may run on, ascending (`tid` 0: the calling thread).
+pub fn affinity(tid: i32) -> io::Result<Vec<usize>> {
     // SAFETY: set is valid for writes; CPU_ISSET reads within CPU_SETSIZE.
     let set = unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         cvt(libc::sched_getaffinity(
-            0,
+            tid,
             std::mem::size_of::<libc::cpu_set_t>(),
             &mut set,
         ))?;
         set
     };
-    let cpus: Vec<usize> = (0..CPU_SETSIZE)
+    Ok((0..CPU_SETSIZE)
         .filter(|&c| unsafe { libc::CPU_ISSET(c, &set) })
-        .collect();
+        .collect())
+}
+
+/// The calling thread's affinity as a CPU list ("0-1,7").
+pub fn affinity_list() -> io::Result<String> {
+    affinity(0).map(|cpus| format_cpu_list(&cpus))
+}
+
+/// Formats ascending CPU numbers as a CPU list ("0-1,7"), the form parse_cpu_list reads.
+pub fn format_cpu_list(cpus: &[usize]) -> String {
     let mut out = String::new();
     let mut i = 0;
     while i < cpus.len() {
@@ -410,7 +445,7 @@ pub fn affinity_list() -> io::Result<String> {
         }
         i = j + 1;
     }
-    Ok(out)
+    out
 }
 
 /// Names the calling thread (comm, at most 15 bytes); threads it creates inherit the name.
@@ -423,76 +458,43 @@ pub fn set_thread_name(name: &str) {
     }
 }
 
-/// Lowest TID of this process whose comm is `name`, other than `exclude`.
-pub fn find_thread(name: &str, exclude: i32) -> Option<i32> {
-    std::fs::read_dir("/proc/self/task")
-        .ok()?
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
-        .filter(|&tid| tid != exclude)
+/// The TIDs of this process whose comm is `name`, ascending.
+pub fn threads_named(name: &str) -> io::Result<Vec<i32>> {
+    let mut tids: Vec<i32> = std::fs::read_dir("/proc/self/task")?
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
         .filter(|&tid| {
             std::fs::read_to_string(format!("/proc/self/task/{tid}/comm"))
                 .is_ok_and(|c| c.trim_end_matches('\n') == name)
         })
-        .min()
+        .collect();
+    tids.sort_unstable();
+    Ok(tids)
 }
 
-// ---- telemetry ----
+/// Lowest TID of this process whose comm is `name`, other than `exclude`.
+pub fn find_thread(name: &str, exclude: i32) -> Option<i32> {
+    threads_named(name)
+        .ok()?
+        .into_iter()
+        .find(|&t| t != exclude)
+}
 
-/// One line of `key=value` pairs for thread `tid` of this process: stat utime, stime (clock
-/// ticks) and processor, se.nr_migrations when /proc/.../sched is readable, context switches and
-/// Cpus_allowed_list from status, plus the process cpuset and the tick rate.
-pub fn telemetry(tid: i32) -> String {
+// ---- clocks ----
+
+/// CLOCK_BOOTTIME in nanoseconds, the clock Perfetto stamps its trace with.
+pub fn boottime_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: ts is valid for writes for the call, which cannot fail: CLOCK_BOOTTIME exists
+    // since Linux 2.6.39.
+    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// USER_HZ, the unit of utime and stime.
+pub fn clock_ticks() -> u64 {
     // SAFETY: plain libc query.
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    let mut out = format!("tid={tid} clk_tck={hz}");
-    let base = format!("/proc/self/task/{tid}");
-    match std::fs::read_to_string(format!("{base}/stat")) {
-        Ok(stat) if tid > 0 => {
-            if let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) {
-                let comm: String = stat[open + 1..close]
-                    .chars()
-                    .map(|c| if c.is_whitespace() { '_' } else { c })
-                    .collect();
-                // Field 3 (state) is the first after the closing parenthesis.
-                let f: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-                let field = |n: usize| f.get(n - 3).copied().unwrap_or("?");
-                let _ = write!(
-                    out,
-                    " comm={comm} state={} utime={} stime={} processor={}",
-                    field(3),
-                    field(14),
-                    field(15),
-                    field(39)
-                );
-            }
-        }
-        _ => out.push_str(" error=no_such_thread"),
-    }
-    if let Ok(sched) = std::fs::read_to_string(format!("{base}/sched"))
-        && let Some(v) = sched
-            .lines()
-            .find(|l| l.trim_start().starts_with("se.nr_migrations"))
-            .and_then(|l| l.split(':').nth(1))
-    {
-        let _ = write!(out, " nr_migrations={}", v.trim());
-    }
-    if let Ok(status) = std::fs::read_to_string(format!("{base}/status")) {
-        for (key, name) in [
-            ("voluntary_ctxt_switches", "voluntary_ctxt_switches"),
-            ("nonvoluntary_ctxt_switches", "nonvoluntary_ctxt_switches"),
-            ("Cpus_allowed_list", "cpus_allowed_list"),
-        ] {
-            if let Some(v) = status
-                .lines()
-                .find_map(|l| l.strip_prefix(key)?.strip_prefix(':'))
-            {
-                let _ = write!(out, " {name}={}", v.trim());
-            }
-        }
-    }
-    let cpuset = std::fs::read_to_string("/proc/self/cpuset")
-        .map(|s| s.trim().replace(char::is_whitespace, "_"))
-        .unwrap_or_else(|_| "?".into());
-    let _ = write!(out, " cpuset={cpuset}");
-    out
+    unsafe { libc::sysconf(libc::_SC_CLK_TCK) as u64 }
 }

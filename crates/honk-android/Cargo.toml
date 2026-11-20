@@ -9,18 +9,29 @@ description = "honk's Android VpnService integration: honk-netstack as a transpa
 [lib]
 # Loaded by dev.tunbench.HonkEngine as libhonkengine.so.
 name = "honkengine"
-# rlib: for tests/relay.rs.
+# rlib: for the integration tests.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 honk-netstack = { path = "../honk-netstack" }
 jni = { version = "=0.22.4", default-features = false }
 libc = "0.2"
+procfs = { version = "0.18", default-features = false }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Routes jni's `log` records to logcat.
 android_logger = { version = "0.15", default-features = false }
 log = "0.4"
+
+[features]
+# The bench runner (`harness`, test tooling), enabled only by the TunBench build.
+bench = ["dep:serde", "dep:serde_json"]
+
+[[test]]
+name = "harness"
+required-features = ["bench"]
 
 [profile.release]
 opt-level = 3

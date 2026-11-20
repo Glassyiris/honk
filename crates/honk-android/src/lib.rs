@@ -1,13 +1,17 @@
 //! honk's Android VpnService integration: honk-netstack as a transparent TCP terminator on the
 //! tun fd, relaying every flow to one fixed upstream. JNI surface of `dev.tunbench.HonkEngine`,
-//! plus thread helpers (affinity, naming, /proc telemetry) that the hev path uses as well.
+//! plus thread helpers (affinity, naming, /proc telemetry) that the hev path uses as well. The
+//! `bench` feature adds `harness`, the TunBench bench runner.
 //!
 //! Each native method is declared with `native_method!`, which checks it against its Java
 //! signature and catches panics; errors are logged and the Java side gets the default value
 //! (false, 0, null), as it did before. The macro's ABI check in jni-macros 0.22.4 expands to
-//! `AtomicBool::fetch_update`, deprecated since Rust 1.99, hence `allow(deprecated)` on each.
+//! `AtomicBool::fetch_update`, deprecated since Rust 1.99, hence `allow(deprecated)` on each,
+//! the smallest item around the expansion (<https://github.com/jni-rs/jni-rs/issues/846>).
 
 pub mod engine;
+#[cfg(feature = "bench")]
+pub mod harness;
 pub mod sys;
 
 use jni::errors::{LogErrorAndDefault, Result};
