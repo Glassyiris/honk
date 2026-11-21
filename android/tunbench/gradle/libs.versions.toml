@@ -1,8 +1,12 @@
 [versions]
 agp = "9.5.2"
 kotlin = "2.4.21"
+androidx-activity = "1.13.0"
+androidx-core = "1.19.1"
 
 [libraries]
+androidx-activity = { module = "androidx.activity:activity", version.ref = "androidx-activity" }
+androidx-core = { module = "androidx.core:core", version.ref = "androidx-core" }
 kotlin-gradle-plugin = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlin" }
 
 [plugins]

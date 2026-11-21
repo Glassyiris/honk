@@ -1,6 +1,6 @@
-//! The bench runner (feature `bench`): test tooling that does not ship. It runs a JSON plan inside
-//! the TunBench app with the generator, engine, relay (hev only) and sink on their own pinned
-//! CPUs, and writes one JSON line per measurement.
+//! The bench runner (feature `bench`): test tooling. TunBench, the test app, always builds with
+//! it; honk itself never ships it. It runs a JSON plan inside TunBench with the generator, engine,
+//! relay (hev only) and sink on their own pinned CPUs, and writes one JSON line per measurement.
 //!
 //! `plan` parses and schedules the plan, `run` owns the measurement sequence and the record,
 //! `engine` starts the engine under test and finds its threads, `load` the generator, the
@@ -27,7 +27,7 @@
 //!
 //! | Method | Signature | Does |
 //! | --- | --- | --- |
-//! | `openTun(mtu: Int): Int` | `(I)I` | establish the VPN with this MTU (198.18.0.0/15, the app not excluded); its fd, or -1 |
+//! | `openTun(mtu: Int): Int` | `(I)I` | establish the VPN with this MTU (198.18.0.0/15); bench mode routes only TunBench through the tun (`addAllowedApplication`); its fd, or -1 |
 //! | `closeTun()` | `()V` | close that fd (called after the engine stopped) |
 //! | `startHev(configPath: String, tunFd: Int): Boolean` | `(Ljava/lang/String;I)Z` | `TProxyService.TProxyStartService(configPath, tunFd)` |
 //! | `stopHev(): Boolean` | `()Z` | `TProxyService.TProxyStopService()`; on false or an exception the tun stays open and `run` ends |

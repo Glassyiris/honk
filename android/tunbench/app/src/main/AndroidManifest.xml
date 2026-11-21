@@ -22,6 +22,13 @@
             </intent-filter>
         </activity>
 
+        <!-- The black bench screen, started with am start (see BenchActivity). -->
+        <activity
+            android:name=".BenchActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.TunBench.Black" />
+
         <!-- systemExempted is allowed for VPN apps; lint only knows the exact-alarm criterion.
              https://developer.android.com/develop/background-work/services/fgs/service-types#system-exempted -->
         <service
@@ -34,5 +41,19 @@
                 <action android:name="android.net.VpnService" />
             </intent-filter>
         </service>
+
+        <!-- No ProfileInstallerInitializer: its deferred background work could wake the process
+             during a measurement. https://developer.android.com/topic/libraries/app-startup
+             androidx.startup is a runtime-only dependency, hence MissingClass. -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:ignore="MissingClass"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.profileinstaller.ProfileInstallerInitializer"
+                tools:node="remove" />
+        </provider>
     </application>
 </manifest>

@@ -12,11 +12,11 @@ val cargoBin = (System.getenv("CARGO_HOME") ?: "${System.getProperty("user.home"
 val cargo = File(cargoBin, "cargo").takeIf { it.canExecute() }?.path ?: "cargo"
 val ndkDir = androidComponents.sdkComponents.ndkDirectory
 val buildHonkEngine = tasks.register<Exec>("buildHonkEngine") {
-    description = "Builds libhonkengine.so for arm64-v8a with cargo-ndk and the NDK."
+    description = "Builds libhonkengine.so (with the bench runner) for arm64-v8a with cargo-ndk."
     workingDir = honkEngineDir // rustup reads rust-toolchain.toml from the working directory
     commandLine(
         cargo, "ndk", "-t", "arm64-v8a", "--platform", "29",
-        "-o", honkJniLibs.absolutePath, "build", "--release", "--locked",
+        "-o", honkJniLibs.absolutePath, "build", "--release", "--locked", "--features", "bench",
     )
     environment("PATH", cargoBin + File.pathSeparator + System.getenv("PATH"))
     doFirst { environment("ANDROID_NDK_HOME", ndkDir.get().asFile.absolutePath) }
@@ -71,4 +71,9 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+}
+
+dependencies {
+    implementation(libs.androidx.activity)
+    implementation(libs.androidx.core)
 }
