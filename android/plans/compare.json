@@ -1,0 +1,15 @@
+{
+  "engines": ["hev", "honk"],
+  "mtu": [8500],
+  "cases": [
+    { "kind": "bulk", "dir": "up", "flows": [1, 4], "seconds": 10 },
+    { "kind": "bulk", "dir": "down", "flows": [1, 4], "seconds": 10 },
+    { "kind": "idle", "seconds": 60 },
+    { "kind": "tail", "burst_seconds": 5, "observe_seconds": 10 },
+    { "kind": "sparse", "interval_ms": 1000, "bytes": 64, "seconds": 60 }
+  ],
+  "pin": { "engine": "7", "generator": "0-1", "relay": "6", "sink": "2-3" },
+  "repeat": 5,
+  "cooldown_seconds": 30,
+  "interleave": true
+}
