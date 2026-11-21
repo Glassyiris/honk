@@ -14,6 +14,7 @@ Re-read it when a conversation grows long or context is trimmed: a rule read onc
 | real-kernel or eBPF work, `crates/honk-ebpf*`, `crates/honk-core/src/ebpf/`, mock-eBPF development | `.agents/rules/real-ebpf.md`; skill [`honk-real-ebpf-tests`](.agents/skills/honk-real-ebpf-tests/SKILL.md) |
 | `crates/honk-netstack`, `crates/honk-outbound/src/proxy/wireguard/`, WireGuard node runtime or tunnel behavior | `.agents/rules/netstack.md`; `doc/en/design/netstack.md`; `just outbound-ci` |
 | placing or finding tests, benchmarks | `.agents/rules/test-locations.md` |
+| `crates/honk-android`, `android/`, the TunBench bench harness | `doc/en/design/android-bench.md`; `android/scripts/README.md`; `.agents/rules/test-locations.md` |
 | releases, CI workflows | `.agents/rules/release.md`; skill [`honk-release`](.agents/skills/honk-release/SKILL.md) |
 | deployment, security-sensitive paths | `.agents/rules/deployment.md`, `.agents/rules/security.md` |
 | REALITY / xtls interop verification against live servers | `.agents/rules/maintainer-lab.md` (the maintainer's lab; not required for contributions) |
@@ -29,7 +30,7 @@ Maintaining this guide: a rule that binds every change goes in this file; a subs
 - `honk-config` provides shared types/parsers for original dae `{ section { ... } }`, the primary and only documented config syntax.
 - Status: **experimental alpha**. Expect breaking changes.
 - License: **GPL-3.0-only**. Repository: <https://github.com/daeuniverse/honk>
-- Docs: `README.md` / `README.zh.md` (bilingual overview, feature checklist, TODO list); matching `doc/en/` / `doc/zh/` trees under `doc/`, indexed by bilingual `doc/README.md`. Each has `configuration.md`, `design/` (overview/datapath/routing/nfqueue/control-plane/dns/outbound/groups/netstack), `reference/` (global/nodes/groups/routing/dns/subscription/assets/experimental/api/cli), and `operations/` runbooks; per-release configuration changes that affect an existing configuration live in `doc/migration/{en,zh}/<tag>.md` (one file per release tag). Lab benchmark tooling, evidence, and bilingual docs live only on `bench`.
+- Docs: `README.md` / `README.zh.md` (bilingual overview, feature checklist, TODO list); matching `doc/en/` / `doc/zh/` trees under `doc/`, indexed by bilingual `doc/README.md`. Each has `configuration.md`, `design/` (overview/datapath/routing/nfqueue/control-plane/dns/outbound/groups/netstack/android-bench), `reference/` (global/nodes/groups/routing/dns/subscription/assets/experimental/api/cli), and `operations/` runbooks; per-release configuration changes that affect an existing configuration live in `doc/migration/{en,zh}/<tag>.md` (one file per release tag). Lab benchmark tooling, evidence, and bilingual docs live only on `bench`.
 
 ## Repository layout
 
@@ -46,7 +47,7 @@ Maintaining this guide: a rule that binds every change goes in this file; a subs
 ├── example.dae               # Annotated example (Chinese comments)
 ├── doc/                      # en/ + zh/ doc trees: guide, design/, reference/, operations/; migration/{en,zh}/<tag>.md
 ├── ci/                       # zigcc/zigcxx: zig cc/c++ wrappers for cross builds (strip CMake's clang-style --target from boring-sys ASM rules + rustc's aarch64 errata linker args; used by build-musl and the release workflow); zig-bindgen-env: derive BINDGEN_EXTRA_CLANG_ARGS from `zig cc -E -v` for cross bindgen
-├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release
+├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release; android.yml: path-filtered honk-android, TunBench and harness-script checks
 ├── android/                  # tunbench/: TunBench VpnService benchmark app (Gradle; hev-socks5-tunnel submodule); scripts/: build and adb drivers, README
 └── crates/
     ├── honk-config           # Config schema + dae-syntax parser + share links (workspace member)
@@ -231,6 +232,7 @@ size observations are historical, not a maintained target allowlist.
 - **Say which gates you ran and which you did not.** Running a subset is fine; reporting no limits after running a subset is not.
 - `cargo test --all`: unprivileged default workspace unit/integration suites using mock eBPF/loopback where appropriate. `just test-routing` and dependent `just test-netns` share the full isolated floor-kernel VM gate, including routing goldens, failed-publication preservation, real NFQUEUE/eBPF and guarded root-cgroup fixtures.
 - Test locations: `.agents/rules/test-locations.md`.
+- `crates/honk-android` is outside the workspace (own `Cargo.lock`), so `cargo test --all` skips it: run `cargo test --features bench` and `cargo test --release --test relay` in that directory. `tests/harness.rs` needs four CPUs. `.github/workflows/android.yml` first runs ruff, pytest and shellcheck over `android/scripts`, then the same tests with `--locked` plus fmt, Clippy (host and `aarch64-linux-android`), `./gradlew assembleDebug lint` in `android/tunbench` and the 16 KiB alignment check of the APK (`zipalign`) and both native libraries; it is filtered on `crates/honk-android`, `crates/honk-netstack`, `Cargo.toml`, `android/` and `.gitmodules`. Phone measurements are not tests; design in `doc/en/design/android-bench.md`.
 - Older standalone netns/podman scripts mentioned in stale docs are absent; use the supported `just test-netns` gate above.
 
 ## Notes for agents

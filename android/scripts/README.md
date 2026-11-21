@@ -123,12 +123,13 @@ the finish only every 30 s (`POLL`).
 
 The screen stays interactive with the panel black: the app shows a full-screen black Activity
 that keeps the screen on while it is in front. A few seconds after the start `run.sh` checks
-`mWakefulness=Awake`, display ON and `BenchActivity` as the resumed top activity, and aborts
-otherwise. `run.sh` never changes `stayon`: it records `stay_on_while_plugged_in` at the start and
-the end, refuses to wake the phone if it is not 0 at the start and fails the run if it is not 0 at
-the end, because the phone would then never sleep on USB power. Its exit trap, on success,
-failure, Ctrl-C and `kill`, sends the stop intent with this run's id if its start was sent and the
-app has not finished, stops Perfetto and waits for it to exit, saves what the app wrote and pulls
+`mWakefulness=Awake` (from `dumpsys power`), the display state (from `dumpsys display`, which
+Android 17 no longer prints in `dumpsys power`) and `BenchActivity` as the resumed top activity, and
+aborts otherwise. `run.sh` never changes `stayon`: it records `stay_on_while_plugged_in` at the
+start and the end, refuses to wake the phone if it is not 0 at the start and fails the run if it is
+not 0 at the end, because the phone would then never sleep on USB power. Its exit trap, on success,
+failure, Ctrl-C and `kill`, sends the stop intent with this run's id if its start was sent and its finish was
+not confirmed (a `done` after the deadline does not count), stops Perfetto and waits for it to exit, saves what the app wrote and pulls
 the trace. It deletes the phone's copy of the trace only after a pull. A failed stop fails the
 run, and so does any of `plan.json`, a non-empty `results.jsonl`, `done` and the trace not pulled;
 the log names the missing files. Every adb call in the trap has a time limit, and Ctrl-C does not
@@ -144,17 +145,20 @@ and check that `adb shell settings get global stay_on_while_plugged_in` prints 0
 rail, listed from the trace), `wakeups` (per role and thread, from `thread_state`: runnable after
 a sleep, not a preemption or yield) and `invalid`, the reason each null value is null. The window is
 `[boottime_start_ns, boottime_end_ns]`, the span of the runner's CPU samples and counted bytes
-(the drain after `boottime_cut_ns` included). The rails are every `power_rails` counter track.
-Boundaries are interpolated between the samples around them. A record the runner rejected gets
-only nulls. A missing rail, a boundary outside the samples, a counter reset or a gap above
+(the drain after `boottime_cut_ns` included). The rails are every `power_rails` counter track,
+grouped by track id; two tracks with one name come out as `name#id`. Boundaries are interpolated between the samples around them. A record the runner rejected
+gets only nulls. A missing rail, a boundary outside the samples, a counter reset or a gap above
 `--max-gap-ms` (1000) makes that value invalid; lost scheduler data in the trace, or scheduler
-data that ends before the window does, makes the wakeups invalid. It prints the poll
-interval found. Quick table: `jq -r '[.seq,.engine,.case.kind,.flows,.joules.VSYS_PWR_VBATT]|@tsv'
+data that ends before the window does, makes the wakeups invalid. A sleep that ends straight in
+running counts as a wakeup (the waker ran before the switch-out was recorded). The
+runner's fields, `scan_start_ns` and `scan_end_ns` among them, pass through unchanged. It prints the
+poll interval found. Quick table: `jq -r '[.seq,.engine,.case.kind,.flows,.joules.VSYS_PWR_VBATT]|@tsv'
 RUN_DIR/analysis.jsonl`.
 
 Gates for `run.sh` and `analyze.py`: `shellcheck android/scripts/run.sh`, `shfmt -d
 android/scripts/run.sh` and, in `android/scripts`, `uv run ruff check`, `uv run ruff format
---check`, `uv run pytest`.
+--check`, `uv run pytest`. CI runs all of these but `shfmt`, with `uv run` locked to `uv.lock`, in a
+step before the Gradle step.
 
 ## Known limits
 
