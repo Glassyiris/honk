@@ -1,0 +1,84 @@
+name: Android
+
+on:
+  push:
+    branches: [main, dev]
+    paths: ["crates/honk-android/**", "crates/honk-netstack/**", "Cargo.toml", "android/**", ".gitmodules", ".github/workflows/android.yml"]
+  pull_request:
+    branches: [main, dev]
+    paths: ["crates/honk-android/**", "crates/honk-netstack/**", "Cargo.toml", "android/**", ".gitmodules", ".github/workflows/android.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('ci-{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  android:
+    name: honk-android + tunbench
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # hev-socks5-tunnel is a submodule with submodules of its own.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Check the harness scripts
+        working-directory: android/scripts
+        env:
+          UV_LOCKED: "1"
+        run: |
+          uv run ruff check
+          uv run ruff format --check
+          uv run pytest
+          shellcheck run.sh
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' crates/honk-android/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+          components: rustfmt, clippy
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: crates/honk-android
+          cache-on-failure: true
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Install the NDK and cargo-ndk
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          cargo install --locked cargo-ndk@4.1.2
+      - name: fmt, clippy and tests
+        working-directory: crates/honk-android
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --features bench -- -D warnings
+          cargo test --locked --features bench
+          cargo test --locked --release --test relay
+          cargo ndk -t arm64-v8a --platform 29 clippy --locked --all-targets --features bench -- -D warnings
+      - name: Build the APK and lint
+        working-directory: android/tunbench
+        run: ./gradlew assembleDebug lint
+      - name: Check the 16 KiB page alignment of the native libraries
+        run: |
+          set -euo pipefail
+          readelf="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          apk=android/tunbench/app/build/outputs/apk/debug/app-debug.apk
+          "$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/zipalign" -c -P 16 4 "$apk"
+          unzip -oq "$apk" 'lib/arm64-v8a/*.so' -d "$RUNNER_TEMP/apk"
+          for so in libhonkengine.so libhev-socks5-tunnel.so; do
+            echo "$so"
+            "$readelf" -lW "$RUNNER_TEMP/apk/lib/arm64-v8a/$so" | awk '$1 == "LOAD" { print; if ($NF != "0x4000") bad = 1 } END { exit bad }'
+          done

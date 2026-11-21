@@ -1,7 +1,7 @@
 # Android benchmark harness
 
-Tools for measuring honk-netstack on arm64 Android phones. Nothing here runs in CI, and the
-results are not a performance gate.
+Tools for measuring honk-netstack on arm64 Android phones. CI builds and checks the app and the
+runner but never measures; the results are not a performance gate.
 
 ## What it measures
 
