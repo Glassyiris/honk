@@ -49,9 +49,11 @@ class TunService : VpnService() {
         val cpuList = if (intent.hasExtra(EXTRA_CPUS)) intent.getStringExtra(EXTRA_CPUS)
             else prefs.getString(EXTRA_CPUS, "")
 
-        goForeground(host, port, mtu, eng, cpuList)
         stopTunnel()
         try {
+            // Without VPN consent, startForeground() with the systemExempted type throws
+            // (ForegroundServiceTypeNotAllowedException); report it like a failed establish().
+            goForeground(host, port, mtu, eng, cpuList)
             startTunnel(host, port, mtu, eng, cpuList?.trim { it <= ' ' }.orEmpty())
             lastError = null
         } catch (e: Exception) {
@@ -80,7 +82,7 @@ class TunService : VpnService() {
             .setContentIntent(open)
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            startForeground(NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
         } else {
             startForeground(NOTIFICATION_ID, n)
         }
